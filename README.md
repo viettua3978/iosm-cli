@@ -1,4 +1,4 @@
-<h1 align="center">IOSM CLI v0.1.1</h1>
+<h1 align="center">IOSM CLI v0.1.2</h1>
 
 <p align="center">
   <strong>AI Engineering Runtime for Professional Developers</strong>
@@ -139,7 +139,7 @@ Core commands to unlock full runtime value:
 
 ```console
 $ iosm
-IOSM CLI v0.1.1 [full]
+IOSM CLI v0.1.2 [full]
 
 you> Refactor authentication module with parallel agents, then finalize in IOSM mode
 iosm> /orchestrate --parallel --agents 4 \

@@ -14,6 +14,14 @@ const toolDescriptions: Record<string, string> = {
 	grep: "Search file contents for patterns (respects .gitignore)",
 	find: "Find files by glob pattern (respects .gitignore)",
 	ls: "List directory contents",
+	rg: "Run ripgrep directly for advanced regex search",
+	fd: "Run fd directly for fast file discovery",
+	ast_grep: "Run ast-grep for AST/syntax-aware structural code search",
+	comby: "Run comby for structural pattern search/rewrite previews (no in-place edits)",
+	jq: "Run jq for JSON querying/transformation",
+	yq: "Run yq for YAML/JSON/TOML querying/transformation",
+	semgrep: "Run semgrep for structural/static security checks",
+	sed: "Run sed for stream editing/extraction previews (no in-place edits)",
 	task: "Run a specialized subagent (supports profile, cwd, lock_key for optional write serialization, run_id/task_id, model override, background mode for detached runs, and agent=<custom name from .iosm/agents>)",
 };
 
@@ -131,13 +139,41 @@ export function buildSystemPrompt(options: BuildSystemPromptOptions = {}): strin
 	const hasGrep = tools.includes("grep");
 	const hasFind = tools.includes("find");
 	const hasLs = tools.includes("ls");
+	const hasRg = tools.includes("rg");
+	const hasFd = tools.includes("fd");
+	const hasAstGrep = tools.includes("ast_grep");
+	const hasComby = tools.includes("comby");
+	const hasJq = tools.includes("jq");
+	const hasYq = tools.includes("yq");
+	const hasSemgrep = tools.includes("semgrep");
+	const hasSed = tools.includes("sed");
 	const hasRead = tools.includes("read");
 
 	// File exploration guidelines
-	if (hasBash && !hasGrep && !hasFind && !hasLs) {
+	if (hasBash && !hasGrep && !hasFind && !hasLs && !hasRg && !hasFd) {
 		addGuideline("Use bash for file operations like ls, rg, find; prefer rg for targeted search when available");
-	} else if (hasBash && (hasGrep || hasFind || hasLs)) {
-		addGuideline("Prefer grep/find/ls tools over bash for file exploration (faster, respects .gitignore)");
+	} else if (hasBash && (hasGrep || hasFind || hasLs || hasRg || hasFd)) {
+		addGuideline("Prefer grep/find/ls/rg/fd tools over bash for codebase exploration (faster and less noisy)");
+	}
+
+	if (hasAstGrep || hasComby) {
+		addGuideline("Use ast_grep/comby for syntax-aware structural queries before falling back to broad regex");
+	}
+
+	if (hasComby) {
+		addGuideline("Use comby to preview structural rewrite matches first, then apply final changes via edit/write");
+	}
+
+	if (hasJq || hasYq) {
+		addGuideline("Prefer jq/yq over ad-hoc shell parsing when extracting or transforming JSON/YAML/TOML");
+	}
+
+	if (hasSemgrep) {
+		addGuideline("Use semgrep for rule-based risk scans and structural security checks when relevant");
+	}
+
+	if (hasSed) {
+		addGuideline("Use sed for preview/extraction workflows only; perform final file edits with edit/write");
 	}
 
 	// Read before edit guideline

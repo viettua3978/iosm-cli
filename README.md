@@ -1,4 +1,4 @@
-<h1 align="center">IOSM CLI v0.1.0</h1>
+<h1 align="center">IOSM CLI v0.1.1</h1>
 
 <p align="center">
   <strong>AI Engineering Runtime for Professional Developers</strong>
@@ -78,6 +78,35 @@ Requirements:
 - Node.js `>=20.6.0`
 - provider auth (environment variable API key and/or `/login`)
 
+### Recommended CLI Toolchain (for maximum efficiency)
+
+`iosm-cli` ships managed fallback for `rg` and `fd`, but best performance comes from system-installed tooling, especially for large repos.
+
+Tools used by advanced search/analysis workflows:
+- `rg`, `fd`, `ast-grep` (`sg`), `comby`, `jq`, `yq`, `semgrep`, `sed`
+
+macOS (Homebrew):
+```bash
+brew install ripgrep fd ast-grep comby jq yq semgrep
+```
+
+Ubuntu/Debian:
+```bash
+sudo apt-get update
+sudo apt-get install -y ripgrep fd-find jq yq sed
+
+# optional but recommended:
+# semgrep: pipx install semgrep
+# ast-grep: npm i -g @ast-grep/cli
+# comby: see https://comby.dev/docs/installation
+```
+
+Check availability quickly:
+```bash
+iosm
+/doctor
+```
+
 ## 60-Second Start
 
 ```bash
@@ -110,7 +139,7 @@ Core commands to unlock full runtime value:
 
 ```console
 $ iosm
-IOSM CLI v0.1.0 [full]
+IOSM CLI v0.1.1 [full]
 
 you> Refactor authentication module with parallel agents, then finalize in IOSM mode
 iosm> /orchestrate --parallel --agents 4 \
@@ -157,7 +186,7 @@ Auth + Model Selection (/login, /model)
    ↓
 Agent Runtime (interactive + JSON + JSON-RPC + SDK)
    ↓
-Tooling Layer (read / edit / bash / grep / find / ls + MCP tools)
+Tooling Layer (read/edit/bash + search/structural/data/security tools + MCP tools)
    ↓
 Orchestration Engine (/orchestrate, subagents, dependencies, locks, worktrees)
    ↓

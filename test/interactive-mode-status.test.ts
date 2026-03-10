@@ -771,6 +771,68 @@ describe("InteractiveMode OpenRouter login flow", () => {
 	});
 });
 
+describe("InteractiveMode doctor command", () => {
+	test("includes external CLI tool status block in JSON report", async () => {
+		const showCommandJsonBlock = vi.fn();
+
+		const fakeThis: any = Object.create((InteractiveMode as any).prototype);
+		fakeThis.getHookPolicySummary = () => undefined;
+		fakeThis.activeProfileName = "full";
+		fakeThis.permissionMode = "ask";
+		fakeThis.permissionAllowRules = [];
+		fakeThis.permissionDenyRules = [];
+		Object.defineProperty(fakeThis, "sessionManager", {
+			value: {
+				getCwd: () => process.cwd(),
+				getSessionFile: () => null,
+			},
+			configurable: true,
+		});
+		fakeThis.session = {
+			model: undefined,
+			modelRegistry: {
+				getAll: () => [],
+				getAvailable: () => [],
+				getError: () => null,
+				authStorage: {
+					list: () => [],
+					hasAuth: () => false,
+				},
+			},
+			resourceLoader: {
+				getExtensions: () => ({ errors: [] }),
+				getSkills: () => ({ diagnostics: [] }),
+				getPrompts: () => ({ diagnostics: [] }),
+				getThemes: () => ({ diagnostics: [] }),
+			},
+		};
+		fakeThis.mcpRuntime = undefined;
+		fakeThis.showCommandJsonBlock = showCommandJsonBlock;
+		fakeThis.showCommandTextBlock = vi.fn();
+		fakeThis.runDoctorInteractiveFixes = vi.fn();
+
+		await (InteractiveMode as any).prototype.handleDoctorCommand.call(fakeThis, "/doctor --json");
+
+		expect(showCommandJsonBlock).toHaveBeenCalledTimes(1);
+		expect(showCommandJsonBlock).toHaveBeenCalledWith(
+			"Doctor Report",
+			expect.objectContaining({
+				externalCliTools: expect.any(Array),
+				checks: expect.any(Array),
+			}),
+		);
+
+		const payload = showCommandJsonBlock.mock.calls[0]?.[1] as {
+			externalCliTools: Array<{ tool: string }>;
+			checks: Array<{ label: string }>;
+		};
+		expect(payload.externalCliTools.map((tool) => tool.tool)).toEqual(
+			expect.arrayContaining(["rg", "fd", "ast_grep", "comby", "jq", "yq", "semgrep", "sed"]),
+		);
+		expect(payload.checks.some((check) => check.label === "CLI toolchain")).toBe(true);
+	});
+});
+
 describe("OAuthSelectorComponent login providers", () => {
 	test("shows OpenRouter API key option in login selector", () => {
 		initTheme("dark");

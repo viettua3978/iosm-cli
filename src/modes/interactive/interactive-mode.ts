@@ -141,7 +141,7 @@ import {
 import { getChangelogPath, getNewEntries, parseChangelog } from "../../utils/changelog.js";
 import { copyToClipboard } from "../../utils/clipboard.js";
 import { extensionForImageMimeType, readClipboardImage } from "../../utils/clipboard-image.js";
-import { ensureTool } from "../../utils/tools-manager.js";
+import { ensureTool, getToolPath } from "../../utils/tools-manager.js";
 import { ArminComponent } from "./components/armin.js";
 import { AsciiLogoComponent } from "./components/ascii-logo.js";
 import { AssistantMessageComponent } from "./components/assistant-message.js";
@@ -256,6 +256,133 @@ type DoctorCheckItem = {
 	detail: string;
 	fix?: string;
 };
+
+type DoctorCliToolStatus = {
+	tool: string;
+	available: boolean;
+	source: "managed" | "system" | "missing";
+	command?: string;
+	hint?: string;
+};
+
+type DoctorCliToolSpec = {
+	tool: string;
+	candidates: string[];
+	managed?: "fd" | "rg";
+	hint: string;
+};
+
+const DOCTOR_CLI_TOOL_SPECS: DoctorCliToolSpec[] = [
+	{
+		tool: "rg",
+		candidates: ["rg"],
+		managed: "rg",
+		hint: "Install ripgrep (rg) or allow iosm-cli to download managed binaries.",
+	},
+	{
+		tool: "fd",
+		candidates: ["fd"],
+		managed: "fd",
+		hint: "Install fd or allow iosm-cli to download managed binaries.",
+	},
+	{
+		tool: "ast_grep",
+		candidates: ["ast-grep", "sg"],
+		hint: "Install ast-grep (brew install ast-grep or npm i -g @ast-grep/cli).",
+	},
+	{
+		tool: "comby",
+		candidates: ["comby"],
+		hint: "Install comby (brew install comby).",
+	},
+	{
+		tool: "jq",
+		candidates: ["jq"],
+		hint: "Install jq (brew install jq).",
+	},
+	{
+		tool: "yq",
+		candidates: ["yq"],
+		hint: "Install yq (brew install yq).",
+	},
+	{
+		tool: "semgrep",
+		candidates: ["semgrep"],
+		hint: "Install semgrep (pipx install semgrep or pip install semgrep).",
+	},
+	{
+		tool: "sed",
+		candidates: ["sed"],
+		hint: "Install sed or GNU sed if unavailable (brew install gnu-sed).",
+	},
+];
+
+function commandCandidateExists(candidates: string[]): string | undefined {
+	for (const candidate of candidates) {
+		try {
+			const locator = os.platform() === "win32" ? "where" : "which";
+			const located = spawnSync(locator, [candidate], { stdio: "pipe" });
+			if ((located.status ?? 1) === 0 && !located.error) {
+				return candidate;
+			}
+		} catch {
+			// Continue trying fallback check
+		}
+
+		try {
+			const result = spawnSync(candidate, ["--version"], { stdio: "pipe" });
+			const err = result.error as NodeJS.ErrnoException | undefined;
+			if (!err || err.code !== "ENOENT") {
+				return candidate;
+			}
+		} catch {
+			// Continue trying other candidates
+		}
+	}
+	return undefined;
+}
+
+function resolveDoctorCliToolStatuses(): DoctorCliToolStatus[] {
+	return DOCTOR_CLI_TOOL_SPECS.map((spec) => {
+		if (spec.managed) {
+			const toolPath = getToolPath(spec.managed);
+			if (toolPath) {
+				const isManagedPath = path.isAbsolute(toolPath);
+				return {
+					tool: spec.tool,
+					available: true,
+					source: isManagedPath ? "managed" : "system",
+					command: toolPath,
+					hint: spec.hint,
+				};
+			}
+			return {
+				tool: spec.tool,
+				available: false,
+				source: "missing",
+				hint: spec.hint,
+			};
+		}
+
+		const resolvedCommand = commandCandidateExists(spec.candidates);
+		if (resolvedCommand) {
+			return {
+				tool: spec.tool,
+				available: true,
+				source: "system",
+				command: resolvedCommand,
+				hint: spec.hint,
+			};
+		}
+
+		return {
+			tool: spec.tool,
+			available: false,
+			source: "missing",
+			hint: spec.hint,
+		};
+	});
+}
 
 const OPENROUTER_PROVIDER_ID = "openrouter";
 
@@ -5344,6 +5471,12 @@ export class InteractiveMode {
 			models = [];
 		}
 		if (models.length === 0) {
+			if (preferredProvider) {
+				// Fallback for transient registry/load errors: still open model selector
+				// with a provider hint so login flow can continue.
+				this.showModelSelector(preferredProvider);
+				return;
+			}
 			this.showStatus("No models available");
 			return;
 		}
@@ -5902,7 +6035,6 @@ export class InteractiveMode {
 		}
 
 		this.session.modelRegistry.authStorage.set(OPENROUTER_PROVIDER_ID, { type: "api_key", key: apiKey });
-		this.session.modelRegistry.refresh();
 		await this.updateAvailableProviderCount();
 		this.showStatus(`${providerName} API key saved to ${getAuthPath()}`);
 		await this.showModelProviderSelector(OPENROUTER_PROVIDER_ID);
@@ -5985,7 +6117,6 @@ export class InteractiveMode {
 
 			// Success
 			restoreEditor();
-			this.session.modelRegistry.refresh();
 			await this.updateAvailableProviderCount();
 			this.showStatus(`Logged in to ${providerName}. Credentials saved to ${getAuthPath()}`);
 			await this.showModelProviderSelector(providerId);
@@ -6733,6 +6864,8 @@ export class InteractiveMode {
 		const mcpConnected = mcpStatuses.filter((status) => status.state === "connected").length;
 		const mcpErrored = mcpStatuses.filter((status) => status.state === "error").length;
 		const mcpDisabled = mcpStatuses.filter((status) => !status.enabled).length;
+		const cliToolStatuses = resolveDoctorCliToolStatuses();
+		const missingCliTools = cliToolStatuses.filter((status) => !status.available).map((status) => status.tool);
 
 		const checks: DoctorCheckItem[] = [];
 		const addCheck = (
@@ -6788,6 +6921,17 @@ export class InteractiveMode {
 			addCheck("ok", "MCP servers", `${mcpConnected} connected, ${mcpDisabled} disabled`);
 		}
 
+		if (missingCliTools.length > 0) {
+			addCheck(
+				"warn",
+				"CLI toolchain",
+				`${cliToolStatuses.length - missingCliTools.length}/${cliToolStatuses.length} available (missing: ${missingCliTools.join(", ")})`,
+				`Install missing CLI tools: ${missingCliTools.join(", ")}.`,
+			);
+		} else {
+			addCheck("ok", "CLI toolchain", `${cliToolStatuses.length}/${cliToolStatuses.length} available`);
+		}
+
 		if (extensionErrors > 0 || skillDiagnostics > 0 || promptDiagnostics > 0 || themeDiagnostics > 0) {
 			addCheck(
 				"warn",
@@ -6829,6 +6973,7 @@ export class InteractiveMode {
 				cwd: this.sessionManager.getCwd(),
 				sessionFile: this.sessionManager.getSessionFile() ?? null,
 				activeProfile: this.activeProfileName,
+				externalCliTools: cliToolStatuses,
 				checks,
 				recommendations,
 			});
@@ -6844,6 +6989,19 @@ export class InteractiveMode {
 		for (const check of checks) {
 			const prefix = check.level === "ok" ? "[OK]" : check.level === "warn" ? "[WARN]" : "[FAIL]";
 			lines.push(`${prefix} ${check.label}: ${check.detail}`);
+		}
+		lines.push("");
+		lines.push("External CLI tools:");
+		for (const status of cliToolStatuses) {
+			const prefix = status.available ? "[OK]" : "[WARN]";
+			const sourceLabel =
+				status.source === "missing"
+					? "missing"
+					: `${status.source}${status.command ? ` (${status.command})` : ""}`;
+			lines.push(`${prefix} ${status.tool}: ${sourceLabel}`);
+			if (!status.available && status.hint) {
+				lines.push(`       fix: ${status.hint}`);
+			}
 		}
 		if (recommendations.length > 0) {
 			lines.push("");

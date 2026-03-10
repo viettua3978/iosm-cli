@@ -161,7 +161,7 @@ Profiles change the agent's behavior, available tools, and system prompt:
 
 | Profile | Tools | Use Case |
 |---------|-------|----------|
-| `full` | All (read, bash, edit, write, grep, find, ls) | Default development work |
+| `full` | All built-ins (read, bash, edit, write, grep, find, ls, rg, fd, ast_grep, comby, jq, yq, semgrep, sed) | Default development work |
 | `plan` | Read-only (read, grep, find, ls) | Architecture planning, code review |
 | `iosm` | All + IOSM context | IOSM cycle execution with artifact sync |
 

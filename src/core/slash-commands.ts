@@ -66,7 +66,10 @@ export const BUILTIN_SLASH_COMMANDS: ReadonlyArray<BuiltinSlashCommand> = [
 	{ name: "copy", description: "Copy last agent message to clipboard" },
 	{ name: "name", description: "Set session display name" },
 	{ name: "session", description: "Show session info and stats" },
-	{ name: "doctor", description: "Run runtime diagnostics (model/auth/MCP/hooks/paths) with optional interactive fixes" },
+	{
+		name: "doctor",
+		description: "Run runtime diagnostics (model/auth/MCP/CLI tools/hooks/paths) with optional interactive fixes",
+	},
 	{ name: "checkpoint", description: "Create/list checkpoints for safe rollback" },
 	{ name: "rollback", description: "Rollback session tree to a checkpoint (picker when omitted)" },
 	{ name: "changelog", description: "Show changelog entries" },

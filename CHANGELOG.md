@@ -9,12 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Search/analysis toolchain expansion** — Added separate built-in tools: `rg`, `fd`, `ast_grep`, `comby`, `jq`, `yq`, `semgrep`, `sed`
+- **Doctor CLI diagnostics for tools** — `/doctor` now reports external CLI toolchain availability (`rg`, `fd`, `ast_grep`, `comby`, `jq`, `yq`, `semgrep`, `sed`) in text and JSON output
 - **CLI entry point** — Standalone `iosm` binary with full argument parsing
 - **Interactive mode** — Multi-turn terminal agent with keyboard-driven controls
 - **Print mode** — One-shot `iosm -p` for scripting and CI
 - **JSON stream mode** — Machine-readable `--mode json` event output
 - **RPC mode** — stdio JSON-RPC server for IDE integrations
-- **Built-in tools** — `read`, `bash`, `edit`, `write`, `grep`, `find`, `ls`
+- **Built-in tools** — `read`, `bash`, `edit`, `write`, `grep`, `find`, `ls`, `rg`, `fd`, `ast_grep`, `comby`, `jq`, `yq`, `semgrep`, `sed`
 - **Multi-provider support** — Anthropic, OpenAI, Gemini, Groq, Cerebras, xAI, OpenRouter, Mistral, AWS Bedrock, Azure OpenAI, and more
 - **Model cycling** — `--models` flag and `Ctrl+P` for model rotation
 - **Thinking levels** — `--thinking off|minimal|low|medium|high|xhigh`

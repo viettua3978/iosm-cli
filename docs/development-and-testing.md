@@ -157,7 +157,7 @@ Tests are organized by feature area:
 
 | Area | Test Files | Coverage |
 |------|-----------|----------|
-| **Tools** | `tools.test.ts` | All 7 built-in tools |
+| **Tools** | `tools.test.ts` | Built-in tools (`read`, `bash`, `edit`, `write`, `grep`, `find`, `ls`, `rg`, `fd`, `ast_grep`, `comby`, `jq`, `yq`, `semgrep`, `sed`) |
 | **Session** | `session-manager/`, `session-*.test.ts` | Persistence, branching, migration |
 | **Extensions** | `extensions-*.test.ts` | Discovery, running, hooks, input events |
 | **Compaction** | `compaction*.test.ts` | Context summarization |

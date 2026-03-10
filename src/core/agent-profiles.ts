@@ -26,12 +26,29 @@ export interface AgentProfile {
 	mainMode?: boolean;
 }
 
+const READ_EXPLORATION_TOOLS = [
+	"read",
+	"grep",
+	"find",
+	"ls",
+	"rg",
+	"fd",
+	"ast_grep",
+	"comby",
+	"jq",
+	"yq",
+	"semgrep",
+	"sed",
+] as const;
+
+const WRITE_ENGINEERING_TOOLS = ["read", "bash", "edit", "write", ...READ_EXPLORATION_TOOLS.slice(1)] as const;
+
 export const AGENT_PROFILES: Record<AgentProfileName, AgentProfile> = {
 	explore: {
 		name: "explore",
 		label: "Explore",
 		description: "Fast read-only codebase exploration. No file modifications.",
-		tools: ["read", "grep", "find", "ls"],
+		tools: [...READ_EXPLORATION_TOOLS],
 		thinkingLevel: "off",
 		systemPromptAppend:
 			"You are in EXPLORE mode. You may ONLY read files — never write, edit, or run commands that modify state. Answer concisely. Prefer grep/find/ls over bash. Explore fast and report findings.",
@@ -42,7 +59,7 @@ export const AGENT_PROFILES: Record<AgentProfileName, AgentProfile> = {
 		label: "Plan",
 		description:
 			"Technical architect. Explores codebase and produces implementation plan without executing.",
-		tools: ["read", "bash", "grep", "find", "ls"],
+		tools: ["read", "bash", ...READ_EXPLORATION_TOOLS.slice(1)],
 		thinkingLevel: "medium",
 		systemPromptAppend:
 			"You are in PLAN mode. Explore the codebase thoroughly, then produce a detailed implementation plan. Do NOT write or edit any files. Output a structured plan with steps, risks, and trade-offs. Pause and ask the user to confirm before implementing.",
@@ -52,7 +69,7 @@ export const AGENT_PROFILES: Record<AgentProfileName, AgentProfile> = {
 		name: "iosm",
 		label: "IOSM",
 		description: "IOSM methodology mode: runtime context, /iosm loop, and IOSM artifact lifecycle.",
-		tools: ["read", "bash", "edit", "write", "grep", "find", "ls"],
+		tools: [...WRITE_ENGINEERING_TOOLS],
 		thinkingLevel: "medium",
 		systemPromptAppend:
 			"You are in IOSM mode. Use IOSM runtime context and methodology for actionable engineering requests. Keep IOSM artifacts synchronized when implementation changes.",
@@ -62,7 +79,7 @@ export const AGENT_PROFILES: Record<AgentProfileName, AgentProfile> = {
 		name: "iosm_analyst",
 		label: "IOSM Analyst",
 		description: "Analyzes IOSM artifacts and metrics. Read + bash only.",
-		tools: ["read", "bash", "grep", "find", "ls"],
+		tools: ["read", "bash", ...READ_EXPLORATION_TOOLS.slice(1)],
 		thinkingLevel: "low",
 		systemPromptAppend:
 			"You are an IOSM Analyst. Your job is to analyze .iosm/ artifacts, cycle reports, metrics history, and codebase evidence. Be precise and evidence-based. Report metric values, confidence levels, and risks with concrete evidence from the repository. Do not modify product source code.",
@@ -93,7 +110,7 @@ export const AGENT_PROFILES: Record<AgentProfileName, AgentProfile> = {
 		name: "full",
 		label: "Full",
 		description: "Full access. All tools enabled. Default engineering agent.",
-		tools: ["read", "bash", "edit", "write", "grep", "find", "ls"],
+		tools: [...WRITE_ENGINEERING_TOOLS],
 		thinkingLevel: "medium",
 		systemPromptAppend: "",
 		mainMode: true,

@@ -1,4 +1,9 @@
 export {
+	createAstGrepTool,
+	type AstGrepToolInput,
+	astGrepTool,
+} from "./ast-grep.js";
+export {
 	type BashOperations,
 	type BashSpawnContext,
 	type BashSpawnHook,
@@ -9,6 +14,11 @@ export {
 	createBashTool,
 } from "./bash.js";
 export {
+	type CombyToolInput,
+	combyTool,
+	createCombyTool,
+} from "./comby.js";
+export {
 	createEditTool,
 	type EditOperations,
 	type EditToolDetails,
@@ -16,6 +26,17 @@ export {
 	type EditToolOptions,
 	editTool,
 } from "./edit.js";
+export {
+	type ExternalCliToolDetails,
+	type ExternalCliToolInput,
+	type ExternalCliToolOptions,
+	createExternalCliTool,
+} from "./external-cli.js";
+export {
+	createFdTool,
+	type FdToolInput,
+	fdTool,
+} from "./fd.js";
 export {
 	createFindTool,
 	type FindOperations,
@@ -33,6 +54,11 @@ export {
 	grepTool,
 } from "./grep.js";
 export {
+	createJqTool,
+	type JqToolInput,
+	jqTool,
+} from "./jq.js";
+export {
 	createLsTool,
 	type LsOperations,
 	type LsToolDetails,
@@ -48,6 +74,21 @@ export {
 	type ReadToolOptions,
 	readTool,
 } from "./read.js";
+export {
+	createRgTool,
+	type RgToolInput,
+	rgTool,
+} from "./rg.js";
+export {
+	createSedTool,
+	type SedToolInput,
+	sedTool,
+} from "./sed.js";
+export {
+	createSemgrepTool,
+	type SemgrepToolInput,
+	semgrepTool,
+} from "./semgrep.js";
 export {
 	DEFAULT_MAX_BYTES,
 	DEFAULT_MAX_LINES,
@@ -78,6 +119,11 @@ export {
 	type TodoReadInput,
 } from "./todo.js";
 export {
+	createYqTool,
+	type YqToolInput,
+	yqTool,
+} from "./yq.js";
+export {
 	createTaskTool,
 	type SubagentRunner,
 	type TaskToolProgress,
@@ -87,13 +133,21 @@ export {
 } from "./task.js";
 
 import type { AgentTool } from "@mariozechner/pi-agent-core";
+import { astGrepTool, createAstGrepTool } from "./ast-grep.js";
 import { type BashToolOptions, bashTool, createBashTool } from "./bash.js";
+import { combyTool, createCombyTool } from "./comby.js";
 import { createEditTool, type EditToolOptions, editTool } from "./edit.js";
+import { createFdTool, fdTool } from "./fd.js";
 import { createFindTool, findTool } from "./find.js";
 import { createGrepTool, grepTool } from "./grep.js";
+import { createJqTool, jqTool } from "./jq.js";
 import { createLsTool, lsTool } from "./ls.js";
 import { createReadTool, type ReadToolOptions, readTool } from "./read.js";
+import { createRgTool, rgTool } from "./rg.js";
+import { createSedTool, sedTool } from "./sed.js";
+import { createSemgrepTool, semgrepTool } from "./semgrep.js";
 import { createWriteTool, type WriteToolOptions, writeTool } from "./write.js";
+import { createYqTool, yqTool } from "./yq.js";
 import { todoWriteTool, todoReadTool } from "./todo.js";
 
 /** Tool type (AgentTool from pi-ai) */
@@ -103,7 +157,20 @@ export type Tool = AgentTool<any>;
 export const codingTools: Tool[] = [readTool, bashTool, editTool, writeTool];
 
 // Read-only tools for exploration without modification (using process.cwd())
-export const readOnlyTools: Tool[] = [readTool, grepTool, findTool, lsTool];
+export const readOnlyTools: Tool[] = [
+	readTool,
+	grepTool,
+	findTool,
+	lsTool,
+	rgTool,
+	fdTool,
+	astGrepTool,
+	combyTool,
+	jqTool,
+	yqTool,
+	semgrepTool,
+	sedTool,
+];
 
 // All available tools (using process.cwd())
 export const allTools = {
@@ -114,6 +181,14 @@ export const allTools = {
 	grep: grepTool,
 	find: findTool,
 	ls: lsTool,
+	rg: rgTool,
+	fd: fdTool,
+	ast_grep: astGrepTool,
+	comby: combyTool,
+	jq: jqTool,
+	yq: yqTool,
+	semgrep: semgrepTool,
+	sed: sedTool,
 	todo_write: todoWriteTool,
 	todo_read: todoReadTool,
 };
@@ -147,7 +222,20 @@ export function createCodingTools(cwd: string, options?: ToolsOptions): Tool[] {
  * Create read-only tools configured for a specific working directory.
  */
 export function createReadOnlyTools(cwd: string, options?: ToolsOptions): Tool[] {
-	return [createReadTool(cwd, options?.read), createGrepTool(cwd), createFindTool(cwd), createLsTool(cwd)];
+	return [
+		createReadTool(cwd, options?.read),
+		createGrepTool(cwd),
+		createFindTool(cwd),
+		createLsTool(cwd),
+		createRgTool(cwd),
+		createFdTool(cwd),
+		createAstGrepTool(cwd),
+		createCombyTool(cwd),
+		createJqTool(cwd),
+		createYqTool(cwd),
+		createSemgrepTool(cwd),
+		createSedTool(cwd),
+	];
 }
 
 /**
@@ -162,6 +250,14 @@ export function createAllTools(cwd: string, options?: ToolsOptions): Record<Tool
 		grep: createGrepTool(cwd),
 		find: createFindTool(cwd),
 		ls: createLsTool(cwd),
+		rg: createRgTool(cwd),
+		fd: createFdTool(cwd),
+		ast_grep: createAstGrepTool(cwd),
+		comby: createCombyTool(cwd),
+		jq: createJqTool(cwd),
+		yq: createYqTool(cwd),
+		semgrep: createSemgrepTool(cwd),
+		sed: createSedTool(cwd),
 		todo_write: todoWriteTool,
 		todo_read: todoReadTool,
 	};

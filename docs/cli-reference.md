@@ -209,7 +209,12 @@ iosm --api-key sk-test-123           # Override for this run
 
 ### Available Tools
 
-`read`, `bash`, `edit`, `write`, `grep`, `find`, `ls`
+`read`, `bash`, `edit`, `write`, `grep`, `find`, `ls`, `rg`, `fd`, `ast_grep`, `comby`, `jq`, `yq`, `semgrep`, `sed`
+
+Tool notes:
+- `rg`, `fd` are managed by iosm-cli and auto-resolved when missing.
+- `ast_grep`, `comby`, `jq`, `yq`, `semgrep` are optional external CLIs and should be available in `PATH` to use their tools.
+- `sed` tool is preview/extraction-oriented; in-place edits are intentionally blocked.
 
 **Examples:**
 
@@ -219,6 +224,9 @@ iosm
 
 # Read-only analysis
 iosm --tools read,grep,find,ls -p "Audit for dead code"
+
+# Structural/security analysis pass
+iosm --tools read,rg,ast_grep,semgrep -p "Find risky auth patterns and report"
 
 # No tools
 iosm --no-tools -p "Explain polymorphism"

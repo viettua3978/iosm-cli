@@ -106,26 +106,6 @@ Core commands to unlock full runtime value:
 - `/mcp` — connect external tool ecosystems in interactive UI
 - `/memory` — persist project facts and constraints across sessions
 
-### Example Session
-
-```console
-$ iosm
-IOSM CLI v0.1.0 [full]
-status  [profile full] [model github-copilot/grok-code-fast-1] [mcp 1/1] [memory p:0 u:0]
-next    task  /orchestrate  /init  /iosm
-
-you> Split auth refactor into parallel agents and run an IOSM cycle with quality gates
-iosm> Team run started: #42 (/orchestrate --parallel --agents 4 ...)
-iosm> agent[1|iosm_analyst] found coupling hotspots in auth/session/token
-iosm> agent[2|explore] prepared migration path for middleware branches
-iosm> agent[3|iosm_verifier] added regression checks and failure guards
-iosm> Consolidated execution plan ready
-iosm> /init
-iosm> /iosm 0.95 --max-iterations 5
-iosm> Result: simplicity +18%, modularity +11%, performance +6%
-iosm> Artifacts: .iosm/cycles/2026-03-10-001/
-```
-
 ## Real-World Example: Agent-Orchestrated IOSM Refactor
 
 ```console

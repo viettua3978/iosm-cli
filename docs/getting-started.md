@@ -92,6 +92,7 @@ You'll see a prompt where you can type messages. The agent has access to your fi
 |---------|-------------|
 | `/model` | Pick or change the active model |
 | `/login` | Authenticate with OAuth providers (including Qwen) or add OpenRouter API key |
+| `/semantic` | Configure semantic provider and index/query meaning-based code search |
 | `/init` | Bootstrap IOSM artifacts for the current project |
 | `/agents` | View available custom/system agents |
 | `/settings` | View and modify settings |

@@ -53,6 +53,7 @@ iosm --continue
 | `/model` | Open provider-first model selector (`provider -> model`) | `/model` |
 | `/scoped-models` | Manage model rotation | `/scoped-models` |
 | `/mcp` | Open MCP manager UI and run MCP subcommands | `/mcp` |
+| `/semantic` | Open semantic search manager (`setup/status/index/rebuild/query`) | `/semantic` |
 | `/memory` | Interactive memory manager (`add/edit/remove/scope/path`) | `/memory` |
 | `/settings` | View/modify settings | `/settings` |
 | `/hotkeys` | View keyboard shortcuts | `/hotkeys` |
@@ -97,6 +98,9 @@ iosm --continue
 | `/logout` | Clear saved provider credentials | `/logout` |
 
 `/mcp add` without flags starts a guided wizard in the terminal UI.
+`/semantic` opens an interactive setup/status/index/query manager for embeddings search.
+`/semantic setup` now auto-loads model catalogs for OpenRouter (`/api/v1/embeddings/models`) and Ollama (`/api/tags`) with manual fallback.
+In `/semantic setup`, the headers step is optional: press `Enter` on empty input to skip.
 `/memory` opens an interactive manager. `/memory <text>` saves a note to `memory.md` and reloads session context. Use `/memory edit <index> <text>` for direct updates.
 
 ---
@@ -161,7 +165,7 @@ Profiles change the agent's behavior, available tools, and system prompt:
 
 | Profile | Tools | Use Case |
 |---------|-------|----------|
-| `full` | All built-ins (read, bash, edit, write, grep, find, ls, rg, fd, ast_grep, comby, jq, yq, semgrep, sed) | Default development work |
+| `full` | All built-ins (read, bash, edit, write, grep, find, ls, rg, fd, ast_grep, comby, jq, yq, semgrep, sed, semantic_search) | Default development work |
 | `plan` | Read-only (read, grep, find, ls) | Architecture planning, code review |
 | `iosm` | All + IOSM context | IOSM cycle execution with artifact sync |
 

@@ -9,7 +9,7 @@ export function createAstGrepTool(cwd: string): AgentTool<typeof externalCliSche
 		name: "ast_grep",
 		label: "ast-grep",
 		description:
-			"Run ast-grep (sg) for syntax-aware code queries. Pass CLI arguments directly (for example: [\"scan\",\"--pattern\",\"console.log($A)\",\"src\"]).",
+			"Run ast-grep (sg) for syntax-aware code queries. Pass CLI args directly. Preferred form: [\"run\",\"--pattern\",\"console.log($A)\",\"--lang\",\"javascript\",\"src\"]. If version syntax differs, retry with scan/-p equivalents.",
 		commandCandidates: ["ast-grep", "sg"],
 		missingInstallHint: "Install ast-grep (brew install ast-grep or npm i -g @ast-grep/cli).",
 	});

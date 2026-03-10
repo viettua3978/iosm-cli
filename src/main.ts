@@ -44,6 +44,16 @@ import {
 	parseMcpAddCommand,
 	parseMcpTargetCommand,
 } from "./core/mcp/index.js";
+import {
+	getSemanticCommandHelp,
+	parseSemanticCliCommand,
+	SemanticConfigMissingError,
+	SemanticRebuildRequiredError,
+	SemanticSearchRuntime,
+	type SemanticIndexOperationResult,
+	type SemanticQueryResult,
+	type SemanticStatusResult,
+} from "./core/semantic/index.js";
 import { DefaultPackageManager } from "./core/package-manager.js";
 import { DefaultResourceLoader } from "./core/resource-loader.js";
 import { type CreateAgentSessionOptions, createAgentSession } from "./core/sdk.js";
@@ -1485,6 +1495,128 @@ async function handleMcpCommand(args: string[]): Promise<boolean> {
 	}
 }
 
+function printSemanticConfigMissing(error: SemanticConfigMissingError): void {
+	console.error(chalk.yellow("Semantic search is not configured."));
+	console.error(chalk.dim(`User config: ${error.userConfigPath}`));
+	console.error(chalk.dim(`Project config: ${error.projectConfigPath}`));
+	console.error(chalk.dim("Run /semantic setup in interactive mode, or create one of the config files."));
+}
+
+function printSemanticStatus(status: SemanticStatusResult): void {
+	console.log(chalk.bold("Semantic search status"));
+	console.log(`configured: ${status.configured ? "yes" : "no"}`);
+	console.log(`enabled: ${status.enabled ? "yes" : "no"}`);
+	console.log(`indexed: ${status.indexed ? "yes" : "no"}`);
+	console.log(`stale: ${status.stale ? `yes${status.staleReason ? ` (${status.staleReason})` : ""}` : "no"}`);
+	if (status.provider) console.log(`provider: ${status.provider}`);
+	if (status.model) console.log(`model: ${status.model}`);
+	console.log(`files: ${status.files}`);
+	console.log(`chunks: ${status.chunks}`);
+	if (status.dimension !== undefined) console.log(`dimension: ${status.dimension}`);
+	if (status.ageSeconds !== undefined) console.log(`age_seconds: ${status.ageSeconds}`);
+	console.log(`index_path: ${status.indexPath}`);
+	console.log(`config_user: ${status.configPathUser}`);
+	console.log(`config_project: ${status.configPathProject}`);
+	if (!status.configured) {
+		console.log(chalk.dim("Hint: /semantic setup (interactive) or create semantic config JSON manually."));
+	}
+}
+
+function printSemanticIndexResult(result: SemanticIndexOperationResult): void {
+	console.log(chalk.green(`${result.action} completed.`));
+	console.log(`processed_files: ${result.processedFiles}`);
+	console.log(`reused_files: ${result.reusedFiles}`);
+	console.log(`new_files: ${result.newFiles}`);
+	console.log(`changed_files: ${result.changedFiles}`);
+	console.log(`removed_files: ${result.removedFiles}`);
+	console.log(`chunks: ${result.chunks}`);
+	console.log(`dimension: ${result.dimension}`);
+	console.log(`duration_ms: ${result.durationMs}`);
+	console.log(`built_at: ${result.builtAt}`);
+	console.log(`index_path: ${result.indexPath}`);
+}
+
+function printSemanticQueryResult(result: SemanticQueryResult): void {
+	console.log(chalk.bold(`Semantic query: ${result.query}`));
+	console.log(`top_k: ${result.topK}`);
+	console.log(`auto_refreshed: ${result.autoRefreshed ? "yes" : "no"}`);
+	if (result.hits.length === 0) {
+		console.log(chalk.dim("No semantic matches found."));
+		return;
+	}
+	for (let index = 0; index < result.hits.length; index++) {
+		const hit = result.hits[index]!;
+		console.log(
+			`${index + 1}. score=${hit.score.toFixed(4)} ${hit.path}:${hit.lineStart}-${hit.lineEnd}\n   ${hit.snippet}`,
+		);
+	}
+}
+
+async function handleSemanticCommand(args: string[]): Promise<boolean> {
+	if (args[0] !== "semantic") {
+		return false;
+	}
+
+	const parsed = parseSemanticCliCommand(args.slice(1));
+	if (!parsed.ok) {
+		console.error(chalk.red(parsed.error));
+		console.error(chalk.dim(`Use "${APP_NAME} semantic help".`));
+		process.exitCode = 1;
+		return true;
+	}
+
+	if (parsed.value.kind === "help") {
+		console.log(getSemanticCommandHelp(`${APP_NAME} semantic`));
+		return true;
+	}
+
+	const runtime = new SemanticSearchRuntime({
+		cwd: process.cwd(),
+		agentDir: getAgentDir(),
+		authStorage: AuthStorage.create(),
+	});
+
+	try {
+		if (parsed.value.kind === "status") {
+			const status = await runtime.status();
+			printSemanticStatus(status);
+			return true;
+		}
+
+		if (parsed.value.kind === "index") {
+			const result = await runtime.index();
+			printSemanticIndexResult(result);
+			return true;
+		}
+
+		if (parsed.value.kind === "rebuild") {
+			const result = await runtime.rebuild();
+			printSemanticIndexResult(result);
+			return true;
+		}
+
+		const result = await runtime.query(parsed.value.query, parsed.value.topK);
+		printSemanticQueryResult(result);
+		return true;
+	} catch (error) {
+		if (error instanceof SemanticConfigMissingError) {
+			printSemanticConfigMissing(error);
+			process.exitCode = 1;
+			return true;
+		}
+		if (error instanceof SemanticRebuildRequiredError) {
+			console.error(chalk.yellow(error.message));
+			console.error(chalk.dim(`Run "${APP_NAME} semantic rebuild".`));
+			process.exitCode = 1;
+			return true;
+		}
+		const message = error instanceof Error ? error.message : String(error);
+		console.error(chalk.red(`Semantic command failed: ${message}`));
+		process.exitCode = 1;
+		return true;
+	}
+}
+
 export async function main(args: string[]) {
 	applySessionTraceCliOverrides(args);
 
@@ -1509,6 +1641,10 @@ export async function main(args: string[]) {
 	}
 
 	if (await handleMcpCommand(args)) {
+		return;
+	}
+
+	if (await handleSemanticCommand(args)) {
 		return;
 	}
 

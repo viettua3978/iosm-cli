@@ -2879,6 +2879,9 @@ export class AgentSession {
 							return this._toolPermissionHandler ? this._toolPermissionHandler(request) : true;
 						},
 					},
+					semantic: {
+						authStorage: this._modelRegistry.authStorage,
+					},
 				});
 
 		this._baseToolRegistry = new Map(Object.entries(baseTools).map(([name, tool]) => [name, tool as AgentTool]));

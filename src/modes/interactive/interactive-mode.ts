@@ -96,6 +96,26 @@ import {
 	updateMemoryEntry,
 	type MemoryScope,
 } from "../../core/memory.js";
+import {
+	getDefaultSemanticSearchConfig,
+	getSemanticConfigPath,
+	getSemanticIndexDir,
+	isLikelyEmbeddingModelId,
+	listOllamaLocalModels,
+	listOpenRouterEmbeddingModels,
+	loadMergedSemanticConfig,
+	SemanticConfigMissingError,
+	SemanticRebuildRequiredError,
+	SemanticSearchRuntime,
+	upsertScopedSemanticSearchConfig,
+	type SemanticIndexOperationResult,
+	type SemanticProviderConfig,
+	type SemanticProviderType,
+	type SemanticQueryResult,
+	type SemanticScope,
+	type SemanticSearchConfig,
+	type SemanticStatusResult,
+} from "../../core/semantic/index.js";
 import { DefaultResourceLoader } from "../../core/resource-loader.js";
 import { createAgentSession } from "../../core/sdk.js";
 import { createTeamRun, getTeamRun, listTeamRuns } from "../../core/agent-teams.js";
@@ -1172,6 +1192,49 @@ export class InteractiveMode {
 		return null;
 	}
 
+	private getSemanticArgumentCompletions(prefix: string): AutocompleteItem[] | null {
+		const subcommands = ["ui", "setup", "status", "index", "rebuild", "query", "help"];
+		const queryFlags = ["--top-k"];
+		const topKValues = ["5", "8", "10", "20"];
+		const hasTrailingSpace = /\\s$/.test(prefix);
+		const tokens = this.parseSlashArgs(prefix);
+		const first = tokens[0]?.toLowerCase();
+
+		if (!first || (tokens.length === 1 && !hasTrailingSpace)) {
+			const query = first ?? "";
+			const candidates = subcommands.filter((item) => item.includes(query));
+			return candidates.map((item) => ({ value: item, label: item }));
+		}
+
+		if (first !== "query") {
+			return null;
+		}
+
+		const topKIndex = tokens.findIndex((token) => token === "--top-k");
+		if (topKIndex >= 0) {
+			const currentValue = tokens[topKIndex + 1];
+			if (!currentValue) {
+				return topKValues.map((value) => ({ value, label: value }));
+			}
+			return topKValues
+				.filter((value) => value.startsWith(currentValue))
+				.map((value) => ({ value, label: value }));
+		}
+
+		const query = hasTrailingSpace ? "" : (tokens[tokens.length - 1] ?? "");
+		if (query.startsWith("--")) {
+			return queryFlags
+				.filter((flag) => flag.includes(query))
+				.map((flag) => ({ value: flag, label: flag }));
+		}
+
+		if (hasTrailingSpace) {
+			return queryFlags.map((flag) => ({ value: flag, label: flag }));
+		}
+
+		return null;
+	}
+
 	private setupAutocomplete(fdPath: string | undefined): void {
 		// Define commands for autocomplete
 		const builtinCommands = BUILTIN_SLASH_COMMANDS.filter(
@@ -1223,6 +1286,12 @@ export class InteractiveMode {
 		if (memoryCommand) {
 			memoryCommand.getArgumentCompletions = (prefix: string): AutocompleteItem[] | null =>
 				this.getMemoryArgumentCompletions(prefix);
+		}
+
+		const semanticCommand = slashCommands.find((command) => command.name === "semantic");
+		if (semanticCommand) {
+			semanticCommand.getArgumentCompletions = (prefix: string): AutocompleteItem[] | null =>
+				this.getSemanticArgumentCompletions(prefix);
 		}
 
 		// Convert prompt templates to SlashCommand format for autocomplete
@@ -1516,7 +1585,9 @@ export class InteractiveMode {
 		// Commands and keys
 		const commandsLine =
 			`${pad}${theme.fg("dim", "cmds")}  ` +
-			["model", "login", "mcp", "memory", "doctor", "new"].map((c) => theme.fg("accent", `/${c}`)).join(theme.fg("dim", "  "));
+			["model", "login", "mcp", "semantic", "memory", "doctor", "new"]
+				.map((c) => theme.fg("accent", `/${c}`))
+				.join(theme.fg("dim", "  "));
 
 		const keysLine =
 			`${pad}${theme.fg("dim", "keys")}  ` +
@@ -2576,6 +2647,30 @@ export class InteractiveMode {
 		return result === "Yes";
 	}
 
+	private async runWithExtensionLoader<T>(message: string, task: () => Promise<T>): Promise<T> {
+		const loader = new BorderedLoader(this.ui, theme, message, {
+			cancellable: false,
+		});
+		this.editorContainer.clear();
+		this.editorContainer.addChild(loader);
+		this.ui.setFocus(loader);
+		this.ui.requestRender();
+
+		const restoreEditor = () => {
+			loader.dispose();
+			this.editorContainer.clear();
+			this.editorContainer.addChild(this.editor);
+			this.ui.setFocus(this.editor);
+			this.ui.requestRender();
+		};
+
+		try {
+			return await task();
+		} finally {
+			restoreEditor();
+		}
+	}
+
 	/**
 	 * Show a text input for extensions.
 	 */
@@ -3025,6 +3120,11 @@ export class InteractiveMode {
 			if (text === "/memory" || text.startsWith("/memory ")) {
 				this.editor.setText("");
 				await this.handleMemoryCommand(text);
+				return;
+			}
+			if (text === "/semantic" || text.startsWith("/semantic ")) {
+				this.editor.setText("");
+				await this.handleSemanticCommand(text);
 				return;
 			}
 			if (text === "/settings") {
@@ -6006,7 +6106,8 @@ export class InteractiveMode {
 		return providerInfo?.name || providerId;
 	}
 
-	private async handleOpenRouterApiKeyLogin(): Promise<void> {
+	private async handleOpenRouterApiKeyLogin(options?: { openModelSelector?: boolean }): Promise<void> {
+		const openModelSelector = options?.openModelSelector ?? true;
 		const providerName = this.getProviderDisplayName(OPENROUTER_PROVIDER_ID);
 		const existingCredential = this.session.modelRegistry.authStorage.get(OPENROUTER_PROVIDER_ID);
 		if (existingCredential) {
@@ -6037,7 +6138,9 @@ export class InteractiveMode {
 		this.session.modelRegistry.authStorage.set(OPENROUTER_PROVIDER_ID, { type: "api_key", key: apiKey });
 		await this.updateAvailableProviderCount();
 		this.showStatus(`${providerName} API key saved to ${getAuthPath()}`);
-		await this.showModelProviderSelector(OPENROUTER_PROVIDER_ID);
+		if (openModelSelector) {
+			await this.showModelProviderSelector(OPENROUTER_PROVIDER_ID);
+		}
 	}
 
 	private async showLoginDialog(providerId: string): Promise<void> {
@@ -6571,6 +6674,671 @@ export class InteractiveMode {
 		}
 	}
 
+	private createSemanticRuntime(): SemanticSearchRuntime {
+		return new SemanticSearchRuntime({
+			cwd: this.sessionManager.getCwd(),
+			agentDir: getAgentDir(),
+			authStorage: this.session.modelRegistry.authStorage,
+		});
+	}
+
+	private parseSemanticScopeOptions(args: string[]): {
+		scope: SemanticScope | undefined;
+		rest: string[];
+		error?: string;
+	} {
+		let scope: SemanticScope | undefined;
+		const rest: string[] = [];
+
+		for (let index = 0; index < args.length; index++) {
+			const token = args[index] ?? "";
+			const normalized = token.toLowerCase();
+
+			if (normalized === "--scope") {
+				const value = (args[index + 1] ?? "").toLowerCase();
+				if (!value) {
+					return { scope, rest, error: "Usage: /semantic setup --scope <user|project>" };
+				}
+				if (value !== "user" && value !== "project") {
+					return { scope, rest, error: `Invalid semantic scope "${value}". Use user or project.` };
+				}
+				scope = value;
+				index += 1;
+				continue;
+			}
+
+			rest.push(token);
+		}
+
+		return { scope, rest };
+	}
+
+	private parseSemanticTopKOptions(args: string[]): {
+		topK?: number;
+		rest: string[];
+		error?: string;
+	} {
+		let topK: number | undefined;
+		const rest: string[] = [];
+
+		for (let index = 0; index < args.length; index++) {
+			const token = args[index] ?? "";
+			const normalized = token.toLowerCase();
+			if (normalized === "--top-k" || normalized === "--topk") {
+				const raw = (args[index + 1] ?? "").trim();
+				if (!raw) {
+					return { topK, rest, error: "Usage: /semantic query <text> [--top-k 1..20]" };
+				}
+				const parsed = Number.parseInt(raw, 10);
+				if (!Number.isFinite(parsed) || `${parsed}` !== raw || parsed < 1 || parsed > 20) {
+					return { topK, rest, error: "--top-k must be an integer between 1 and 20." };
+				}
+				topK = parsed;
+				index += 1;
+				continue;
+			}
+			rest.push(token);
+		}
+
+		return { topK, rest };
+	}
+
+	private formatSemanticStatusReport(status: SemanticStatusResult): string {
+		const lines = [
+			`configured: ${status.configured ? "yes" : "no"}`,
+			`enabled: ${status.enabled ? "yes" : "no"}`,
+			`indexed: ${status.indexed ? "yes" : "no"}`,
+			`stale: ${status.stale ? `yes${status.staleReason ? ` (${status.staleReason})` : ""}` : "no"}`,
+		];
+		if (status.provider) lines.push(`provider: ${status.provider}`);
+		if (status.model) lines.push(`model: ${status.model}`);
+		lines.push(`files: ${status.files}`);
+		lines.push(`chunks: ${status.chunks}`);
+		if (status.dimension !== undefined) lines.push(`dimension: ${status.dimension}`);
+		if (status.ageSeconds !== undefined) lines.push(`age_seconds: ${status.ageSeconds}`);
+		lines.push(`index_path: ${status.indexPath}`);
+		lines.push(`config_user: ${status.configPathUser}`);
+		lines.push(`config_project: ${status.configPathProject}`);
+		if (!status.configured) {
+			lines.push("hint: run /semantic setup");
+		}
+		return lines.join("\n");
+	}
+
+	private formatSemanticIndexReport(result: SemanticIndexOperationResult): string {
+		return [
+			`action: ${result.action}`,
+			`processed_files: ${result.processedFiles}`,
+			`reused_files: ${result.reusedFiles}`,
+			`new_files: ${result.newFiles}`,
+			`changed_files: ${result.changedFiles}`,
+			`removed_files: ${result.removedFiles}`,
+			`chunks: ${result.chunks}`,
+			`dimension: ${result.dimension}`,
+			`duration_ms: ${result.durationMs}`,
+			`built_at: ${result.builtAt}`,
+			`index_path: ${result.indexPath}`,
+		].join("\n");
+	}
+
+	private formatSemanticQueryReport(result: SemanticQueryResult): string {
+		const lines = [
+			`query: ${result.query}`,
+			`top_k: ${result.topK}`,
+			`auto_refreshed: ${result.autoRefreshed ? "yes" : "no"}`,
+		];
+
+		if (result.hits.length === 0) {
+			lines.push("hits: none");
+			return lines.join("\n");
+		}
+
+		lines.push("hits:");
+		for (let index = 0; index < result.hits.length; index++) {
+			const hit = result.hits[index]!;
+			lines.push(
+				`${index + 1}. score=${hit.score.toFixed(4)} ${hit.path}:${hit.lineStart}-${hit.lineEnd}`,
+			);
+			lines.push(`   ${hit.snippet}`);
+		}
+		return lines.join("\n");
+	}
+
+	private getSemanticSetupProviderLabel(type: SemanticProviderType): string {
+		if (type === "openrouter") return "openrouter";
+		if (type === "ollama") return "ollama";
+		return "custom_openai";
+	}
+
+	private async ensureOpenRouterSemanticCredentials(): Promise<void> {
+		const existing = await this.session.modelRegistry.authStorage.getApiKey(OPENROUTER_PROVIDER_ID);
+		if (existing) return;
+
+		const shouldLogin = await this.showExtensionConfirm(
+			"Semantic setup: OpenRouter key missing",
+			"No OpenRouter API key found. Open login flow now?",
+		);
+		if (!shouldLogin) {
+			this.showWarning("OpenRouter key is missing. semantic index/query will fail until credentials are added.");
+			return;
+		}
+
+		await this.handleOpenRouterApiKeyLogin({ openModelSelector: false });
+		const afterLogin = await this.session.modelRegistry.authStorage.getApiKey(OPENROUTER_PROVIDER_ID);
+		if (!afterLogin) {
+			this.showWarning("OpenRouter key is still missing. You can run /login later.");
+		}
+	}
+
+	private async selectSemanticModelFromCatalog(
+		title: string,
+		catalogModels: string[],
+		currentModel: string,
+		options?: { highlightLikelyEmbedding?: boolean },
+	): Promise<string | undefined> {
+		const normalizedCurrent = currentModel.trim();
+		const uniqueModels: string[] = [];
+		const seen = new Set<string>();
+		for (const model of catalogModels) {
+			const normalized = model.trim();
+			if (!normalized || seen.has(normalized)) continue;
+			seen.add(normalized);
+			uniqueModels.push(normalized);
+		}
+
+		const optionToModel = new Map<string, string>();
+		const selectorOptions: string[] = [];
+		const addOption = (label: string, modelId: string): void => {
+			let uniqueLabel = label;
+			let suffix = 2;
+			while (optionToModel.has(uniqueLabel)) {
+				uniqueLabel = `${label} (${suffix})`;
+				suffix += 1;
+			}
+			optionToModel.set(uniqueLabel, modelId);
+			selectorOptions.push(uniqueLabel);
+		};
+
+		if (normalizedCurrent) {
+			addOption(`Current: ${normalizedCurrent}`, normalizedCurrent);
+		}
+
+		for (const modelId of uniqueModels) {
+			const marker =
+				options?.highlightLikelyEmbedding && isLikelyEmbeddingModelId(modelId) ? " [embedding]" : "";
+			addOption(`${modelId}${marker}`, modelId);
+		}
+
+		const manualOption = "Enter model manually";
+		selectorOptions.push(manualOption);
+
+		const selected = await this.showExtensionSelector(title, selectorOptions);
+		if (!selected) return undefined;
+
+		if (selected === manualOption) {
+			const modelInput = await this.showExtensionInput(`${title}: model`, normalizedCurrent || "model-id");
+			if (modelInput === undefined) return undefined;
+			const model = modelInput.trim();
+			if (!model) {
+				this.showWarning("Model cannot be empty.");
+				return undefined;
+			}
+			return model;
+		}
+
+		return optionToModel.get(selected);
+	}
+
+	private async runSemanticSetupWizard(initialScope?: SemanticScope): Promise<void> {
+		const cwd = this.sessionManager.getCwd();
+		const agentDir = getAgentDir();
+		const merged = loadMergedSemanticConfig(cwd, agentDir);
+		const config: SemanticSearchConfig = merged.config ?? getDefaultSemanticSearchConfig();
+
+		let scope = initialScope;
+		if (!scope) {
+			const pickedScope = await this.showExtensionSelector("/semantic setup: scope", [
+				"user (Recommended)",
+				"project",
+			]);
+			if (!pickedScope) {
+				this.showStatus("Semantic setup cancelled");
+				return;
+			}
+			scope = pickedScope.startsWith("project") ? "project" : "user";
+		}
+
+		const providerOption = await this.showExtensionSelector("/semantic setup: provider", [
+			"openrouter (Recommended)",
+			"ollama",
+			"custom_openai",
+		]);
+		if (!providerOption) {
+			this.showStatus("Semantic setup cancelled");
+			return;
+		}
+
+		const providerType: SemanticProviderType = providerOption.startsWith("ollama")
+			? "ollama"
+			: providerOption.startsWith("custom_openai")
+				? "custom_openai"
+				: "openrouter";
+
+		const providerDefaults: Record<SemanticProviderType, string> = {
+			openrouter: "openai/text-embedding-3-small",
+			ollama: "nomic-embed-text",
+			custom_openai: "text-embedding-3-small",
+		};
+
+		const currentModel = (
+			config.provider.type === providerType ? config.provider.model : providerDefaults[providerType]
+		).trim();
+		let model = currentModel;
+
+		const nextProvider: SemanticProviderConfig = {
+			...config.provider,
+			type: providerType,
+			model: model || providerDefaults[providerType],
+		};
+
+		if (providerType === "ollama") {
+			const defaultBase =
+				(config.provider.type === "ollama" ? config.provider.baseUrl : undefined) ?? "http://127.0.0.1:11434";
+			const baseUrlInput = await this.showExtensionInput("/semantic setup: ollama base URL", defaultBase);
+			if (baseUrlInput === undefined) {
+				this.showStatus("Semantic setup cancelled");
+				return;
+			}
+			const baseUrl = baseUrlInput.trim();
+			nextProvider.baseUrl = baseUrl || undefined;
+			nextProvider.apiKeyEnv = undefined;
+
+			let ollamaModels: string[] = [];
+			try {
+				ollamaModels = await listOllamaLocalModels({
+					baseUrl: nextProvider.baseUrl,
+					headers: config.provider.type === "ollama" ? config.provider.headers : undefined,
+					timeoutMs: nextProvider.timeoutMs,
+				});
+				if (ollamaModels.length === 0) {
+					this.showWarning("No local Ollama models found at /api/tags. You can enter model manually.");
+				}
+			} catch (error) {
+				const errorMsg = error instanceof Error ? error.message : String(error);
+				this.showWarning(`Failed to load Ollama models automatically: ${errorMsg}`);
+			}
+
+			const selectedModel = await this.selectSemanticModelFromCatalog(
+				"/semantic setup: ollama model",
+				ollamaModels,
+				currentModel || providerDefaults.ollama,
+				{ highlightLikelyEmbedding: true },
+			);
+			if (!selectedModel) {
+				this.showStatus("Semantic setup cancelled");
+				return;
+			}
+			model = selectedModel;
+		} else if (providerType === "custom_openai") {
+			const defaultBase =
+				(config.provider.type === "custom_openai" ? config.provider.baseUrl : undefined) ?? "http://127.0.0.1:8000/v1";
+			const baseUrlInput = await this.showExtensionInput("/semantic setup: custom base URL", defaultBase);
+			if (baseUrlInput === undefined) {
+				this.showStatus("Semantic setup cancelled");
+				return;
+			}
+			const baseUrl = baseUrlInput.trim();
+			if (!baseUrl) {
+				this.showWarning("Custom provider base URL cannot be empty.");
+				return;
+			}
+			nextProvider.baseUrl = baseUrl;
+
+			const defaultApiKeyEnv =
+				(config.provider.type === "custom_openai" ? config.provider.apiKeyEnv : undefined) ?? "OPENAI_API_KEY";
+			const apiKeyEnvInput = await this.showExtensionInput(
+				"/semantic setup: custom API key env (optional)",
+				defaultApiKeyEnv,
+			);
+			if (apiKeyEnvInput === undefined) {
+				this.showStatus("Semantic setup cancelled");
+				return;
+			}
+			nextProvider.apiKeyEnv = apiKeyEnvInput.trim() || undefined;
+
+			const modelInput = await this.showExtensionInput("/semantic setup: custom model", currentModel);
+			if (modelInput === undefined) {
+				this.showStatus("Semantic setup cancelled");
+				return;
+			}
+			const normalizedModel = modelInput.trim();
+			if (!normalizedModel) {
+				this.showWarning("Model cannot be empty.");
+				return;
+			}
+			model = normalizedModel;
+		} else {
+			nextProvider.baseUrl = undefined;
+			nextProvider.apiKeyEnv = undefined;
+
+			let openRouterModels: string[] = [];
+			try {
+				openRouterModels = await listOpenRouterEmbeddingModels({
+					timeoutMs: nextProvider.timeoutMs,
+					authStorage: this.session.modelRegistry.authStorage,
+				});
+				if (openRouterModels.length === 0) {
+					this.showWarning("OpenRouter embeddings catalog is empty. You can enter model manually.");
+				}
+			} catch (error) {
+				const errorMsg = error instanceof Error ? error.message : String(error);
+				this.showWarning(`Failed to load OpenRouter embedding models automatically: ${errorMsg}`);
+			}
+
+			const selectedModel = await this.selectSemanticModelFromCatalog(
+				"/semantic setup: openrouter model",
+				openRouterModels,
+				currentModel || providerDefaults.openrouter,
+			);
+			if (!selectedModel) {
+				this.showStatus("Semantic setup cancelled");
+				return;
+			}
+			model = selectedModel;
+		}
+
+		nextProvider.model = model;
+
+		while (true) {
+			const headersInput = await this.showExtensionInput(
+				"/semantic setup: headers (optional KEY=VALUE,CSV; press Enter to skip)",
+				"",
+			);
+			if (headersInput === undefined) {
+				this.showStatus("Semantic setup cancelled");
+				return;
+			}
+			const parsedHeaders = this.parseMcpKeyValueMapInput(headersInput);
+			if (parsedHeaders.error) {
+				this.showWarning(parsedHeaders.error);
+				continue;
+			}
+			nextProvider.headers = parsedHeaders.value;
+			break;
+		}
+
+		const nextConfig: SemanticSearchConfig = {
+			...config,
+			enabled: true,
+			provider: nextProvider,
+		};
+
+		const savedPath = upsertScopedSemanticSearchConfig(scope, nextConfig, cwd, agentDir);
+		if (providerType === "openrouter") {
+			await this.ensureOpenRouterSemanticCredentials();
+		}
+
+		this.showStatus(`Semantic setup saved (${scope})`);
+		this.showCommandTextBlock(
+			"Semantic Setup",
+			[
+				`scope: ${scope}`,
+				`provider: ${this.getSemanticSetupProviderLabel(providerType)}`,
+				`model: ${nextProvider.model}`,
+				`config: ${savedPath}`,
+				`index_dir: ${getSemanticIndexDir(cwd, agentDir)}`,
+			].join("\n"),
+		);
+	}
+
+	private async runSemanticInteractiveMenu(): Promise<void> {
+		while (true) {
+			let status: SemanticStatusResult | undefined;
+			try {
+				status = await this.createSemanticRuntime().status();
+			} catch (error) {
+				this.reportSemanticError(error, "status");
+			}
+
+			const summary = status
+				? `configured=${status.configured ? "yes" : "no"} indexed=${status.indexed ? "yes" : "no"} stale=${status.stale ? "yes" : "no"}`
+				: "status unavailable";
+			const selected = await this.showExtensionSelector(`/semantic manager\n${summary}`, [
+				"Configure provider/model",
+				"Show status",
+				"Index now",
+				"Rebuild index",
+				"Query index",
+				"Show config/index paths",
+				"Close",
+			]);
+			if (!selected || selected === "Close") {
+				return;
+			}
+
+			if (selected === "Configure provider/model") {
+				await this.runSemanticSetupWizard();
+				continue;
+			}
+			if (selected === "Show status") {
+				try {
+					const result = await this.runWithExtensionLoader("Checking semantic index status...", async () =>
+						this.createSemanticRuntime().status(),
+					);
+					this.showCommandTextBlock("Semantic Status", this.formatSemanticStatusReport(result));
+				} catch (error) {
+					this.reportSemanticError(error, "status");
+				}
+				continue;
+			}
+			if (selected === "Index now") {
+				try {
+					const result = await this.runWithExtensionLoader("Indexing semantic embeddings...", async () =>
+						this.createSemanticRuntime().index(),
+					);
+					this.showStatus(`Semantic index updated (${result.processedFiles} files).`);
+					this.showCommandTextBlock("Semantic Index", this.formatSemanticIndexReport(result));
+				} catch (error) {
+					this.reportSemanticError(error, "index");
+				}
+				continue;
+			}
+			if (selected === "Rebuild index") {
+				try {
+					const result = await this.runWithExtensionLoader("Rebuilding semantic index...", async () =>
+						this.createSemanticRuntime().rebuild(),
+					);
+					this.showStatus(`Semantic index rebuilt (${result.processedFiles} files).`);
+					this.showCommandTextBlock("Semantic Rebuild", this.formatSemanticIndexReport(result));
+				} catch (error) {
+					this.reportSemanticError(error, "rebuild");
+				}
+				continue;
+			}
+			if (selected === "Query index") {
+				const queryInput = await this.showExtensionInput("/semantic query", "where auth token is validated");
+				if (queryInput === undefined) continue;
+				const query = queryInput.trim();
+				if (!query) {
+					this.showWarning("Semantic query cannot be empty.");
+					continue;
+				}
+
+				const topKInput = await this.showExtensionInput("/semantic query: top-k (optional, 1..20)", "8");
+				if (topKInput === undefined) continue;
+				const topKRaw = topKInput.trim();
+				let topK: number | undefined = undefined;
+				if (topKRaw) {
+					const parsed = Number.parseInt(topKRaw, 10);
+					if (!Number.isFinite(parsed) || parsed < 1 || parsed > 20) {
+						this.showWarning("top-k must be an integer between 1 and 20.");
+						continue;
+					}
+					topK = parsed;
+				}
+
+				try {
+					const result = await this.runWithExtensionLoader("Querying semantic index...", async () =>
+						this.createSemanticRuntime().query(query, topK),
+					);
+					this.showCommandTextBlock("Semantic Query", this.formatSemanticQueryReport(result));
+				} catch (error) {
+					this.reportSemanticError(error, "query");
+				}
+				continue;
+			}
+			if (selected === "Show config/index paths") {
+				const runtime = this.createSemanticRuntime();
+				const cwd = this.sessionManager.getCwd();
+				const agentDir = getAgentDir();
+				try {
+					const semanticStatus = await this.runWithExtensionLoader("Loading semantic paths...", async () =>
+						runtime.status(),
+					);
+					this.showCommandTextBlock(
+						"Semantic Paths",
+						[
+							`user_config: ${getSemanticConfigPath("user", cwd, agentDir)}`,
+							`project_config: ${getSemanticConfigPath("project", cwd, agentDir)}`,
+							`index_dir: ${semanticStatus.indexPath}`,
+						].join("\n"),
+					);
+				} catch (error) {
+					this.reportSemanticError(error, "status");
+				}
+				continue;
+			}
+		}
+	}
+
+	private reportSemanticError(error: unknown, context: string): void {
+		if (error instanceof SemanticConfigMissingError) {
+			this.showWarning("Semantic search is not configured. Run /semantic setup.");
+			this.showCommandTextBlock(
+				"Semantic Config",
+				[
+					`user_config: ${error.userConfigPath}`,
+					`project_config: ${error.projectConfigPath}`,
+					"next: /semantic setup",
+				].join("\n"),
+			);
+			return;
+		}
+		if (error instanceof SemanticRebuildRequiredError) {
+			this.showWarning(error.message);
+			this.showWarning("Run /semantic rebuild.");
+			return;
+		}
+		const message = error instanceof Error ? error.message : String(error);
+		this.showError(`Semantic ${context} failed: ${message}`);
+	}
+
+	private async handleSemanticCommand(text: string): Promise<void> {
+		const args = this.parseSlashArgs(text).slice(1);
+		if (args.length === 0 || (args[0]?.toLowerCase() ?? "") === "ui") {
+			await this.runSemanticInteractiveMenu();
+			return;
+		}
+
+		const subcommand = (args[0] ?? "").toLowerCase();
+		const rest = args.slice(1);
+
+		if (subcommand === "help" || subcommand === "-h" || subcommand === "--help") {
+			this.showCommandTextBlock(
+				"Semantic Help",
+				[
+					"Usage:",
+					"  /semantic",
+					"  /semantic ui",
+					"  /semantic setup [--scope user|project]",
+					"  /semantic status",
+					"  /semantic index",
+					"  /semantic rebuild",
+					"  /semantic query <text> [--top-k N]",
+					"  /semantic help",
+				].join("\n"),
+			);
+			return;
+		}
+
+		if (subcommand === "setup") {
+			const parsedScope = this.parseSemanticScopeOptions(rest);
+			if (parsedScope.error) {
+				this.showWarning(parsedScope.error);
+				return;
+			}
+			if (parsedScope.rest.length > 0) {
+				this.showWarning(`Unexpected arguments for /semantic setup: ${parsedScope.rest.join(" ")}`);
+				return;
+			}
+			await this.runSemanticSetupWizard(parsedScope.scope);
+			return;
+		}
+
+		if (subcommand === "status") {
+			try {
+				const result = await this.runWithExtensionLoader("Checking semantic index status...", async () =>
+					this.createSemanticRuntime().status(),
+				);
+				this.showCommandTextBlock("Semantic Status", this.formatSemanticStatusReport(result));
+			} catch (error) {
+				this.reportSemanticError(error, "status");
+			}
+			return;
+		}
+
+		if (subcommand === "index") {
+			try {
+				const result = await this.runWithExtensionLoader("Indexing semantic embeddings...", async () =>
+					this.createSemanticRuntime().index(),
+				);
+				this.showStatus(`Semantic index updated (${result.processedFiles} files).`);
+				this.showCommandTextBlock("Semantic Index", this.formatSemanticIndexReport(result));
+			} catch (error) {
+				this.reportSemanticError(error, "index");
+			}
+			return;
+		}
+
+		if (subcommand === "rebuild") {
+			try {
+				const result = await this.runWithExtensionLoader("Rebuilding semantic index...", async () =>
+					this.createSemanticRuntime().rebuild(),
+				);
+				this.showStatus(`Semantic index rebuilt (${result.processedFiles} files).`);
+				this.showCommandTextBlock("Semantic Rebuild", this.formatSemanticIndexReport(result));
+			} catch (error) {
+				this.reportSemanticError(error, "rebuild");
+			}
+			return;
+		}
+
+		if (subcommand === "query") {
+			const parsed = this.parseSemanticTopKOptions(rest);
+			if (parsed.error) {
+				this.showWarning(parsed.error);
+				return;
+			}
+			const query = parsed.rest.join(" ").trim();
+			if (!query) {
+				this.showWarning("Usage: /semantic query <text> [--top-k N]");
+				return;
+			}
+
+			try {
+				const result = await this.runWithExtensionLoader("Querying semantic index...", async () =>
+					this.createSemanticRuntime().query(query, parsed.topK),
+				);
+				this.showCommandTextBlock("Semantic Query", this.formatSemanticQueryReport(result));
+			} catch (error) {
+				this.reportSemanticError(error, "query");
+			}
+			return;
+		}
+
+		this.showWarning(`Unknown /semantic subcommand "${subcommand}". Use /semantic help.`);
+	}
+
 	private parseCheckpointNameFromLabel(label: string | undefined): string | undefined {
 		if (!label) return undefined;
 		if (!label.startsWith(CHECKPOINT_LABEL_PREFIX)) return undefined;
@@ -6777,6 +7545,7 @@ export class InteractiveMode {
 				check.level === "fail",
 		);
 		const hasMcpIssues = checks.some((check) => check.label === "MCP servers" && check.level !== "ok");
+		const hasSemanticIssues = checks.some((check) => check.label === "Semantic index" && check.level !== "ok");
 		const hasResourceIssues = checks.some((check) => check.label === "Resources" && check.level !== "ok");
 
 		while (true) {
@@ -6790,6 +7559,9 @@ export class InteractiveMode {
 					options.push("Open MCP manager");
 				}
 				options.push("Refresh MCP runtime");
+			}
+			if (hasSemanticIssues) {
+				options.push("Open semantic manager");
 			}
 			if (this.permissionMode === "yolo") {
 				options.push("Set permissions mode to ask");
@@ -6823,6 +7595,10 @@ export class InteractiveMode {
 				this.showStatus("MCP servers refreshed");
 				continue;
 			}
+			if (selected === "Open semantic manager") {
+				await this.handleSemanticCommand("/semantic");
+				return;
+			}
 			if (selected === "Set permissions mode to ask") {
 				this.permissionMode = "ask";
 				this.settingsManager.setPermissionMode("ask");
@@ -6834,9 +7610,17 @@ export class InteractiveMode {
 				return;
 			}
 			if (selected === "Show auth/models paths") {
+				const cwd = this.sessionManager.getCwd();
+				const agentDir = getAgentDir();
 				this.showCommandTextBlock(
 					"Runtime Paths",
-					[`auth.json: ${getAuthPath()}`, `models.json: ${getModelsPath()}`].join("\n"),
+					[
+						`auth.json: ${getAuthPath()}`,
+						`models.json: ${getModelsPath()}`,
+						`semantic(user): ${getSemanticConfigPath("user", cwd, agentDir)}`,
+						`semantic(project): ${getSemanticConfigPath("project", cwd, agentDir)}`,
+						`semantic(index): ${getSemanticIndexDir(cwd, agentDir)}`,
+					].join("\n"),
 				);
 				continue;
 			}
@@ -6866,6 +7650,13 @@ export class InteractiveMode {
 		const mcpDisabled = mcpStatuses.filter((status) => !status.enabled).length;
 		const cliToolStatuses = resolveDoctorCliToolStatuses();
 		const missingCliTools = cliToolStatuses.filter((status) => !status.available).map((status) => status.tool);
+		let semanticStatus: SemanticStatusResult | undefined;
+		let semanticStatusError: string | undefined;
+		try {
+			semanticStatus = await this.createSemanticRuntime().status();
+		} catch (error) {
+			semanticStatusError = error instanceof Error ? error.message : String(error);
+		}
 
 		const checks: DoctorCheckItem[] = [];
 		const addCheck = (
@@ -6919,6 +7710,41 @@ export class InteractiveMode {
 			);
 		} else {
 			addCheck("ok", "MCP servers", `${mcpConnected} connected, ${mcpDisabled} disabled`);
+		}
+
+		if (semanticStatusError) {
+			addCheck("fail", "Semantic index", semanticStatusError, "Run /semantic setup and retry /semantic status.");
+		} else if (!semanticStatus) {
+			addCheck("warn", "Semantic index", "Status unavailable", "Run /semantic setup.");
+		} else if (!semanticStatus.configured) {
+			addCheck(
+				"warn",
+				"Semantic index",
+				"Not configured",
+				`Run /semantic setup (user: ${semanticStatus.configPathUser} or project: ${semanticStatus.configPathProject}).`,
+			);
+		} else if (!semanticStatus.enabled) {
+			addCheck("warn", "Semantic index", "Configured but disabled", "Enable semanticSearch.enabled or rerun /semantic setup.");
+		} else if (!semanticStatus.indexed) {
+			addCheck("warn", "Semantic index", "Configured but index is missing", "Run /semantic index.");
+		} else if (semanticStatus.stale) {
+			const requiresRebuild =
+				semanticStatus.staleReason === "provider_changed" ||
+				semanticStatus.staleReason === "chunking_changed" ||
+				semanticStatus.staleReason === "index_filters_changed" ||
+				semanticStatus.staleReason === "dimension_mismatch";
+			addCheck(
+				"warn",
+				"Semantic index",
+				`Indexed but stale${semanticStatus.staleReason ? ` (${semanticStatus.staleReason})` : ""}`,
+				requiresRebuild ? "Run /semantic rebuild." : "Run /semantic index.",
+			);
+		} else {
+			addCheck(
+				"ok",
+				"Semantic index",
+				`${semanticStatus.provider}/${semanticStatus.model} · files=${semanticStatus.files} chunks=${semanticStatus.chunks}`,
+			);
 		}
 
 		if (missingCliTools.length > 0) {

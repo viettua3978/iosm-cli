@@ -9,7 +9,7 @@ export function createRgTool(cwd: string): AgentTool<typeof externalCliSchema> {
 		name: "rg",
 		label: "rg",
 		description:
-			"Run ripgrep directly for advanced regex search. Args are passed directly to rg (no shell interpolation). Exit code 1 (no matches) is treated as success.",
+			"Run ripgrep directly for advanced regex search. Args are passed directly to rg (no shell interpolation). Prefer explicit path args (for example: [\"-n\",\"--hidden\",\"score\",\".\"]). Exit code 1 (no matches) is treated as success.",
 		commandCandidates: ["rg"],
 		ensureManagedTool: "rg",
 		allowExitCodes: [0, 1],

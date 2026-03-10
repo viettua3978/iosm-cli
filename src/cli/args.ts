@@ -214,8 +214,9 @@ ${chalk.bold("Commands:")}
   ${APP_NAME} update [source]          Update installed extensions (skips pinned sources)
   ${APP_NAME} list                     List installed extensions from settings
   ${APP_NAME} mcp <subcommand>         Manage MCP servers and inspect MCP tools
+  ${APP_NAME} semantic <subcommand>    Manage semantic index (status/index/rebuild/query)
   ${APP_NAME} config                   Open TUI to enable/disable package resources
-  ${APP_NAME} <command> --help         Show help for init/cycle/install/remove/update/list/mcp
+  ${APP_NAME} <command> --help         Show help for init/cycle/install/remove/update/list/mcp/semantic
 
 ${chalk.bold("Options:")}
   --provider <name>              Provider name (requires --model)
@@ -234,7 +235,7 @@ ${chalk.bold("Options:")}
                                  Supports globs (anthropic/*, *sonnet*) and fuzzy matching
 	--no-tools                     Disable all built-in tools
 	--tools <tools>                Comma-separated list of tools to enable (default: read,bash,edit,write)
-	                                 Available: read, bash, edit, write, grep, find, ls, rg, fd, ast_grep, comby, jq, yq, semgrep, sed
+	                                 Available: read, bash, edit, write, grep, find, ls, rg, fd, ast_grep, comby, jq, yq, semgrep, sed, semantic_search
   --thinking <level>             Set thinking level: off, minimal, low, medium, high, xhigh
   --extension, -e <path>         Load an extension file (can be used multiple times)
   --no-extensions, -ne           Disable extension discovery (explicit -e paths still work)
@@ -364,5 +365,6 @@ ${chalk.bold("Available Tools (default: read, bash, edit, write):")}
   yq     - YAML/JSON/TOML query/transform tool
   semgrep - Structural static/security scan tool
   sed    - Stream editing/extraction tool (no in-place edits)
+  semantic_search - Embedding-based semantic search (status/index/rebuild/query)
 `);
 }

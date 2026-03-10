@@ -12,6 +12,7 @@ Complete reference for `iosm-cli` settings, environment variables, profiles, and
 ~/.iosm/agent/
 ├── settings.json          # Global settings
 ├── mcp.json               # User MCP servers
+├── semantic.json          # User semantic search config
 ├── models.json            # Model configuration and preferences
 ├── auth.json              # Provider credentials (OAuth + API keys via /login)
 ├── keybindings.json       # Custom keyboard shortcuts
@@ -28,6 +29,7 @@ Complete reference for `iosm-cli` settings, environment variables, profiles, and
 ```
 .iosm/
 ├── settings.json          # Project-specific settings
+├── semantic.json          # Project semantic search overrides
 ├── extensions/            # Project extensions
 ├── skills/                # Project skills
 ├── prompts/               # Project prompt templates
@@ -105,6 +107,76 @@ MCP configs are loaded with project override precedence:
 
 ---
 
+## Semantic Search Configuration
+
+Semantic search is configured separately from settings and supports user/project override merge:
+
+1. `~/.iosm/agent/semantic.json`
+2. `.iosm/semantic.json` (project root, overrides user)
+
+Interactive setup:
+
+```bash
+/semantic setup
+```
+
+CLI actions:
+
+```bash
+iosm semantic status
+iosm semantic index
+iosm semantic query "where auth token is validated" --top-k 8
+iosm semantic rebuild
+```
+
+Schema (`semanticSearch` object):
+
+```json
+{
+  "semanticSearch": {
+    "enabled": true,
+    "provider": {
+      "type": "openrouter",
+      "model": "openai/text-embedding-3-small",
+      "baseUrl": "optional",
+      "apiKeyEnv": "optional",
+      "headers": {
+        "KEY": "VALUE"
+      },
+      "batchSize": 32,
+      "timeoutMs": 30000
+    },
+    "index": {
+      "includeGlobs": [
+        "**/*.{ts,tsx,js,jsx,py,go,rs,java,md,json,yaml,yml}"
+      ],
+      "excludeGlobs": [
+        "**/.git/**",
+        "**/node_modules/**",
+        "**/dist/**",
+        "**/build/**",
+        "**/.iosm/**"
+      ],
+      "chunkMaxChars": 1200,
+      "chunkOverlapChars": 200,
+      "maxFileBytes": 262144,
+      "maxFiles": 20000
+    }
+  }
+}
+```
+
+Index storage (global cache):
+
+```
+~/.iosm/agent/semantic/indexes/<project-hash>/
+├── meta.json
+├── chunks.jsonl
+└── vectors.jsonl
+```
+
+---
+
 ## Environment Variables
 
 ### Provider API Keys
@@ -118,7 +190,7 @@ MCP configs are loaded with project override precedence:
 | `GROQ_API_KEY` | Groq | |
 | `CEREBRAS_API_KEY` | Cerebras | |
 | `XAI_API_KEY` | xAI (Grok) | |
-| `OPENROUTER_API_KEY` | OpenRouter | Multi-provider gateway |
+| `OPENROUTER_API_KEY` | OpenRouter | Multi-provider gateway + default semantic embeddings key |
 | `MISTRAL_API_KEY` | Mistral | |
 | `MINIMAX_API_KEY` | MiniMax | |
 | `KIMI_API_KEY` | Kimi | |
@@ -165,7 +237,7 @@ Profiles control the agent's behavior, available tools, and system prompt.
 
 | Profile | Tools | Behavior |
 |---------|-------|----------|
-| `full` | All built-ins (read, bash, edit, write, grep, find, ls, rg, fd, ast_grep, comby, jq, yq, semgrep, sed) | Default full development capabilities |
+| `full` | All built-ins (read, bash, edit, write, grep, find, ls, rg, fd, ast_grep, comby, jq, yq, semgrep, sed, semantic_search) | Default full development capabilities |
 | `plan` | Read-only (read, grep, find, ls) | Architecture planning and code review |
 | `iosm` | All + IOSM context | IOSM cycle execution with artifact synchronization |
 

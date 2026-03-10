@@ -39,6 +39,7 @@ const READ_EXPLORATION_TOOLS = [
 	"yq",
 	"semgrep",
 	"sed",
+	"semantic_search",
 ] as const;
 
 const WRITE_ENGINEERING_TOOLS = ["read", "bash", "edit", "write", ...READ_EXPLORATION_TOOLS.slice(1)] as const;

@@ -192,6 +192,7 @@ export {
 	createReadTool,
 	createRgTool,
 	createSedTool,
+	createSemanticSearchTool,
 	createSemgrepTool,
 	createAstGrepTool,
 	createWriteTool,
@@ -242,6 +243,8 @@ export {
 } from "./core/skills.js";
 // Tools
 export {
+	type SemanticSearchToolInput,
+	type SemanticSearchToolOptions,
 	type BashOperations,
 	type BashSpawnContext,
 	type BashSpawnHook,
@@ -295,6 +298,7 @@ export {
 	type ReadToolOptions,
 	readTool,
 	sedTool,
+	semanticSearchTool,
 	semgrepTool,
 	type ToolsOptions,
 	type TruncationOptions,
@@ -309,6 +313,45 @@ export {
 	yqTool,
 	createExternalCliTool,
 } from "./core/tools/index.js";
+export type {
+	SemanticAction,
+	SemanticConfigFile,
+	SemanticIndexConfig,
+	SemanticIndexMeta,
+	SemanticIndexOperationResult,
+	SemanticMergedConfig,
+	SemanticProviderConfig,
+	SemanticProviderType,
+	SemanticQueryHit,
+	SemanticQueryResult,
+	SemanticScope,
+	SemanticScopedLoadResult,
+	SemanticSearchConfig,
+	SemanticStatusResult,
+	SemanticStaleReason,
+	SemanticToolResult,
+} from "./core/semantic/index.js";
+export {
+	SemanticConfigError,
+	SemanticConfigMissingError,
+	SemanticRebuildRequiredError,
+	SemanticSearchRuntime,
+	createSemanticEmbeddingProvider,
+	getDefaultSemanticSearchConfig,
+	getSemanticConfigPath,
+	getSemanticIndexDir,
+	getSemanticIndexFiles,
+	getSemanticIndexesDir,
+	getSemanticProjectHash,
+	getSemanticRootDir,
+	loadMergedSemanticConfig,
+	loadSemanticIndex,
+	readScopedSemanticConfig,
+	upsertScopedSemanticSearchConfig,
+	writeScopedSemanticConfig,
+	writeSemanticIndex,
+	clearSemanticIndex,
+} from "./core/semantic/index.js";
 // Main entry point
 export { main } from "./main.js";
 // Run modes for programmatic SDK usage

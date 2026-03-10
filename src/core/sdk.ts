@@ -38,6 +38,7 @@ import {
 	createRgTool,
 	createSedTool,
 	createSemgrepTool,
+	createSemanticSearchTool,
 	createTaskTool,
 	createToolsFromNames,
 	createWriteTool,
@@ -51,6 +52,7 @@ import {
 	readTool,
 	rgTool,
 	sedTool,
+	semanticSearchTool,
 	semgrepTool,
 	todoReadTool,
 	todoWriteTool,
@@ -84,7 +86,7 @@ export interface CreateAgentSessionOptions {
 	/** Models available for cycling (Ctrl+P in interactive mode) */
 	scopedModels?: Array<{ model: Model<any>; thinkingLevel?: ThinkingLevel }>;
 
-	/** Built-in tools to use. Default: codingTools [read, bash, edit, write] */
+	/** Built-in tools to use. Default: active profile tools (profile defaults to "full"). */
 	tools?: Tool[];
 	/** Custom tools to register (in addition to built-in tools). */
 	customTools?: ToolDefinition[];
@@ -157,6 +159,7 @@ export type { Tool } from "./tools/index.js";
 		yqTool,
 		semgrepTool,
 		sedTool,
+		semanticSearchTool,
 		codingTools,
 		readOnlyTools,
 		allTools as allBuiltInTools,
@@ -178,6 +181,7 @@ export type { Tool } from "./tools/index.js";
 		createYqTool,
 		createSemgrepTool,
 		createSedTool,
+		createSemanticSearchTool,
 	};
 
 // Helper Functions
@@ -324,9 +328,10 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		thinkingLevel = "off";
 	}
 
-	// Apply agent profile: overrides tools + thinkingLevel unless caller provided them explicitly
-	const profile = options.profile ? getAgentProfile(options.profile) : undefined;
-	if (profile && profile.name !== "full") {
+	// Apply agent profile: default to "full" when no explicit profile is provided.
+	// This keeps runtime tool availability aligned with UI/profile badges.
+	const profile = getAgentProfile(options.profile);
+	if (profile.name !== "full") {
 		// Profile overrides thinking level only when caller did not explicitly pass one
 		if (options.thinkingLevel === undefined && !hasExistingSession) {
 			thinkingLevel = profile.thinkingLevel;
@@ -338,20 +343,9 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 	}
 
 	const enableTaskTool = options.enableTaskTool !== false; // default true
-	const defaultActiveToolNames: string[] = [
-		"read",
-		"bash",
-		"edit",
-		"write",
-		...(enableTaskTool ? ["task"] : []),
-		"todo_write",
-		"todo_read",
-	];
-	const profileToolNames: string[] = profile
-		? [...profile.tools, ...(enableTaskTool ? ["task"] : []), "todo_write", "todo_read"].filter(
-				(n) => n === "task" || n in allTools,
-			)
-		: defaultActiveToolNames;
+	const profileToolNames: string[] = [...profile.tools, ...(enableTaskTool ? ["task"] : []), "todo_write", "todo_read"].filter(
+		(n) => n === "task" || n in allTools,
+	);
 
 	const initialActiveToolNames: string[] = options.tools
 		? options.tools.map((t) => t.name).filter((n) => n === "task" || n in allTools)
@@ -493,7 +487,9 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 					authStorage,
 					modelRegistry,
 					model: subModel,
-					tools: createToolsFromNames(runnerOptions.cwd, runnerOptions.tools),
+					tools: createToolsFromNames(runnerOptions.cwd, runnerOptions.tools, {
+						semantic: { authStorage, agentDir },
+					}),
 					sessionManager: SessionManager.inMemory(),
 					settingsManager,
 					enableTaskTool: false, // prevent recursive subagent spawning

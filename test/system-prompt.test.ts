@@ -103,4 +103,18 @@ describe("buildSystemPrompt", () => {
 			expect(prompt.match(/- Use dynamic_tool for summaries\./g)).toHaveLength(1);
 		});
 	});
+
+	describe("semantic search guidance", () => {
+		test("includes semantic_search tool description and semantic-vs-regex guidance when enabled", () => {
+			const prompt = buildSystemPrompt({
+				selectedTools: ["read", "rg", "ast_grep", "semantic_search"],
+				contextFiles: [],
+				skills: [],
+			});
+
+			expect(prompt).toContain("- semantic_search:");
+			expect(prompt).toContain("concept-level retrieval");
+			expect(prompt).toContain("hard to express with regex");
+		});
+	});
 });

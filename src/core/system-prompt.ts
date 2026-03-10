@@ -14,14 +14,18 @@ const toolDescriptions: Record<string, string> = {
 	grep: "Search file contents for patterns (respects .gitignore)",
 	find: "Find files by glob pattern (respects .gitignore)",
 	ls: "List directory contents",
-	rg: "Run ripgrep directly for advanced regex search",
+	rg: "Run ripgrep directly for advanced regex search (prefer explicit path args, e.g. -n pattern .)",
 	fd: "Run fd directly for fast file discovery",
-	ast_grep: "Run ast-grep for AST/syntax-aware structural code search",
-	comby: "Run comby for structural pattern search/rewrite previews (no in-place edits)",
+	ast_grep:
+		"Run ast-grep for AST/syntax-aware structural code search (prefer run --pattern; retry with scan/-p on older versions)",
+	comby:
+		"Run comby for structural pattern search/rewrite previews (prefer explicit -matcher; no in-place edits)",
 	jq: "Run jq for JSON querying/transformation",
 	yq: "Run yq for YAML/JSON/TOML querying/transformation",
 	semgrep: "Run semgrep for structural/static security checks",
 	sed: "Run sed for stream editing/extraction previews (no in-place edits)",
+	semantic_search:
+		"Semantic embeddings search over the project index (actions: status, index, rebuild, query)",
 	task: "Run a specialized subagent (supports profile, cwd, lock_key for optional write serialization, run_id/task_id, model override, background mode for detached runs, and agent=<custom name from .iosm/agents>)",
 };
 
@@ -147,6 +151,7 @@ export function buildSystemPrompt(options: BuildSystemPromptOptions = {}): strin
 	const hasYq = tools.includes("yq");
 	const hasSemgrep = tools.includes("semgrep");
 	const hasSed = tools.includes("sed");
+	const hasSemanticSearch = tools.includes("semantic_search");
 	const hasRead = tools.includes("read");
 
 	// File exploration guidelines
@@ -154,6 +159,12 @@ export function buildSystemPrompt(options: BuildSystemPromptOptions = {}): strin
 		addGuideline("Use bash for file operations like ls, rg, find; prefer rg for targeted search when available");
 	} else if (hasBash && (hasGrep || hasFind || hasLs || hasRg || hasFd)) {
 		addGuideline("Prefer grep/find/ls/rg/fd tools over bash for codebase exploration (faster and less noisy)");
+	}
+
+	if (hasRg || hasFd || hasAstGrep || hasComby || hasJq || hasYq || hasSemgrep || hasSed || hasSemanticSearch) {
+		addGuideline(
+			"Route work to specialized tools first: rg/fd (search/discovery), semantic_search (concept-level retrieval), ast_grep/comby (structural code queries), jq/yq (data/config transforms), semgrep (risk scans), sed (stream extraction)",
+		);
 	}
 
 	if (hasAstGrep || hasComby) {
@@ -174,6 +185,30 @@ export function buildSystemPrompt(options: BuildSystemPromptOptions = {}): strin
 
 	if (hasSed) {
 		addGuideline("Use sed for preview/extraction workflows only; perform final file edits with edit/write");
+	}
+
+	if (hasSemanticSearch) {
+		addGuideline(
+			"Use semantic_search for intent/meaning queries that are hard to express with regex; use rg/ast_grep for exact symbol and syntax matches",
+		);
+		addGuideline(
+			"If semantic_search reports stale/missing index, run semantic_search status and then semantic_search index (or rebuild when required) before semantic queries",
+		);
+	}
+
+	if (hasRg || hasAstGrep || hasComby) {
+		addGuideline(
+			"For rg/ast_grep/comby, pass explicit target paths to avoid cwd ambiguity; if syntax errors occur (especially ast_grep), retry once with version-compatible command forms before concluding no matches",
+		);
+	}
+
+	if (
+		hasBash &&
+		(hasRg || hasFd || hasAstGrep || hasComby || hasJq || hasYq || hasSemgrep || hasSed || hasSemanticSearch)
+	) {
+		addGuideline(
+			"If a required CLI tool is missing, install it first when permitted (rg/fd can be auto-managed; others via brew/apt/pipx/npm), then continue with that tool instead of broad bash fallback. For semantic_search, configure provider/index first via /semantic setup.",
+		);
 	}
 
 	// Read before edit guideline

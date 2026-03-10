@@ -1017,6 +1017,37 @@ describe("InteractiveMode memory command", () => {
 	});
 });
 
+describe("InteractiveMode semantic command", () => {
+	test("shows semantic help in command block", async () => {
+		const showCommandTextBlock = vi.fn();
+		const showWarning = vi.fn();
+		const fakeThis: any = Object.create((InteractiveMode as any).prototype);
+		fakeThis.showCommandTextBlock = showCommandTextBlock;
+		fakeThis.showWarning = showWarning;
+		fakeThis.parseSlashArgs = (InteractiveMode as any).prototype.parseSlashArgs.bind(fakeThis);
+
+		await (InteractiveMode as any).prototype.handleSemanticCommand.call(fakeThis, "/semantic help");
+
+		expect(showWarning).not.toHaveBeenCalled();
+		expect(showCommandTextBlock).toHaveBeenCalledWith(
+			"Semantic Help",
+			expect.stringContaining("/semantic setup"),
+		);
+	});
+
+	test("warns when /semantic query has no query text", async () => {
+		const showWarning = vi.fn();
+		const fakeThis: any = Object.create((InteractiveMode as any).prototype);
+		fakeThis.showWarning = showWarning;
+		fakeThis.showCommandTextBlock = vi.fn();
+		fakeThis.parseSlashArgs = (InteractiveMode as any).prototype.parseSlashArgs.bind(fakeThis);
+
+		await (InteractiveMode as any).prototype.handleSemanticCommand.call(fakeThis, "/semantic query --top-k 8");
+
+		expect(showWarning).toHaveBeenCalledWith("Usage: /semantic query <text> [--top-k N]");
+	});
+});
+
 describe("InteractiveMode.promptWithTaskFallback", () => {
 	test("routes @agent capability questions without task orchestration", async () => {
 		const tempDir = mkdtempSync(join(tmpdir(), "iosm-agent-mention-"));

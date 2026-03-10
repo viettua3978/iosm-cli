@@ -52,6 +52,11 @@ export const BUILTIN_SLASH_COMMANDS: ReadonlyArray<BuiltinSlashCommand> = [
 		description:
 			"Memory manager: /memory (interactive), /memory <text>, /memory edit <index> <text>, /memory rm <index>",
 	},
+	{
+		name: "semantic",
+		description:
+			"Semantic search manager: /semantic (interactive UI), /semantic setup|status|index|rebuild|query <text> [--top-k N]",
+	},
 	{ name: "settings", description: "Open settings menu" },
 	{
 		name: "permissions",

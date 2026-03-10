@@ -1,10 +1,10 @@
-<h1 align="center">IOSM CLI v0.1.2</h1>
+<h1 align="center">IOSM CLI v0.1.3</h1>
 
 <p align="center">
   <strong>AI Engineering Runtime for Professional Developers</strong>
 </p>
 <p align="center">
-  Interactive coding agent · IOSM methodology · MCP · Checkpoints · Subagent orchestration · Extensions
+  Interactive coding agent · IOSM methodology · MCP · Semantic Search · Checkpoints · Subagent orchestration · Extensions
 </p>
 
 <p align="center">
@@ -27,6 +27,7 @@ It is a runtime for production codebases:
 - a terminal-native coding agent with direct filesystem and shell tooling
 - primary operating profiles: **full** (default) and **iosm** (advanced, methodology-driven engineering cycles)
 - smart orchestration for complex tasks: parallel/sequential agents, dependency ordering, lock coordination, and worktree isolation
+- built-in semantic embeddings search (`semantic_search` tool + `/semantic` + `iosm semantic`)
 - repeatable codebase improvement workflows via **IOSM** (Improve -> Optimize -> Shrink -> Modularize)
 - auditable artifact history for cycles, decisions, and metric evolution across runs
 - operational controls for safe iteration (`/checkpoint`, `/rollback`, `/doctor`, `/memory`)
@@ -133,13 +134,14 @@ Core commands to unlock full runtime value:
 - `/orchestrate` — run parallel/sequential subagents with dependencies, locks, and optional worktrees
 - `/init` + `/iosm` — execute measurable IOSM cycles with artifacts and quality gates
 - `/mcp` — connect external tool ecosystems in interactive UI
+- `/semantic` — configure semantic provider, build/rebuild embeddings index, run meaning-based retrieval
 - `/memory` — persist project facts and constraints across sessions
 
 ## Real-World Example: Agent-Orchestrated IOSM Refactor
 
 ```console
 $ iosm
-IOSM CLI v0.1.2 [full]
+IOSM CLI v0.1.3 [full]
 
 you> Refactor authentication module with parallel agents, then finalize in IOSM mode
 iosm> /orchestrate --parallel --agents 4 \
@@ -257,6 +259,7 @@ Track and resume delegated execution with `/subagent-runs`, `/subagent-resume`, 
 | Run IOSM cycle | `/iosm [target-index] [--max-iterations N]` | Execute measurable improve/verify loops with artifact output |
 | Track delegated runs | `/subagent-runs`, `/subagent-resume`, `/team-runs`, `/team-status` | Monitor and resume orchestration pipelines |
 | Manage MCP servers | `/mcp` | Inspect/add/enable external tool servers interactively |
+| Manage semantic search | `/semantic` | Configure provider with auto model discovery (OpenRouter/Ollama), index codebase, query by intent/meaning |
 | Manage memory | `/memory` | Add/edit/remove persistent project facts and constraints |
 | Save/restore state | `/checkpoint` / `/rollback` | Safe experimentation with fast rollback |
 | Diagnose runtime | `/doctor` | Verify model/auth/MCP/resources when behavior is inconsistent |

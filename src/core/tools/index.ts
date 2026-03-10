@@ -90,6 +90,12 @@ export {
 	semgrepTool,
 } from "./semgrep.js";
 export {
+	createSemanticSearchTool,
+	type SemanticSearchToolInput,
+	type SemanticSearchToolOptions,
+	semanticSearchTool,
+} from "./semantic-search.js";
+export {
 	DEFAULT_MAX_BYTES,
 	DEFAULT_MAX_LINES,
 	formatSize,
@@ -146,6 +152,11 @@ import { createReadTool, type ReadToolOptions, readTool } from "./read.js";
 import { createRgTool, rgTool } from "./rg.js";
 import { createSedTool, sedTool } from "./sed.js";
 import { createSemgrepTool, semgrepTool } from "./semgrep.js";
+import {
+	createSemanticSearchTool,
+	type SemanticSearchToolOptions,
+	semanticSearchTool,
+} from "./semantic-search.js";
 import { createWriteTool, type WriteToolOptions, writeTool } from "./write.js";
 import { createYqTool, yqTool } from "./yq.js";
 import { todoWriteTool, todoReadTool } from "./todo.js";
@@ -170,6 +181,7 @@ export const readOnlyTools: Tool[] = [
 	yqTool,
 	semgrepTool,
 	sedTool,
+	semanticSearchTool,
 ];
 
 // All available tools (using process.cwd())
@@ -189,6 +201,7 @@ export const allTools = {
 	yq: yqTool,
 	semgrep: semgrepTool,
 	sed: sedTool,
+	semantic_search: semanticSearchTool,
 	todo_write: todoWriteTool,
 	todo_read: todoReadTool,
 };
@@ -204,6 +217,8 @@ export interface ToolsOptions {
 	edit?: EditToolOptions;
 	/** Options for the write tool */
 	write?: WriteToolOptions;
+	/** Options for the semantic_search tool */
+	semantic?: SemanticSearchToolOptions;
 }
 
 /**
@@ -235,6 +250,7 @@ export function createReadOnlyTools(cwd: string, options?: ToolsOptions): Tool[]
 		createYqTool(cwd),
 		createSemgrepTool(cwd),
 		createSedTool(cwd),
+		createSemanticSearchTool(cwd, options?.semantic),
 	];
 }
 
@@ -258,6 +274,7 @@ export function createAllTools(cwd: string, options?: ToolsOptions): Record<Tool
 		yq: createYqTool(cwd),
 		semgrep: createSemgrepTool(cwd),
 		sed: createSedTool(cwd),
+		semantic_search: createSemanticSearchTool(cwd, options?.semantic),
 		todo_write: todoWriteTool,
 		todo_read: todoReadTool,
 	};

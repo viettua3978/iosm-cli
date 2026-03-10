@@ -98,6 +98,22 @@ View and manage configuration.
 iosm config
 ```
 
+### `iosm semantic`
+
+Semantic index management for meaning-based retrieval.
+
+```bash
+iosm semantic help
+iosm semantic status
+iosm semantic index
+iosm semantic rebuild
+iosm semantic query "<text>" [--top-k N]
+```
+
+Notes:
+- If semantic config is missing, the command prints actionable paths and suggests `/semantic setup`.
+- `query` auto-refreshes stale indexes incrementally; provider/chunk/filter changes require `rebuild`.
+
 ---
 
 ## Core Options
@@ -209,12 +225,13 @@ iosm --api-key sk-test-123           # Override for this run
 
 ### Available Tools
 
-`read`, `bash`, `edit`, `write`, `grep`, `find`, `ls`, `rg`, `fd`, `ast_grep`, `comby`, `jq`, `yq`, `semgrep`, `sed`
+`read`, `bash`, `edit`, `write`, `grep`, `find`, `ls`, `rg`, `fd`, `ast_grep`, `comby`, `jq`, `yq`, `semgrep`, `sed`, `semantic_search`
 
 Tool notes:
 - `rg`, `fd` are managed by iosm-cli and auto-resolved when missing.
 - `ast_grep`, `comby`, `jq`, `yq`, `semgrep` are optional external CLIs and should be available in `PATH` to use their tools.
 - `sed` tool is preview/extraction-oriented; in-place edits are intentionally blocked.
+- `semantic_search` uses configured embeddings provider/index (`/semantic setup`).
 
 **Examples:**
 

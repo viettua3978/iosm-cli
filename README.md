@@ -23,12 +23,15 @@
 
 **IOSM CLI** (`iosm-cli`) is not a chat wrapper around an LLM.
 
-It is an engineering runtime designed for production work:
+It is a runtime for production codebases:
 - a terminal-native coding agent with direct filesystem and shell tooling
+- dual operating modes: **standard** (default) and **iosm** (advanced, methodology-driven engineering cycles)
 - repeatable codebase improvement workflows via **IOSM** (Improve -> Optimize -> Shrink -> Modularize)
 - auditable artifact history for cycles, decisions, and metric evolution across runs
 - operational controls for safe iteration (`/checkpoint`, `/rollback`, `/doctor`, `/memory`)
 - extensibility for teams (MCP + extensions) and embedding (SDK + JSON/RPC modes)
+
+Adoption path is layered: start in **standard** mode for low-friction daily usage, then switch to **iosm** mode when you need advanced IOSM cycles, metrics, and governance.
 
 ## Why It Exists
 
@@ -57,7 +60,8 @@ This is not a “better/worse” claim. It is a positioning map so teams can cho
 
 ## Who It Is For
 
-- engineers handling refactors with non-trivial blast radius
+- developers at any level: start in **standard** mode and be productive quickly
+- advanced engineers and tech leads using **iosm** mode for high-risk refactors and system-level change
 - teams that need auditability, rollback, and repeatable improvement history
 - platform/backend teams that operationalize AI coding into reliable workflows
 - teams building internal coding automation on top of a CLI runtime
@@ -87,6 +91,7 @@ Inside the session:
 1. `/login` (or `/auth`) to configure provider credentials.
 2. `/model` to select the active model.
 3. Ask your task.
+4. Use `Shift+Tab` (or launch with `iosm --profile iosm`) when you need advanced IOSM cycle workflow.
 
 High-value first commands:
 - `/doctor` - verify model/auth/MCP/resources state

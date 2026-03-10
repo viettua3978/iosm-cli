@@ -1,4 +1,4 @@
-<h1 align="left">IOSM CLI v0.1.0</h1>
+<h1 align="center">IOSM CLI v0.1.0</h1>
 
 <p align="center">
   <strong>AI Engineering Runtime for Professional Developers</strong>

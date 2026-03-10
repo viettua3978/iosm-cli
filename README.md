@@ -218,16 +218,20 @@ Track and resume delegated execution with `/subagent-runs`, `/subagent-resume`, 
 
 ## Core Commands
 
-| Goal | Command |
-|------|---------|
-| Start fresh session | `/new` or `/clear` |
-| Set auth | `/login` or `/auth` |
-| Pick model | `/model` |
-| Diagnose setup | `/doctor` |
-| Manage MCP servers | `/mcp` |
-| Manage session memory | `/memory` |
-| Save/restore state | `/checkpoint` / `/rollback` |
-| Manage settings | `/settings` |
+| Workflow Step | Command | Why It Matters |
+|------|---------|----------------|
+| Start clean context | `/new` or `/clear` | Reset session state before a new task or after context drift |
+| Configure auth | `/login` or `/auth` | Set provider credentials with guided flow |
+| Select active model | `/model` | Choose provider/model category for current workload |
+| Launch multi-agent execution | `/orchestrate ...` | Split complex tasks across agents with dependencies, locks, and optional worktrees |
+| Initialize IOSM workspace | `/init` | Bootstrap/update IOSM files and cycle workspace |
+| Run IOSM cycle | `/iosm [target-index] [--max-iterations N]` | Execute measurable improve/verify loops with artifact output |
+| Track delegated runs | `/subagent-runs`, `/subagent-resume`, `/team-runs`, `/team-status` | Monitor and resume orchestration pipelines |
+| Manage MCP servers | `/mcp` | Inspect/add/enable external tool servers interactively |
+| Manage memory | `/memory` | Add/edit/remove persistent project facts and constraints |
+| Save/restore state | `/checkpoint` / `/rollback` | Safe experimentation with fast rollback |
+| Diagnose runtime | `/doctor` | Verify model/auth/MCP/resources when behavior is inconsistent |
+| Manage settings | `/settings` | Tune runtime defaults and operational preferences |
 
 ## IOSM In One Line
 
@@ -258,7 +262,15 @@ Use the docs as the source of truth for details.
 | Sessions, traces, export | [docs/sessions-traces-export.md](./docs/sessions-traces-export.md) |
 | JSON/RPC/SDK usage | [docs/rpc-json-sdk.md](./docs/rpc-json-sdk.md) |
 | Full docs index | [docs/README.md](./docs/README.md) |
-| Full IOSM specification | [iosm-spec.md](./iosm-spec.md) |
+| Full IOSM specification (local) | [iosm-spec.md](./iosm-spec.md) |
+| IOSM methodology spec (canonical) | [github.com/rokoss21/IOSM](https://github.com/rokoss21/IOSM) |
+
+## Related Repositories
+
+| Repository | Description |
+|------------|-------------|
+| [IOSM](https://github.com/rokoss21/IOSM) | Canonical IOSM v1.0 specification, schemas, artifact templates, and validation scripts |
+| [iosm-cli](https://github.com/rokoss21/iosm-cli) | This repo — CLI runtime that implements the IOSM methodology as an engineering agent |
 
 ## Development
 

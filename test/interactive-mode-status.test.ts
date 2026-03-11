@@ -1771,9 +1771,9 @@ describe("InteractiveMode.promptWithTaskFallback", () => {
 		expect(prompt).toHaveBeenCalledTimes(1);
 		const [generatedPrompt, options] = prompt.mock.calls[0] as [string, Record<string, unknown>];
 		expect(generatedPrompt).toContain('<orchestrate mode="parallel" agents="1" max_parallel="20">');
-		expect(generatedPrompt).toContain("- agent 1: profile=meta cwd=/tmp/workspace");
+		expect(generatedPrompt).toContain("- agent 1: profile=meta cwd=/tmp/workspace agent=meta_orchestrator");
 		expect(generatedPrompt).toContain("task: добавь интересную фичу в протокол");
-		expect(generatedPrompt).toContain('MUST call task tool with profile="meta"');
+		expect(generatedPrompt).toContain('MUST call task tool with agent="meta_orchestrator" and profile="meta"');
 		expect(generatedPrompt).toContain("Include delegate_parallel_hint in the task call.");
 		expect(generatedPrompt).toContain("DELEGATION_IMPOSSIBLE: <reason>");
 		expect(options).toEqual({

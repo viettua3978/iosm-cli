@@ -699,13 +699,14 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 					return resolvedName ? current.agents.find((agent) => agent.name === resolvedName) : undefined;
 				},
 				availableCustomSubagents: initialCustomSubagents.agents.map((agent) => agent.name),
-				availableCustomSubagentHints: initialCustomSubagents.agents.map((agent) => ({
-					name: agent.name,
-					description: agent.description,
-				})),
-				getMetaMessages: () => sessionRef?.getMetaMessages() ?? [],
-			})
-		: undefined;
+					availableCustomSubagentHints: initialCustomSubagents.agents.map((agent) => ({
+						name: agent.name,
+						description: agent.description,
+					})),
+					getMetaMessages: () => sessionRef?.getMetaMessages() ?? [],
+					hostProfileName: profile?.name,
+				})
+			: undefined;
 
 	// Wire in ask_user, task tool, and any caller-supplied custom tools
 	const baseCustomTools: ToolDefinition[] = [

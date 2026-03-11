@@ -171,6 +171,8 @@ export interface TaskToolOptions {
 	availableCustomSubagentHints?: Array<{ name: string; description: string }>;
 	/** Returns pending live meta updates entered during an active run. */
 	getMetaMessages?: () => readonly string[];
+	/** Parent session profile name (for policy-aware task defaults). */
+	hostProfileName?: string;
 }
 
 /** Tool names available per profile */
@@ -912,19 +914,31 @@ export function createTaskTool(
 					throw new Error(`Unknown subagent: ${normalizedAgentName}.${available}`);
 				}
 
-				// Recovery path: if model placed a custom agent name into `profile`, remap automatically.
-				if (!customSubagent) {
-					const profileAsAgent = resolveCustom(normalizedProfile);
-					if (profileAsAgent) {
+					// Recovery path: if model placed a custom agent name into `profile`, remap automatically.
+					if (!customSubagent) {
+						const profileAsAgent = resolveCustom(normalizedProfile);
+						if (profileAsAgent) {
 						customSubagent = profileAsAgent;
 						normalizedAgentName = profileAsAgent.name;
-						normalizedProfile = (profileAsAgent.profile ?? "full").trim().toLowerCase();
+							normalizedProfile = (profileAsAgent.profile ?? "full").trim().toLowerCase();
+						}
 					}
-				}
 
-				if (!toolsByProfile[normalizedProfile]) {
-					normalizedProfile = "full";
-				}
+					const hostProfile = options?.hostProfileName?.trim().toLowerCase();
+					const shouldCoerceRootTaskToMeta =
+						hostProfile === "meta" &&
+						!normalizedAgentName &&
+						!customSubagent &&
+						!orchestrationRunId &&
+						!orchestrationTaskId &&
+						normalizedProfile !== "meta";
+					if (shouldCoerceRootTaskToMeta) {
+						normalizedProfile = "meta";
+					}
+
+					if (!toolsByProfile[normalizedProfile]) {
+						normalizedProfile = "full";
+					}
 
 				const effectiveProfile = customSubagent?.profile ?? normalizedProfile;
 			let tools = customSubagent?.tools
@@ -935,27 +949,32 @@ export function createTaskTool(
 				tools = tools.filter((tool) => !blocked.has(tool));
 			}
 			const delegationDepth = maxDelegationDepthFromEnv;
-			const requestedDelegateParallelHint =
-				typeof delegateParallelHint === "number" && Number.isInteger(delegateParallelHint)
-					? Math.max(1, Math.min(10, delegateParallelHint))
-					: undefined;
+				const requestedDelegateParallelHint =
+					typeof delegateParallelHint === "number" && Number.isInteger(delegateParallelHint)
+						? Math.max(1, Math.min(10, delegateParallelHint))
+						: undefined;
 				const autoDelegateParallelHint =
 					requestedDelegateParallelHint === undefined
 						? deriveAutoDelegateParallelHint(effectiveProfile, normalizedAgentName, description, prompt)
 						: undefined;
-			const effectiveDelegateParallelHint = requestedDelegateParallelHint ?? autoDelegateParallelHint;
-			const effectiveMaxDelegations = Math.max(
-				0,
-				Math.min(maxDelegationsPerTaskFromEnv, effectiveDelegateParallelHint ?? maxDelegationsPerTaskFromEnv),
-			);
-			const effectiveMaxDelegateParallel = Math.max(
-				1,
-				Math.min(maxDelegatedParallelFromEnv, effectiveDelegateParallelHint ?? maxDelegatedParallelFromEnv),
-			);
-			const minDelegationsPreferred =
-				(effectiveDelegateParallelHint ?? 0) >= 2 && effectiveMaxDelegations >= 2
-					? Math.min(2, effectiveMaxDelegations)
-					: 0;
+				const enforcedMetaParallelFloor = shouldCoerceRootTaskToMeta ? 3 : 0;
+				let effectiveDelegateParallelHint = requestedDelegateParallelHint ?? autoDelegateParallelHint;
+				if (enforcedMetaParallelFloor > 0 && (effectiveDelegateParallelHint ?? 0) < enforcedMetaParallelFloor) {
+					effectiveDelegateParallelHint = enforcedMetaParallelFloor;
+				}
+				const effectiveMaxDelegations = Math.max(
+					0,
+					Math.min(maxDelegationsPerTaskFromEnv, effectiveDelegateParallelHint ?? maxDelegationsPerTaskFromEnv),
+				);
+				const effectiveMaxDelegateParallel = Math.max(
+					1,
+					Math.min(maxDelegatedParallelFromEnv, effectiveDelegateParallelHint ?? maxDelegatedParallelFromEnv),
+				);
+				const preferredDelegationFloor = effectiveProfile === "meta" ? 3 : 2;
+				const minDelegationsPreferred =
+					(effectiveDelegateParallelHint ?? 0) >= 2 && effectiveMaxDelegations >= 2
+						? Math.min(preferredDelegationFloor, effectiveMaxDelegations, effectiveDelegateParallelHint ?? preferredDelegationFloor)
+						: 0;
 			const baseSystemPrompt =
 				customSubagent?.systemPrompt ??
 				systemPromptByProfile[effectiveProfile] ??

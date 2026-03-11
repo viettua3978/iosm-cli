@@ -10336,11 +10336,11 @@ export class InteractiveMode {
 		if (this.activeProfileName === "meta") {
 			const metaPrompt = [
 				'<orchestrate mode="parallel" agents="1" max_parallel="20">',
-				`- agent 1: profile=meta cwd=${this.sessionManager.getCwd()}`,
+				`- agent 1: profile=meta cwd=${this.sessionManager.getCwd()} agent=meta_orchestrator`,
 				`task: ${userInput}`,
 				"constraints:",
 				"- active profile is meta orchestration mode",
-				'- MUST call task tool with profile="meta"',
+				'- MUST call task tool with agent="meta_orchestrator" and profile="meta"',
 				"- Include delegate_parallel_hint in the task call.",
 				"- Set delegate_parallel_hint adaptively: simple=1, medium=3-6, complex/risky=7-10.",
 				"- For non-trivial tasks, prefer delegate_parallel_hint >= 2 and split into independent <delegate_task> workstreams.",

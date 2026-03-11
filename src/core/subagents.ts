@@ -239,6 +239,7 @@ const BUILTIN_SUBAGENTS: CustomSubagentDefinition[] = [
 				"- Use depends_on to enforce ordering for dependent steps (for example verification after implementation).",
 				"- Use clear description values and focused prompts per delegate.",
 				"- Do not keep doing direct implementation in the orchestrator after recon for non-trivial work; delegate first.",
+				"- Do not collapse the whole implementation into one specialist delegate when multiple independent workstreams exist.",
 				"- If you keep non-trivial work single-agent, include one line: DELEGATION_IMPOSSIBLE: <reason>.",
 			"",
 			"Suggested specialist mapping:",

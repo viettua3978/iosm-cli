@@ -101,6 +101,9 @@ describe("loadCustomSubagents", () => {
 		expect(loaded.agents.find((agent) => agent.name === "meta_orchestrator")?.instructions).toContain(
 			"Recon is only preparation; once you can name the workstreams, stop exploring and delegate.",
 		);
+		expect(loaded.agents.find((agent) => agent.name === "meta_orchestrator")?.instructions).toContain(
+			"Do not collapse the whole implementation into one specialist delegate",
+		);
 	});
 
 	it("allows project agents to override built-in system agents by name", () => {

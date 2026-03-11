@@ -84,6 +84,7 @@ import { getLatestCompactionEntry } from "./session-manager.js";
 import type { SettingsManager } from "./settings-manager.js";
 import { BUILTIN_SLASH_COMMANDS, type SlashCommandInfo, type SlashCommandLocation } from "./slash-commands.js";
 import { buildSystemPrompt } from "./system-prompt.js";
+import type { AgentProfileName } from "./agent-profiles.js";
 import {
 	applyPostToolUseHooks,
 	applyPreToolUseHooks,
@@ -209,6 +210,27 @@ function buildSubagentOrchestrationDirective(text: string): string | undefined {
 	return undefined;
 }
 
+function buildMetaProfileOrchestrationDirective(text: string): string | undefined {
+	if (parseOrchestrateBlock(text)) {
+		return undefined;
+	}
+
+	return [
+		"[META_ORCHESTRATION_DIRECTIVE]",
+		"Session profile is meta. The main/root agent remains the orchestrator for this request.",
+		"If this prompt is not actionable repository work, you may ignore this directive.",
+		"For actionable repository work, keep recon bounded and read-only, just enough to identify the workstreams.",
+		"For medium or complex work, the main/root agent MUST orchestrate with multiple top-level `task` calls in the parent turn when independent streams exist.",
+		"Do NOT collapse the whole task into one root implementation subagent.",
+		"Do NOT hand the entire job to a single write-capable specialist such as iosm_change_executor when the work can be partitioned.",
+		"Use specialist/custom agents as focused workstreams within a broader execution graph, not as the sole executor for the entire non-trivial task.",
+		"If you need clarification first, ask it concisely; once clarified, continue with orchestration.",
+		"If the user specified agent/delegate counts or parallelism constraints, treat them as hard execution requirements.",
+		"For non-trivial work where implementation, tests, verification, docs, or risk analysis can be separated, prefer 3 or more focused task calls rather than 1.",
+		"If you truly cannot split the work into multiple top-level tasks, include one line: DELEGATION_IMPOSSIBLE: <precise reason>.",
+	].join("\n");
+}
+
 /** Session-specific events that extend the core AgentEvent */
 export type AgentSessionEvent =
 	| AgentEvent
@@ -257,6 +279,8 @@ export interface AgentSessionConfig {
 	systemPromptSuffix?: string;
 	/** Enable IOSM runtime context injection/autopilot for this session. Default: true. */
 	iosmAutopilotEnabled?: boolean;
+	/** Optional active profile name for runtime prompt policies. */
+	profileName?: AgentProfileName | string;
 	/** Optional permission handler called before destructive built-in tools execute. */
 	toolPermissionHandler?: (request: ToolPermissionRequest) => Promise<boolean>;
 }
@@ -407,6 +431,7 @@ export class AgentSession {
 	private _baseSystemPrompt = "";
 	private _systemPromptSuffix?: string;
 	private _iosmAutopilotEnabled = true;
+	private _profileName?: string;
 	private _toolPermissionHandler?: (request: ToolPermissionRequest) => Promise<boolean>;
 	private _hooksConfig: LoadedHooksConfig = emptyHooksConfig();
 	private _pendingHookNotices: Array<{ event: HookEventName; message: string }> = [];
@@ -427,6 +452,7 @@ export class AgentSession {
 		this._baseToolsOverride = config.baseToolsOverride;
 		this._systemPromptSuffix = config.systemPromptSuffix || undefined;
 		this._iosmAutopilotEnabled = config.iosmAutopilotEnabled !== false;
+		this._profileName = config.profileName?.trim().toLowerCase() || undefined;
 		this._toolPermissionHandler = config.toolPermissionHandler;
 		this._hooksConfig = this._resourceLoader.getHooks?.() ?? emptyHooksConfig();
 		this._refreshSessionTracePath("session_start");
@@ -1303,7 +1329,8 @@ export class AgentSession {
 		}
 		const orchestrationDirective = options?.skipOrchestrationDirective
 			? undefined
-			: buildSubagentOrchestrationDirective(expandedText);
+			: buildSubagentOrchestrationDirective(expandedText) ??
+				(this._profileName === "meta" ? buildMetaProfileOrchestrationDirective(expandedText) : undefined);
 		const promptText = orchestrationDirective ? `${expandedText}\n\n${orchestrationDirective}` : expandedText;
 		this._appendSessionTrace({
 			type: "prompt_expanded",

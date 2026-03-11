@@ -767,6 +767,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		extensionRunnerRef,
 		systemPromptSuffix: profile?.systemPromptAppend || undefined,
 		iosmAutopilotEnabled: profile?.name === "iosm",
+		profileName: profile?.name,
 	});
 	sessionRef = session;
 	const extensionsResult = resourceLoader.getExtensions();

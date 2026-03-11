@@ -20,6 +20,7 @@ describe("agent profiles", () => {
 		expect(AGENT_PROFILES.meta.systemPromptAppend).toContain("bounded read-only recon");
 		expect(AGENT_PROFILES.meta.systemPromptAppend).toContain("do not make direct write/edit changes in the main agent before launching the first task call");
 		expect(AGENT_PROFILES.meta.systemPromptAppend).toContain("if the user requested a specific number of parallel agents");
+		expect(AGENT_PROFILES.meta.systemPromptAppend).toContain("multiple top-level task calls");
 	});
 
 	it("includes meta in main profile cycling order", () => {

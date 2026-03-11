@@ -827,6 +827,86 @@ describe("InteractiveMode OpenRouter login flow", () => {
 	});
 });
 
+describe("InteractiveMode models.dev API-key provider hydration", () => {
+	test("registers models.dev provider models after API-key login", async () => {
+		const authStorage = AuthStorage.inMemory();
+		const registeredModels: Array<{ provider: string; id: string }> = [];
+		const registerProvider = vi.fn((providerId: string, config: { models?: Array<{ id: string }> }) => {
+			for (const model of config.models ?? []) {
+				registeredModels.push({ provider: providerId, id: model.id });
+			}
+		});
+		const getAll = vi.fn(() => registeredModels);
+		const updateAvailableProviderCount = vi.fn(async () => { });
+		const showModelProviderSelector = vi.fn(async () => { });
+		const showStatus = vi.fn();
+		const showWarning = vi.fn();
+		const showExtensionInput = vi.fn(async () => "z-key-123");
+		const showExtensionConfirm = vi.fn(async () => true);
+
+		const fakeThis: any = Object.create((InteractiveMode as any).prototype);
+		fakeThis.session = {
+			modelRegistry: {
+				authStorage,
+				getAll,
+				registerProvider,
+			},
+		};
+		fakeThis.updateAvailableProviderCount = updateAvailableProviderCount;
+		fakeThis.showModelProviderSelector = showModelProviderSelector;
+		fakeThis.showStatus = showStatus;
+		fakeThis.showWarning = showWarning;
+		fakeThis.showExtensionInput = showExtensionInput;
+		fakeThis.showExtensionConfirm = showExtensionConfirm;
+		fakeThis.getProviderDisplayName = (InteractiveMode as any).prototype.getProviderDisplayName.bind(fakeThis);
+		fakeThis.modelsDevProviderCatalogById = new Map([
+			[
+				"zai-coding-plan",
+				{
+					id: "zai-coding-plan",
+					name: "Z.AI Coding Plan",
+					env: ["ZHIPU_API_KEY"],
+					api: "https://api.z.ai/api/coding/paas/v4",
+					npm: "@ai-sdk/openai-compatible",
+					models: [
+						{
+							id: "glm-5",
+							name: "GLM-5",
+							reasoning: true,
+							input: ["text"],
+							cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+							contextWindow: 128000,
+							maxTokens: 8192,
+							headers: {},
+							api: "https://api.z.ai/api/coding/paas/v4",
+							npm: "@ai-sdk/openai-compatible",
+						},
+					],
+				},
+			],
+		]);
+		fakeThis.refreshModelsDevProviderCatalog = vi.fn(async () => { });
+
+		await (InteractiveMode as any).prototype.handleApiKeyLogin.call(fakeThis, "zai-coding-plan", {
+			providerName: "Z.AI Coding Plan",
+		});
+
+		expect(registerProvider).toHaveBeenCalledTimes(1);
+		expect(registerProvider).toHaveBeenCalledWith(
+			"zai-coding-plan",
+			expect.objectContaining({
+				baseUrl: "https://api.z.ai/api/coding/paas/v4",
+				models: [expect.objectContaining({ id: "glm-5", api: "openai-completions" })],
+			}),
+		);
+		expect(updateAvailableProviderCount).toHaveBeenCalledTimes(1);
+		expect(showModelProviderSelector).toHaveBeenCalledWith("zai-coding-plan");
+		expect(showWarning).not.toHaveBeenCalled();
+		expect(showStatus).toHaveBeenCalledWith(expect.stringContaining("API key saved"));
+		expect(authStorage.get("zai-coding-plan")).toEqual({ type: "api_key", key: "z-key-123" });
+	});
+});
+
 describe("InteractiveMode doctor command", () => {
 	test("includes external CLI tool status block in JSON report", async () => {
 		const showCommandJsonBlock = vi.fn();
@@ -911,6 +991,47 @@ describe("OAuthSelectorComponent login providers", () => {
 		const rendered = stripAnsi(selector.render(120).join("\n"));
 		expect(rendered).toContain("OpenRouter");
 		expect(rendered).toContain("API key");
+	});
+
+	test("renders injected API key providers in login selector", () => {
+		initTheme("dark");
+		const authStorage = AuthStorage.inMemory();
+		const selector = new OAuthSelectorComponent(
+			"login",
+			authStorage,
+			() => { },
+			() => { },
+			[
+				{ id: "openrouter", name: "OpenRouter", kind: "api_key" },
+				{ id: "deepseek", name: "DeepSeek", kind: "api_key" },
+			],
+		);
+
+		const rendered = stripAnsi(selector.render(120).join("\n"));
+		expect(rendered).toContain("OpenRouter");
+		expect(rendered).toContain("DeepSeek");
+		expect(rendered).toContain("API key");
+	});
+
+	test("limits visible rows and allows filtering in long provider lists", () => {
+		initTheme("dark");
+		const authStorage = AuthStorage.inMemory();
+		const manyProviders = Array.from({ length: 25 }, (_, i) => {
+			const index = String(i + 1).padStart(2, "0");
+			return { id: `provider-${index}`, name: `Provider ${index}`, kind: "api_key" as const };
+		});
+		const selector = new OAuthSelectorComponent("login", authStorage, () => { }, () => { }, manyProviders);
+
+		const initialRendered = stripAnsi(selector.render(120).join("\n"));
+		expect(initialRendered).toContain("Provider 01");
+		expect(initialRendered).not.toContain("Provider 25");
+
+		for (const ch of "provider 25") {
+			selector.handleInput(ch);
+		}
+		const filteredRendered = stripAnsi(selector.render(120).join("\n"));
+		expect(filteredRendered).toContain("Provider 25");
+		expect(filteredRendered).not.toContain("Provider 01");
 	});
 });
 

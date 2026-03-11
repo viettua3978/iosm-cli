@@ -1,4 +1,4 @@
-<h1 align="center">IOSM CLI v0.2.1</h1>
+<h1 align="center">IOSM CLI v0.2.2</h1>
 
 <p align="center">
   <strong>AI Engineering Runtime for Professional Developers</strong>
@@ -78,6 +78,7 @@ iosm --version
 Requirements:
 - Node.js `>=20.6.0`
 - provider auth (environment variable API key and/or `/login`)
+- `/login` now includes the full `models.dev` provider catalog; `/model` loads available models for authenticated providers
 
 ### Recommended CLI Toolchain (for maximum efficiency)
 
@@ -118,8 +119,8 @@ iosm
 
 Inside the session (full profile):
 ```text
-/login            # or /auth: configure credentials
-/model            # select active model
+/login            # or /auth: configure credentials (OAuth + API key providers from models.dev)
+/model            # select active provider/model from currently authenticated providers
 <your task>       # start working immediately
 ```
 
@@ -143,7 +144,7 @@ Core commands to unlock full runtime value:
 
 ```console
 $ iosm
-IOSM CLI v0.2.1 [full]
+IOSM CLI v0.2.2 [full]
 
 you> /singular Refactor auth and split session handling from token validation
 iosm> Option 1 selected
@@ -177,7 +178,7 @@ For plain-language execution without `/singular`:
 `IOSM CLI` is layered so execution stays controllable as task complexity grows:
 
 ```text
-Providers (OpenAI / Anthropic / OpenRouter / GitHub / Qwen)
+Providers (built-ins + full models.dev catalog)
    ↓
 Auth + Model Selection (/login, /model)
    ↓
@@ -260,8 +261,8 @@ Bridge from decision mode:
 | Workflow Step | Command | Why It Matters |
 |------|---------|----------------|
 | Start clean context | `/new` or `/clear` | Reset session state before a new task or after context drift |
-| Configure auth | `/login` or `/auth` | Set provider credentials with guided flow |
-| Select active model | `/model` | Choose provider/model category for current workload |
+| Configure auth | `/login` or `/auth` | Set OAuth/API key credentials with guided flow from full models.dev provider catalog |
+| Select active model | `/model` | Choose provider/model from available authenticated providers |
 | Launch controlled execution | `/swarm run ...` | Execute complex tasks with contract boundaries, locks, gates, retries, and checkpoints |
 | Bridge decision to execution | `/swarm from-singular ...` | Apply selected `/singular` option under effective contract policy |
 | Legacy orchestration | `/orchestrate --parallel ...` | Keep previous team-run flow when you explicitly need legacy semantics |

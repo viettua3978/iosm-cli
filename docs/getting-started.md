@@ -64,7 +64,7 @@ export OPENROUTER_API_KEY="sk-or-..."
 export MISTRAL_API_KEY="..."
 ```
 
-You can also use `/login` in interactive mode for OAuth providers (including free Qwen OAuth) and OpenRouter API key setup:
+You can also use `/login` in interactive mode for OAuth providers and API-key providers from the full `models.dev` catalog:
 
 ```bash
 iosm
@@ -91,7 +91,7 @@ You'll see a prompt where you can type messages. The agent has access to your fi
 | Command | What it does |
 |---------|-------------|
 | `/model` | Pick or change the active model |
-| `/login` | Authenticate with OAuth providers (including Qwen) or add OpenRouter API key |
+| `/login` | Authenticate with OAuth providers or add API keys for providers from models.dev catalog |
 | `/semantic` | Configure semantic provider and index/query meaning-based code search |
 | `/init` | Bootstrap IOSM artifacts for the current project |
 | `/agents` | View available custom/system agents |

@@ -224,8 +224,8 @@ export class FooterComponent implements Component {
 
 		let statsLeft = [...statusParts, ...usageParts].join(separator);
 
-		// Add model name on the right side, plus thinking level if model supports it
-		const modelName = state.model?.id || "no-model";
+		// Add provider/model on the right side, plus thinking level if model supports it
+		const modelName = state.model ? `${state.model.provider}/${state.model.id}` : "no-model";
 
 		let statsLeftWidth = visibleWidth(statsLeft);
 
@@ -248,15 +248,7 @@ export class FooterComponent implements Component {
 					: `${theme.fg("accent", modelName)}${theme.fg("muted", ` • ${thinkingLevel}`)}`;
 		}
 
-		// Prepend the provider in parentheses if there are multiple providers and there's enough room
-		let rightSide = rightSideWithoutProvider;
-		if (this.footerData.getAvailableProviderCount() > 1 && state.model) {
-			rightSide = `${theme.fg("muted", `(${state.model.provider}) `)}${rightSideWithoutProvider}`;
-			if (statsLeftWidth + minPadding + visibleWidth(rightSide) > width) {
-				// Too wide, fall back
-				rightSide = rightSideWithoutProvider;
-			}
-		}
+		const rightSide = rightSideWithoutProvider;
 
 		const rightSideWidth = visibleWidth(rightSide);
 		const totalNeeded = statsLeftWidth + minPadding + rightSideWidth;

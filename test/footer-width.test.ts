@@ -1,5 +1,6 @@
 import { visibleWidth } from "@mariozechner/pi-tui";
 import { beforeAll, describe, expect, it } from "vitest";
+import stripAnsi from "strip-ansi";
 import type { AgentSession } from "../src/core/agent-session.js";
 import type { ReadonlyFooterDataProvider } from "../src/core/footer-data-provider.js";
 import { FooterComponent } from "../src/modes/interactive/components/footer.js";
@@ -110,5 +111,20 @@ describe("FooterComponent width handling", () => {
 		for (const line of lines) {
 			expect(visibleWidth(line)).toBeLessThanOrEqual(width);
 		}
+	});
+
+	it("shows provider/model in the right-side status text", () => {
+		const session = createSession({
+			sessionName: "",
+			modelId: "claude-sonnet-4-6",
+			provider: "anthropic",
+			reasoning: true,
+			thinkingLevel: "off",
+		});
+		const footer = new FooterComponent(session, createFooterData(1));
+
+		const lines = footer.render(160);
+		const statsLine = stripAnsi(lines[1] ?? "");
+		expect(statsLine).toContain("anthropic/claude-sonnet-4-6");
 	});
 });

@@ -617,9 +617,8 @@ export class ModelRegistry {
 			if (!config.baseUrl) {
 				throw new Error(`Provider ${providerName}: "baseUrl" is required when defining models.`);
 			}
-			if (!config.apiKey && !config.oauth) {
-				throw new Error(`Provider ${providerName}: "apiKey" or "oauth" is required when defining models.`);
-			}
+			// Runtime-registered providers may rely on AuthStorage credentials only.
+			// models.json validation still enforces apiKey for file-based custom models.
 
 			// Parse and add new models
 			for (const modelDef of config.models) {

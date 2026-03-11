@@ -8,7 +8,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { AgentMessage } from "@mariozechner/pi-agent-core";
-import type { AssistantMessage, ImageContent, Message, Model, OAuthProviderId } from "@mariozechner/pi-ai";
+import type { Api, AssistantMessage, ImageContent, Message, Model, OAuthProviderId } from "@mariozechner/pi-ai";
 import type {
 	AutocompleteItem,
 	AutocompleteProvider,
@@ -79,7 +79,12 @@ import {
 	INTERNAL_UI_META_CUSTOM_TYPE,
 	isInternalUiMetaDetails,
 } from "../../core/messages.js";
-import { ModelRegistry } from "../../core/model-registry.js";
+import {
+	loadModelsDevProviderCatalog,
+	type ModelsDevProviderCatalogInfo,
+} from "../../core/models-dev-provider-catalog.js";
+import { ModelRegistry, type ProviderConfigInput } from "../../core/model-registry.js";
+import { MODELS_DEV_PROVIDERS, type ModelsDevProviderInfo } from "../../core/models-dev-providers.js";
 import { resolveModelScope } from "../../core/model-resolver.js";
 import {
 	getMcpCommandHelp,
@@ -224,7 +229,7 @@ import { appKey, appKeyHint, editorKey } from "./components/keybinding-hints.js"
 import { LoginDialogComponent } from "./components/login-dialog.js";
 import { McpSelectorComponent } from "./components/mcp-selector.js";
 import { ModelSelectorComponent } from "./components/model-selector.js";
-import { OAuthSelectorComponent } from "./components/oauth-selector.js";
+import { type LoginProviderOption, OAuthSelectorComponent } from "./components/oauth-selector.js";
 import { ScopedModelsSelectorComponent } from "./components/scoped-models-selector.js";
 import { SessionSelectorComponent } from "./components/session-selector.js";
 import { SettingsSelectorComponent } from "./components/settings-selector.js";
@@ -552,6 +557,34 @@ function resolveDoctorCliToolStatuses(): DoctorCliToolStatus[] {
 }
 
 const OPENROUTER_PROVIDER_ID = "openrouter";
+const PROVIDER_DISPLAY_NAME_OVERRIDES: Record<string, string> = {
+	"azure-openai-responses": "Azure OpenAI Responses",
+	"google-antigravity": "Google Antigravity",
+	"google-gemini-cli": "Google Gemini CLI",
+	"kimi-coding": "Kimi Coding",
+	"openai-codex": "OpenAI Codex",
+	"opencode-go": "OpenCode Go",
+	"vercel-ai-gateway": "Vercel AI Gateway",
+};
+
+function toProviderDisplayName(providerId: string): string {
+	const override = PROVIDER_DISPLAY_NAME_OVERRIDES[providerId];
+	if (override) return override;
+	return providerId
+		.split(/[-_]/g)
+		.map((part) => {
+			const lower = part.toLowerCase();
+			if (lower === "ai") return "AI";
+			if (lower === "api") return "API";
+			if (lower === "gpt") return "GPT";
+			if (lower === "aws") return "AWS";
+			if (lower === "ui") return "UI";
+			if (lower === "llm") return "LLM";
+			if (lower === "id") return "ID";
+			return part.charAt(0).toUpperCase() + part.slice(1);
+		})
+		.join(" ");
+}
 
 type OrchestrationMode = "parallel" | "sequential";
 
@@ -844,6 +877,20 @@ export class InteractiveMode {
 
 	// ASCII logo component for startup screen
 	private asciiLogo: AsciiLogoComponent | undefined = undefined;
+
+	// API-key provider labels cached for /login and status messages.
+	private apiKeyProviderDisplayNames = new Map<string, string>();
+	private modelsDevProviderCatalog: readonly ModelsDevProviderInfo[] = MODELS_DEV_PROVIDERS;
+	private modelsDevProviderCatalogById: ReadonlyMap<string, ModelsDevProviderCatalogInfo> = new Map(
+		MODELS_DEV_PROVIDERS.map((provider) => [
+			provider.id,
+			{
+				...provider,
+				models: [],
+			} satisfies ModelsDevProviderCatalogInfo,
+		]),
+	);
+	private modelsDevProviderCatalogRefreshPromise: Promise<void> | undefined = undefined;
 
 	// Custom header from extension (undefined = use built-in header)
 	private customHeader: (Component & { dispose?(): void }) | undefined = undefined;
@@ -1822,6 +1869,9 @@ export class InteractiveMode {
 		this.footerDataProvider.onBranchChange(() => {
 			this.ui.requestRender();
 		});
+
+		// Refresh provider catalog from models.dev in background once per startup.
+		void this.refreshModelsDevProviderCatalog();
 
 		// Initialize available provider count for footer display
 		await this.updateAvailableProviderCount();
@@ -4788,7 +4838,7 @@ export class InteractiveMode {
 				this.refreshBuiltInHeader();
 				const thinkingStr =
 					result.model.reasoning && result.thinkingLevel !== "off" ? ` (thinking: ${result.thinkingLevel})` : "";
-				this.showStatus(`Switched to ${result.model.name || result.model.id}${thinkingStr}`);
+				this.showStatus(`Switched to ${result.model.provider}/${result.model.id}${thinkingStr}`);
 			}
 		} catch (error) {
 			this.showError(error instanceof Error ? error.message : String(error));
@@ -5959,7 +6009,7 @@ export class InteractiveMode {
 				this.footer.invalidate();
 				this.updateEditorBorderColor();
 				this.refreshBuiltInHeader();
-				this.showStatus(`Model: ${model.id}`);
+				this.showStatus(`Model: ${model.provider}/${model.id}`);
 				this.checkDaxnutsEasterEgg(model);
 			} catch (error) {
 				this.showError(error instanceof Error ? error.message : String(error));
@@ -5971,6 +6021,7 @@ export class InteractiveMode {
 	}
 
 	private async showModelProviderSelector(preferredProvider?: string): Promise<void> {
+		await this.hydrateMissingProviderModelsForSavedAuth();
 		this.session.modelRegistry.refresh();
 		let models: Model<any>[] = [];
 		try {
@@ -6098,7 +6149,7 @@ export class InteractiveMode {
 						this.updateEditorBorderColor();
 						this.refreshBuiltInHeader();
 						done();
-						this.showStatus(`Model: ${model.id}`);
+						this.showStatus(`Model: ${model.provider}/${model.id}`);
 						this.checkDaxnutsEasterEgg(model);
 					} catch (error) {
 						done();
@@ -6472,26 +6523,32 @@ export class InteractiveMode {
 				return;
 			}
 		}
+		await this.refreshModelsDevProviderCatalog();
+		const apiKeyProviders = this.getApiKeyLoginProviders(this.modelsDevProviderCatalog);
 
 		this.showSelector((done) => {
 			const selector = new OAuthSelectorComponent(
 				mode,
 				this.session.modelRegistry.authStorage,
-				async (providerId: string) => {
+				async (provider: LoginProviderOption) => {
 					done();
 
 					if (mode === "login") {
-						if (providerId === OPENROUTER_PROVIDER_ID) {
-							await this.handleOpenRouterApiKeyLogin();
+						if (provider.kind === "api_key") {
+							if (provider.id === OPENROUTER_PROVIDER_ID) {
+								await this.handleOpenRouterApiKeyLogin();
+							} else {
+								await this.handleApiKeyLogin(provider.id, { providerName: provider.name });
+							}
 						} else {
-							await this.showLoginDialog(providerId);
+							await this.showLoginDialog(provider.id);
 						}
 					} else {
 						// Logout flow
-						const providerName = this.getProviderDisplayName(providerId);
+						const providerName = this.getProviderDisplayName(provider.id);
 
 						try {
-							this.session.modelRegistry.authStorage.logout(providerId);
+							this.session.modelRegistry.authStorage.logout(provider.id);
 							this.session.modelRegistry.refresh();
 							await this.updateAvailableProviderCount();
 							this.showStatus(`Logged out of ${providerName}`);
@@ -6504,23 +6561,173 @@ export class InteractiveMode {
 					done();
 					this.ui.requestRender();
 				},
+				apiKeyProviders,
 			);
 			return { component: selector, focus: selector };
 		});
 	}
 
-	private getProviderDisplayName(providerId: string): string {
-		if (providerId === OPENROUTER_PROVIDER_ID) {
-			return "OpenRouter";
+	private async refreshModelsDevProviderCatalog(): Promise<void> {
+		if (this.modelsDevProviderCatalogRefreshPromise) {
+			await this.modelsDevProviderCatalogRefreshPromise;
+			return;
 		}
-		const providerInfo = this.session.modelRegistry.authStorage.getOAuthProviders().find((p) => p.id === providerId);
-		return providerInfo?.name || providerId;
+
+		this.modelsDevProviderCatalogRefreshPromise = (async () => {
+			const catalog = await loadModelsDevProviderCatalog();
+			this.modelsDevProviderCatalogById = catalog;
+			this.modelsDevProviderCatalog = Array.from(catalog.values())
+				.map((provider) => ({
+					id: provider.id,
+					name: provider.name,
+					env: provider.env,
+				}))
+				.sort((a, b) => a.name.localeCompare(b.name, "en") || a.id.localeCompare(b.id, "en"));
+		})()
+			.catch(() => {
+				this.modelsDevProviderCatalog = MODELS_DEV_PROVIDERS;
+				this.modelsDevProviderCatalogById = new Map(
+					MODELS_DEV_PROVIDERS.map((provider) => [
+						provider.id,
+						{
+							...provider,
+							models: [],
+						} satisfies ModelsDevProviderCatalogInfo,
+					]),
+				);
+			})
+			.finally(() => {
+				this.modelsDevProviderCatalogRefreshPromise = undefined;
+			});
+
+		await this.modelsDevProviderCatalogRefreshPromise;
 	}
 
-	private async handleOpenRouterApiKeyLogin(options?: { openModelSelector?: boolean }): Promise<void> {
+	private resolveModelsDevApi(modelNpm?: string): Api {
+		const npm = modelNpm?.toLowerCase() ?? "";
+		if (npm.includes("anthropic")) return "anthropic-messages";
+		if (npm.includes("google-vertex")) return "google-vertex";
+		if (npm.includes("google")) return "google-generative-ai";
+		if (npm.includes("amazon-bedrock")) return "bedrock-converse-stream";
+		if (npm.includes("mistral")) return "mistral-conversations";
+		if (npm.includes("@ai-sdk/openai") && !npm.includes("compatible")) return "openai-responses";
+		return "openai-completions";
+	}
+
+	private buildModelsDevProviderConfig(providerInfo: ModelsDevProviderCatalogInfo): ProviderConfigInput | undefined {
+		const baseUrl = providerInfo.api ?? providerInfo.models.find((model) => !!model.api)?.api;
+		if (!baseUrl) return undefined;
+		if (providerInfo.models.length === 0) return undefined;
+
+		const models: NonNullable<ProviderConfigInput["models"]> = providerInfo.models.map((model) => ({
+			id: model.id,
+			name: model.name,
+			api: this.resolveModelsDevApi(model.npm ?? providerInfo.npm),
+			reasoning: model.reasoning,
+			input: [...model.input],
+			cost: model.cost,
+			contextWindow: model.contextWindow,
+			maxTokens: model.maxTokens,
+			headers: Object.keys(model.headers).length > 0 ? model.headers : undefined,
+		}));
+
+		return {
+			baseUrl,
+			models,
+		};
+	}
+
+	private hasRegisteredProviderModels(providerId: string): boolean {
+		const registry = this.session.modelRegistry as { getAll?: () => Model<any>[] };
+		if (typeof registry.getAll !== "function") return true;
+		return registry.getAll().some((model) => model.provider === providerId);
+	}
+
+	private async hydrateProviderModelsFromModelsDev(providerId: string): Promise<boolean> {
+		if (this.hasRegisteredProviderModels(providerId)) return true;
+
+		await this.refreshModelsDevProviderCatalog();
+		const providerInfo = this.modelsDevProviderCatalogById.get(providerId);
+		if (!providerInfo) return false;
+
+		const config = this.buildModelsDevProviderConfig(providerInfo);
+		if (!config) return false;
+
+		try {
+			this.session.modelRegistry.registerProvider(providerId, config);
+			return this.hasRegisteredProviderModels(providerId);
+		} catch {
+			return false;
+		}
+	}
+
+	private async hydrateMissingProviderModelsForSavedAuth(): Promise<void> {
+		const savedProviders = this.session.modelRegistry.authStorage.list();
+		if (savedProviders.length === 0) return;
+
+		for (const providerId of savedProviders) {
+			if (this.hasRegisteredProviderModels(providerId)) continue;
+			await this.hydrateProviderModelsFromModelsDev(providerId);
+		}
+	}
+
+	private getApiKeyLoginProviders(modelsDevProviders: readonly ModelsDevProviderInfo[]): LoginProviderOption[] {
+		const providerNames = new Map<string, string>();
+		this.apiKeyProviderDisplayNames.clear();
+
+		for (const model of this.session.modelRegistry.getAll()) {
+			if (!providerNames.has(model.provider)) {
+				providerNames.set(model.provider, toProviderDisplayName(model.provider));
+			}
+		}
+
+		for (const provider of modelsDevProviders) {
+			const fallbackName = toProviderDisplayName(provider.id);
+			const current = providerNames.get(provider.id);
+			if (!current || current === fallbackName) {
+				providerNames.set(provider.id, provider.name || fallbackName);
+			}
+		}
+
+		for (const providerId of this.session.modelRegistry.authStorage.list()) {
+			if (!providerNames.has(providerId)) {
+				providerNames.set(providerId, toProviderDisplayName(providerId));
+			}
+		}
+
+		const oauthProviderIds = new Set(this.session.modelRegistry.authStorage.getOAuthProviders().map((provider) => provider.id));
+		const providers: LoginProviderOption[] = [];
+		for (const [id, name] of providerNames.entries()) {
+			if (oauthProviderIds.has(id)) continue;
+			this.apiKeyProviderDisplayNames.set(id, name);
+			providers.push({ id, name, kind: "api_key" });
+		}
+
+		providers.sort((a, b) => a.name.localeCompare(b.name));
+		return providers;
+	}
+
+	private getProviderDisplayName(providerId: string): string {
+		const apiKeyName = this.apiKeyProviderDisplayNames.get(providerId);
+		if (apiKeyName) {
+			return apiKeyName;
+		}
+		const providerInfo = this.session.modelRegistry.authStorage.getOAuthProviders().find((p) => p.id === providerId);
+		return providerInfo?.name || toProviderDisplayName(providerId);
+	}
+
+	private async handleApiKeyLogin(
+		providerId: string,
+		options?: {
+			providerName?: string;
+			openModelSelector?: boolean;
+			createKeyUrl?: string;
+			placeholder?: string;
+		},
+	): Promise<void> {
+		const providerName = options?.providerName || this.getProviderDisplayName(providerId);
 		const openModelSelector = options?.openModelSelector ?? true;
-		const providerName = this.getProviderDisplayName(OPENROUTER_PROVIDER_ID);
-		const existingCredential = this.session.modelRegistry.authStorage.get(OPENROUTER_PROVIDER_ID);
+		const existingCredential = this.session.modelRegistry.authStorage.get(providerId);
 		if (existingCredential) {
 			const overwrite = await this.showExtensionConfirm(
 				`${providerName}: replace existing credentials?`,
@@ -6532,26 +6739,45 @@ export class InteractiveMode {
 			}
 		}
 
-		const keyInput = await this.showExtensionInput(
-			`${providerName} API key\nCreate key: https://openrouter.ai/keys`,
-			"sk-or-v1-...",
-		);
+		const promptLines = [`${providerName} API key`];
+		if (options?.createKeyUrl) {
+			promptLines.push(`Create key: ${options.createKeyUrl}`);
+		}
+		const keyInput = await this.showExtensionInput(promptLines.join("\n"), options?.placeholder ?? "api-key");
 		if (keyInput === undefined) {
 			this.showStatus(`${providerName} login cancelled.`);
 			return;
 		}
+
 		const apiKey = keyInput.trim();
 		if (!apiKey) {
 			this.showWarning(`${providerName} API key cannot be empty.`);
 			return;
 		}
 
-		this.session.modelRegistry.authStorage.set(OPENROUTER_PROVIDER_ID, { type: "api_key", key: apiKey });
+		this.session.modelRegistry.authStorage.set(providerId, { type: "api_key", key: apiKey });
+		let hasProviderModels = this.hasRegisteredProviderModels(providerId);
+		if (!hasProviderModels) {
+			hasProviderModels = await this.hydrateProviderModelsFromModelsDev(providerId);
+		}
 		await this.updateAvailableProviderCount();
 		this.showStatus(`${providerName} API key saved to ${getAuthPath()}`);
-		if (openModelSelector) {
-			await this.showModelProviderSelector(OPENROUTER_PROVIDER_ID);
+		if (openModelSelector && hasProviderModels) {
+			await this.showModelProviderSelector(providerId);
+		} else if (openModelSelector) {
+			this.showWarning(
+				`${providerName} configured, but no models are available yet. Run /model after network is available.`,
+			);
 		}
+	}
+
+	private async handleOpenRouterApiKeyLogin(options?: { openModelSelector?: boolean }): Promise<void> {
+		await this.handleApiKeyLogin(OPENROUTER_PROVIDER_ID, {
+			providerName: "OpenRouter",
+			openModelSelector: options?.openModelSelector,
+			createKeyUrl: "https://openrouter.ai/keys",
+			placeholder: "sk-or-v1-...",
+		});
 	}
 
 	private async showLoginDialog(providerId: string): Promise<void> {

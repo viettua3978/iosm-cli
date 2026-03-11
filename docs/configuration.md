@@ -186,6 +186,9 @@ Index storage (global cache):
 
 ### Provider API Keys
 
+`/login` supports the full provider catalog from `models.dev` and stores credentials in `~/.iosm/agent/auth.json`.
+The table below lists common environment variables, but is not exhaustive.
+
 | Variable | Provider | Notes |
 |----------|----------|-------|
 | `ANTHROPIC_API_KEY` | Anthropic (Claude) | Primary recommended provider |
@@ -360,7 +363,7 @@ iosm --provider azure --model gpt-5.3
 
 ### OAuth-Based Providers
 
-Some providers support OAuth login (for example, Qwen CLI free OAuth):
+Some providers support OAuth login (for example, Qwen CLI free OAuth). API-key providers are available via the same `/login` flow from the models.dev catalog:
 
 ```bash
 iosm

@@ -1,6 +1,6 @@
 {
 	"name": "iosm-cli",
-	"version": "0.2.1",
+	"version": "0.2.2",
 	"description": "Standalone IOSM CLI with agent tooling, session management, and IOSM artifact orchestration",
 	"type": "module",
 	"iosmConfig": {
@@ -32,7 +32,7 @@
 		"clean": "shx rm -rf dist",
 		"dev": "tsc -p tsconfig.build.json --watch --preserveWatchOutput",
 		"build": "tsc -p tsconfig.build.json && shx chmod +x dist/cli.js && npm run copy-assets",
-		"deploy-local": "npm run build && rsync -a --delete dist/ \"$(node -e \"console.log(require('child_process').execSync('volta which iosm').toString().trim().replace(/\\/bin\\/iosm$/, '/lib/node_modules/iosm-cli/dist'))\")/\"",
+		"deploy-local": "npm run build && node scripts/deploy-local.mjs",
 		"build:binary": "npm run build && bun build --compile ./dist/cli.js --outfile dist/iosm && npm run copy-binary-assets",
 		"check": "tsc --noEmit -p tsconfig.build.json",
 		"copy-assets": "shx mkdir -p dist/modes/interactive/theme && shx cp src/modes/interactive/theme/*.json dist/modes/interactive/theme/ && shx mkdir -p dist/core/export-html/vendor && shx cp src/core/export-html/template.html src/core/export-html/template.css src/core/export-html/template.js dist/core/export-html/ && shx cp src/core/export-html/vendor/*.js dist/core/export-html/vendor/",

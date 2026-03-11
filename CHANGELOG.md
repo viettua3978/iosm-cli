@@ -9,6 +9,59 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 _No unreleased changes._
 
+## [0.2.2] - 2026-03-11
+
+### Added
+
+- **Models.dev provider+model catalog runtime** — added full catalog parsing (providers + models metadata) with timeout/fallback behavior for interactive auth/model flows
+- **Automatic provider model hydration after `/login`** — when a provider has credentials but no built-in model definitions, `iosm-cli` now registers models from `models.dev` so `/model` is immediately usable (including coding-plan providers such as `zai-coding-plan`)
+- **Startup/on-demand auth model hydration** — `/model` now attempts to hydrate missing models for saved authenticated providers before rendering provider/model choices
+
+### Changed
+
+- **Provider/model visibility in status line** — footer and model-switch status now display `provider/model` to make cross-provider switches explicit even when model IDs are identical
+- **Auth UX feedback** — login flow now reports a clear warning when credentials are stored but no models can be loaded yet
+
+### Fixed
+
+- **API-key login crash** — fixed unbound registry method usage that caused `TypeError: Cannot read properties of undefined (reading 'models')` in interactive login flows
+- **Empty model selector after provider login** — fixed cases where `/model` stayed empty after successful API-key auth for providers not shipped in the built-in registry
+
+### Documentation
+
+- Updated README and docs (`getting-started`, `interactive-mode`, `configuration`) to reflect full models.dev-backed provider/model availability via `/login` and `/model`
+
+## [0.2.1] - 2026-03-11
+
+### Added
+
+- **Run/task shared memory runtime** — introduced `.iosm/subagents/shared-memory/*.json` state with versioned entries and history for cross-task coordination
+- **Shared memory tools** — added `shared_memory_write` and `shared_memory_read` tools for subagent orchestration (`run` and `task` scopes, CAS support, append/set modes)
+- **Canonical `/swarm` command surface** — added dedicated runtime commands: `/swarm run`, `/swarm from-singular`, `/swarm watch`, `/swarm retry`, `/swarm resume` (with bounded parallelism and budget controls)
+- **Swarm scheduler reliability modules** — added dedicated scheduler/locks/gates/state-store/spawn/retry components for stable multi-task dispatch under contention
+- **Swarm lock + gate execution model** — introduced hierarchical touch locks and contract-aware task/run gates for `Scopes -> Touches -> Locks -> Gates -> Done`
+- **Swarm runtime artifacts** — added persisted run state in `.iosm/orchestrate/<run-id>/` (`run.json`, `dag.json`, `state.json`, `events.jsonl`, checkpoints, reports)
+- **Swarm watch telemetry** — added runtime visibility for ready/running/blocked/done distribution, budget usage, lock snapshot, ETA/throughput, critical path, and theoretical speedup
+- **Swarm spawn policy controls** — added high-risk spawn candidate classification with confirmation-gated fan-out behavior
+- **Project index subsystem** — introduced repository indexing (`.iosm/project-index/index.json`) for scale-aware planning and targeted file selection
+- **Failure retrospective engine** — added failure-cause classification and retry directive generation for smarter follow-up attempts
+
+### Changed
+
+- **Swarm-first orchestration flow** — `/singular` execution handoff now supports `Start with Swarm (Recommended)` and routes selected options to `/swarm from-singular ...`
+- **Command separation** — `/orchestrate --swarm` removed; `/swarm` is now the canonical gated runtime while `/orchestrate` remains manual legacy team splitting
+- **Task orchestration contract** — `task` tool/runtime now carries richer run/task metadata and improved scheduling context for delegated execution
+- **Interactive swarm observability** — expanded interactive mode status/watch output with deeper swarm runtime diagnostics and task progress details
+
+### Fixed
+
+- **Swarm retry stability** — improved retry bucket handling (`permission`, `dependency/import`, `test`, `timeout`, `unknown`) to reduce noisy re-runs
+- **Lock/contention handling** — improved execution behavior for conflicting touches and blocked tasks in DAG scheduling scenarios
+
+### Documentation
+
+- Expanded README, CLI reference, interactive mode, and orchestration docs for swarm runtime semantics, shared-memory collaboration, and reliability controls
+
 ## [0.2.0] - 2026-03-11
 
 ### Added

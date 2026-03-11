@@ -97,7 +97,7 @@ iosm --continue
 | `/reload` | Reload extensions and resources | `/reload` |
 | `/permissions` | View/set tool permissions | `/permissions` |
 | `/yolo` | Toggle auto-approve mode | `/yolo on` |
-| `/login` | Authenticate with provider (OAuth incl. Qwen + OpenRouter API key) | `/login` |
+| `/login` | Authenticate with provider (OAuth + API key providers from full models.dev catalog) | `/login` |
 | `/auth` | Alias for `/login` | `/auth` |
 | `/logout` | Clear saved provider credentials | `/logout` |
 

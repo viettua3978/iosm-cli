@@ -48,6 +48,7 @@ import {
 	getSemanticCommandHelp,
 	parseSemanticCliCommand,
 	SemanticConfigMissingError,
+	SemanticIndexRequiredError,
 	SemanticRebuildRequiredError,
 	SemanticSearchRuntime,
 	type SemanticIndexOperationResult,
@@ -1506,6 +1507,7 @@ function printSemanticStatus(status: SemanticStatusResult): void {
 	console.log(chalk.bold("Semantic search status"));
 	console.log(`configured: ${status.configured ? "yes" : "no"}`);
 	console.log(`enabled: ${status.enabled ? "yes" : "no"}`);
+	console.log(`auto_index: ${status.autoIndex ? "on" : "off"}`);
 	console.log(`indexed: ${status.indexed ? "yes" : "no"}`);
 	console.log(`stale: ${status.stale ? `yes${status.staleReason ? ` (${status.staleReason})` : ""}` : "no"}`);
 	if (status.provider) console.log(`provider: ${status.provider}`);
@@ -1607,6 +1609,12 @@ async function handleSemanticCommand(args: string[]): Promise<boolean> {
 		if (error instanceof SemanticRebuildRequiredError) {
 			console.error(chalk.yellow(error.message));
 			console.error(chalk.dim(`Run "${APP_NAME} semantic rebuild".`));
+			process.exitCode = 1;
+			return true;
+		}
+		if (error instanceof SemanticIndexRequiredError) {
+			console.error(chalk.yellow(error.message));
+			console.error(chalk.dim(`Run "${APP_NAME} semantic index" or enable auto-indexing in "/semantic".`));
 			process.exitCode = 1;
 			return true;
 		}

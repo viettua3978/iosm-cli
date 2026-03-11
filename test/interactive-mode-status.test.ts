@@ -1,7 +1,7 @@
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { Container } from "@mariozechner/pi-tui";
+import { Container, visibleWidth } from "@mariozechner/pi-tui";
 import stripAnsi from "strip-ansi";
 import { beforeAll, describe, expect, test, vi } from "vitest";
 import { ENV_AGENT_DIR } from "../src/config.js";
@@ -66,6 +66,62 @@ describe("InteractiveMode.showStatus", () => {
 		// adds spacer + text
 		expect(fakeThis.chatContainer.children).toHaveLength(5);
 		expect(renderLastLine(fakeThis.chatContainer)).toContain("STATUS_TWO");
+	});
+});
+
+describe("InteractiveMode.showLoadedResources", () => {
+	test("keeps rendered resource lines within terminal width", () => {
+		const width = 70;
+		const fakeThis: any = Object.create((InteractiveMode as any).prototype);
+		fakeThis.options = { verbose: true };
+		fakeThis.ui = { terminal: { columns: width } };
+		fakeThis.chatContainer = new Container();
+		fakeThis.activeProfileName = "full";
+		fakeThis.formatDisplayPath = (value: string) => value;
+		fakeThis.session = {
+			settingsManager: {
+				getQuietStartup: () => false,
+			},
+			promptTemplates: [
+				{
+					name: "ultra-think-with-very-long-command-name-for-resource-panel-width-test",
+				},
+			],
+			resourceLoader: {
+				getPathMetadata: () => ({ paths: [] }),
+				getSkills: () => ({
+					skills: [
+						{
+							filePath:
+								"/Users/deus21/.codex/skills/custom/really-really-really-long-skill-name/SKILL.md",
+						},
+					],
+					diagnostics: [],
+				}),
+				getPrompts: () => ({ prompts: [], diagnostics: [] }),
+				getThemes: () => ({ themes: [], diagnostics: [] }),
+				getExtensions: () => ({ errors: [] }),
+				getAgentsFiles: () => ({
+					agentsFiles: [
+						{
+							path: "/Users/deus21/Desktop/Projects/iosm-cli/super-long-folder-name-with-extra-details/AGENTS.md",
+						},
+					],
+				}),
+			},
+		};
+
+		(InteractiveMode as any).prototype.showLoadedResources.call(fakeThis, {
+			extensionPaths: [
+				"/Users/deus21/Desktop/Projects/iosm-cli/extensions/very-long-extension-package-name-for-width-check",
+			],
+			force: true,
+		});
+
+		const rendered = renderAll(fakeThis.chatContainer, width);
+		for (const line of rendered.split("\n")) {
+			expect(visibleWidth(line)).toBeLessThanOrEqual(width);
+		}
 	});
 });
 
@@ -807,6 +863,19 @@ describe("InteractiveMode doctor command", () => {
 			},
 		};
 		fakeThis.mcpRuntime = undefined;
+		fakeThis.contractService = {
+			getState: () => ({
+				projectPath: join(process.cwd(), ".iosm", "contract.json"),
+				hasProjectFile: false,
+				project: {},
+				sessionOverlay: {},
+				effective: {},
+			}),
+			getProjectPath: () => join(process.cwd(), ".iosm", "contract.json"),
+		};
+		fakeThis.singularService = {
+			getAnalysesRoot: () => join(process.cwd(), ".iosm", "singular"),
+		};
 		fakeThis.showCommandJsonBlock = showCommandJsonBlock;
 		fakeThis.showCommandTextBlock = vi.fn();
 		fakeThis.runDoctorInteractiveFixes = vi.fn();
@@ -1031,7 +1100,7 @@ describe("InteractiveMode semantic command", () => {
 		expect(showWarning).not.toHaveBeenCalled();
 		expect(showCommandTextBlock).toHaveBeenCalledWith(
 			"Semantic Help",
-			expect.stringContaining("/semantic setup"),
+			expect.stringContaining("/semantic auto-index"),
 		);
 	});
 
@@ -1045,6 +1114,248 @@ describe("InteractiveMode semantic command", () => {
 		await (InteractiveMode as any).prototype.handleSemanticCommand.call(fakeThis, "/semantic query --top-k 8");
 
 		expect(showWarning).toHaveBeenCalledWith("Usage: /semantic query <text> [--top-k N]");
+	});
+
+	test("parses /semantic auto-index on and forwards to updater", async () => {
+		const updateSemanticAutoIndexSetting = vi.fn();
+		const showWarning = vi.fn();
+		const fakeThis: any = Object.create((InteractiveMode as any).prototype);
+		fakeThis.updateSemanticAutoIndexSetting = updateSemanticAutoIndexSetting;
+		fakeThis.showWarning = showWarning;
+		fakeThis.showCommandTextBlock = vi.fn();
+		fakeThis.parseSlashArgs = (InteractiveMode as any).prototype.parseSlashArgs.bind(fakeThis);
+		fakeThis.parseSemanticScopeOptions = (InteractiveMode as any).prototype.parseSemanticScopeOptions.bind(fakeThis);
+
+		await (InteractiveMode as any).prototype.handleSemanticCommand.call(
+			fakeThis,
+			"/semantic auto-index on --scope project",
+		);
+
+		expect(showWarning).not.toHaveBeenCalled();
+		expect(updateSemanticAutoIndexSetting).toHaveBeenCalledWith({
+			scope: "project",
+			value: true,
+		});
+	});
+});
+
+describe("InteractiveMode contract/singular commands", () => {
+	test("shows contract help in command block", async () => {
+		const showCommandTextBlock = vi.fn();
+		const showWarning = vi.fn();
+		const fakeThis: any = Object.create((InteractiveMode as any).prototype);
+		fakeThis.showCommandTextBlock = showCommandTextBlock;
+		fakeThis.showWarning = showWarning;
+		fakeThis.parseSlashArgs = (InteractiveMode as any).prototype.parseSlashArgs.bind(fakeThis);
+
+		await (InteractiveMode as any).prototype.handleContractCommand.call(fakeThis, "/contract help");
+
+		expect(showWarning).not.toHaveBeenCalled();
+		expect(showCommandTextBlock).toHaveBeenCalledWith(
+			"Contract Help",
+			expect.stringContaining("/contract edit --scope"),
+		);
+	});
+
+	test("routes /singular request to analyzer", async () => {
+		const runSingularAnalysis = vi.fn();
+		const showWarning = vi.fn();
+		const fakeThis: any = Object.create((InteractiveMode as any).prototype);
+		fakeThis.runSingularAnalysis = runSingularAnalysis;
+		fakeThis.showCommandTextBlock = vi.fn();
+		fakeThis.showWarning = showWarning;
+		fakeThis.parseSlashArgs = (InteractiveMode as any).prototype.parseSlashArgs.bind(fakeThis);
+
+		await (InteractiveMode as any).prototype.handleSingularCommand.call(fakeThis, "/singular добавить личный кабинет");
+
+		expect(runSingularAnalysis).toHaveBeenCalledWith("добавить личный кабинет");
+		expect(showWarning).not.toHaveBeenCalled();
+	});
+
+	test("shows /singular help in command block", async () => {
+		const showCommandTextBlock = vi.fn();
+		const showWarning = vi.fn();
+		const fakeThis: any = Object.create((InteractiveMode as any).prototype);
+		fakeThis.runSingularAnalysis = vi.fn();
+		fakeThis.showCommandTextBlock = showCommandTextBlock;
+		fakeThis.showWarning = showWarning;
+		fakeThis.parseSlashArgs = (InteractiveMode as any).prototype.parseSlashArgs.bind(fakeThis);
+
+		await (InteractiveMode as any).prototype.handleSingularCommand.call(fakeThis, "/singular help");
+
+		expect(showWarning).not.toHaveBeenCalled();
+		expect(showCommandTextBlock).toHaveBeenCalledWith("Singular Help", expect.stringContaining("/singular <feature request>"));
+	});
+
+	test("runSingularAnalysis merges agent feasibility output and saves final analysis", async () => {
+		const baseline = {
+			runId: "2026-03-11-090000",
+			request: "add account dashboard",
+			generatedAt: "2026-03-11T09:00:00.000Z",
+			scannedFiles: 120,
+			sourceFiles: 80,
+			testFiles: 20,
+			matchedFiles: ["src/account/profile.ts"],
+			baselineComplexity: "medium",
+			baselineBlastRadius: "medium",
+			recommendation: "implement_incrementally",
+			recommendationReason: "Baseline",
+			contractSignals: [],
+			options: [
+				{
+					id: "1",
+					title: "Incremental MVP",
+					summary: "Ship minimal scope",
+					complexity: "medium",
+					blast_radius: "medium",
+					suggested_files: ["src/account/profile.ts"],
+					plan: ["add endpoint"],
+					pros: ["fast"],
+					cons: ["partial"],
+				},
+				{
+					id: "2",
+					title: "Full implementation",
+					summary: "Ship full scope",
+					complexity: "high",
+					blast_radius: "high",
+					suggested_files: ["src/**/*"],
+					plan: ["refactor"],
+					pros: ["complete"],
+					cons: ["risky"],
+				},
+				{
+					id: "3",
+					title: "Defer",
+					summary: "Do not implement now",
+					complexity: "low",
+					blast_radius: "low",
+					suggested_files: [],
+					plan: ["prepare design"],
+					pros: ["safe"],
+					cons: ["delay"],
+				},
+			],
+		};
+
+		const enriched = {
+			...baseline,
+			recommendation: "implement_now",
+			recommendationReason: "Agent validated low rollout risk for current sprint.",
+		};
+
+		const singularService = {
+			analyze: vi.fn(async () => baseline),
+			saveAnalysis: vi.fn(),
+		};
+		const runSingularAgentFeasibilityPass = vi.fn(async () => enriched);
+		const promptSingularDecision = vi.fn(async () => {});
+		const showCommandTextBlock = vi.fn();
+
+		const fakeThis: any = Object.create((InteractiveMode as any).prototype);
+		fakeThis.contractService = { getState: () => ({ effective: {} }) };
+		fakeThis.singularService = singularService;
+		fakeThis.runWithExtensionLoader = vi.fn(async (_message: string, task: () => Promise<unknown>) => task());
+		fakeThis.session = { model: { provider: "openai", id: "gpt-5" } };
+		fakeThis.runSingularAgentFeasibilityPass = runSingularAgentFeasibilityPass;
+		fakeThis.promptSingularDecision = promptSingularDecision;
+		fakeThis.formatSingularRunReport = (InteractiveMode as any).prototype.formatSingularRunReport.bind(fakeThis);
+		fakeThis.showStatus = vi.fn();
+		fakeThis.showWarning = vi.fn();
+		fakeThis.showError = vi.fn();
+		fakeThis.showCommandTextBlock = showCommandTextBlock;
+
+		await (InteractiveMode as any).prototype.runSingularAnalysis.call(fakeThis, "add account dashboard");
+
+		expect(singularService.analyze).toHaveBeenCalledWith({
+			request: "add account dashboard",
+			autosave: false,
+			contract: {},
+		});
+		expect(runSingularAgentFeasibilityPass).toHaveBeenCalledWith("add account dashboard", baseline, {});
+		expect(singularService.saveAnalysis).toHaveBeenCalledWith(enriched);
+		expect(showCommandTextBlock).toHaveBeenCalledWith("Singular Analysis", expect.stringContaining("recommendation: implement_now"));
+		expect(promptSingularDecision).toHaveBeenCalledWith(enriched);
+	});
+
+	test("runSingularAnalysis falls back to baseline when no model is selected", async () => {
+		const baseline = {
+			runId: "2026-03-11-090100",
+			request: "add account dashboard",
+			generatedAt: "2026-03-11T09:01:00.000Z",
+			scannedFiles: 110,
+			sourceFiles: 70,
+			testFiles: 18,
+			matchedFiles: [],
+			baselineComplexity: "medium",
+			baselineBlastRadius: "low",
+			recommendation: "implement_incrementally",
+			recommendationReason: "Baseline",
+			contractSignals: [],
+			options: [
+				{
+					id: "1",
+					title: "Incremental MVP",
+					summary: "Ship minimal scope",
+					complexity: "medium",
+					blast_radius: "medium",
+					suggested_files: [],
+					plan: ["add endpoint"],
+					pros: ["fast"],
+					cons: ["partial"],
+				},
+				{
+					id: "2",
+					title: "Full implementation",
+					summary: "Ship full scope",
+					complexity: "high",
+					blast_radius: "high",
+					suggested_files: [],
+					plan: ["refactor"],
+					pros: ["complete"],
+					cons: ["risky"],
+				},
+				{
+					id: "3",
+					title: "Defer",
+					summary: "Do not implement now",
+					complexity: "low",
+					blast_radius: "low",
+					suggested_files: [],
+					plan: ["prepare design"],
+					pros: ["safe"],
+					cons: ["delay"],
+				},
+			],
+		};
+
+		const singularService = {
+			analyze: vi.fn(async () => baseline),
+			saveAnalysis: vi.fn(),
+		};
+		const runSingularAgentFeasibilityPass = vi.fn();
+		const showWarning = vi.fn();
+
+		const fakeThis: any = Object.create((InteractiveMode as any).prototype);
+		fakeThis.contractService = { getState: () => ({ effective: {} }) };
+		fakeThis.singularService = singularService;
+		fakeThis.runWithExtensionLoader = vi.fn(async (_message: string, task: () => Promise<unknown>) => task());
+		fakeThis.session = { model: undefined };
+		fakeThis.runSingularAgentFeasibilityPass = runSingularAgentFeasibilityPass;
+		fakeThis.promptSingularDecision = vi.fn(async () => {});
+		fakeThis.formatSingularRunReport = (InteractiveMode as any).prototype.formatSingularRunReport.bind(fakeThis);
+		fakeThis.showStatus = vi.fn();
+		fakeThis.showWarning = showWarning;
+		fakeThis.showError = vi.fn();
+		fakeThis.showCommandTextBlock = vi.fn();
+
+		await (InteractiveMode as any).prototype.runSingularAnalysis.call(fakeThis, "add account dashboard");
+
+		expect(runSingularAgentFeasibilityPass).not.toHaveBeenCalled();
+		expect(singularService.saveAnalysis).toHaveBeenCalledWith(baseline);
+		expect(showWarning).toHaveBeenCalledWith(
+			expect.stringContaining("No model selected. /singular used heuristic analysis only."),
+		);
 	});
 });
 
@@ -1317,6 +1628,7 @@ describe("InteractiveMode.requestToolPermission", () => {
 			permissionAllowRules: [],
 			permissionMode: "ask",
 			sessionAllowedToolSignatures: new Set<string>(),
+			shadowGuard: { shouldDenyTool: () => false },
 			matchesPermissionRule: (InteractiveMode as any).prototype.matchesPermissionRule,
 			getToolPermissionSignature: (InteractiveMode as any).prototype.getToolPermissionSignature,
 			withPermissionDialogLock: async (fn: () => Promise<boolean>) => fn(),
@@ -1342,6 +1654,7 @@ describe("InteractiveMode.requestToolPermission", () => {
 			permissionAllowRules: [],
 			permissionMode: "auto",
 			sessionAllowedToolSignatures: new Set<string>(),
+			shadowGuard: { shouldDenyTool: () => false },
 			matchesPermissionRule: (InteractiveMode as any).prototype.matchesPermissionRule,
 			getToolPermissionSignature: (InteractiveMode as any).prototype.getToolPermissionSignature,
 			withPermissionDialogLock: async (fn: () => Promise<boolean>) => fn(),
@@ -1367,6 +1680,7 @@ describe("InteractiveMode.requestToolPermission", () => {
 			permissionAllowRules: [],
 			permissionMode: "ask",
 			sessionAllowedToolSignatures: new Set<string>(),
+			shadowGuard: { shouldDenyTool: () => false },
 			matchesPermissionRule: (InteractiveMode as any).prototype.matchesPermissionRule,
 			getToolPermissionSignature: (InteractiveMode as any).prototype.getToolPermissionSignature,
 			withPermissionDialogLock: async (fn: () => Promise<boolean>) => fn(),

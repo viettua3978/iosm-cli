@@ -54,5 +54,6 @@ export type {
 export {
 	SemanticConfigError,
 	SemanticConfigMissingError,
+	SemanticIndexRequiredError,
 	SemanticRebuildRequiredError,
 } from "./types.js";

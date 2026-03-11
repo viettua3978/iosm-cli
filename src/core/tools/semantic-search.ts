@@ -45,6 +45,7 @@ function formatSemanticStatus(result: SemanticStatusResult): string {
 	const lines = [
 		`configured: ${result.configured ? "yes" : "no"}`,
 		`enabled: ${result.enabled ? "yes" : "no"}`,
+		`auto_index: ${result.autoIndex ? "on" : "off"}`,
 		`indexed: ${result.indexed ? "yes" : "no"}`,
 		`stale: ${result.stale ? `yes${result.staleReason ? ` (${result.staleReason})` : ""}` : "no"}`,
 	];

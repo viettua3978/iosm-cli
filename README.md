@@ -1,4 +1,4 @@
-<h1 align="center">IOSM CLI v0.1.3</h1>
+<h1 align="center">IOSM CLI v0.2.0</h1>
 
 <p align="center">
   <strong>AI Engineering Runtime for Professional Developers</strong>
@@ -141,7 +141,7 @@ Core commands to unlock full runtime value:
 
 ```console
 $ iosm
-IOSM CLI v0.1.3 [full]
+IOSM CLI v0.2.0 [full]
 
 you> Refactor authentication module with parallel agents, then finalize in IOSM mode
 iosm> /orchestrate --parallel --agents 4 \
@@ -260,10 +260,41 @@ Track and resume delegated execution with `/subagent-runs`, `/subagent-resume`, 
 | Track delegated runs | `/subagent-runs`, `/subagent-resume`, `/team-runs`, `/team-status` | Monitor and resume orchestration pipelines |
 | Manage MCP servers | `/mcp` | Inspect/add/enable external tool servers interactively |
 | Manage semantic search | `/semantic` | Configure provider with auto model discovery (OpenRouter/Ollama), index codebase, query by intent/meaning |
+| Define engineering contract | `/contract` | Field-by-field interactive contract editor with auto-save and automatic JSON generation |
+| Analyze feasibility variants | `/singular <feature request>` | Runs baseline + standard agent pass, then returns 3 implementation options and recommendation |
 | Manage memory | `/memory` | Add/edit/remove persistent project facts and constraints |
 | Save/restore state | `/checkpoint` / `/rollback` | Safe experimentation with fast rollback |
 | Diagnose runtime | `/doctor` | Verify model/auth/MCP/resources when behavior is inconsistent |
 | Manage settings | `/settings` | Tune runtime defaults and operational preferences |
+
+## Decision Workflow: `/contract` + `/singular`
+
+### `/contract` (interactive contract manager)
+
+- No manual JSON editing in terminal.
+- You edit fields directly (`goal`, `scope_include`, `scope_exclude`, `constraints`, `quality_gates`, `definition_of_done`, `risks`, and additional planning fields).
+- Press `Enter` on a field value and it is saved immediately.
+- Contract JSON is built automatically.
+
+Key manager actions:
+- `Open effective contract` = read merged runtime contract (`project + session`).
+- `Edit session contract` = temporary overlay for current session only.
+- `Edit project contract` = persistent baseline in `.iosm/contract.json`.
+
+### `/singular <request>` (feature feasibility analyzer)
+
+- Command-first flow: write request, run analysis, receive decision options.
+- Uses standard agent-style repository run (not static form output), then merges with baseline repository scan.
+- Produces exactly 3 options:
+  - `Option 1`: practical implementation path (usually recommended).
+  - `Option 2`: alternative strategy with different trade-offs.
+  - `Option 3`: defer/do-not-implement-now path.
+- Each option includes affected files, step-by-step plan, risks, and when-to-choose guidance.
+- User selects `1/2/3` (or exits) before coding starts.
+
+Legacy note:
+- `/blast` and `/shadow` are removed from active workflow.
+- Use `/singular` for feasibility decisions and `/contract` for engineering constraints.
 
 ## IOSM In One Line
 

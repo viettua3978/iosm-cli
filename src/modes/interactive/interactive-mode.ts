@@ -32,6 +32,7 @@ import {
 	ProcessTerminal,
 	Spacer,
 	Text,
+	truncateToWidth,
 	TruncatedText,
 	TUI,
 	visibleWidth,
@@ -97,6 +98,23 @@ import {
 	type MemoryScope,
 } from "../../core/memory.js";
 import {
+	ContractService,
+	normalizeEngineeringContract,
+	type ContractScope,
+	type ContractState,
+	type EngineeringContract,
+} from "../../core/contract.js";
+import {
+	SingularService,
+	type SingularAnalysisResult,
+	type SingularBlastRadius,
+	type SingularComplexity,
+	type SingularImpactAnalysis,
+	type SingularOption,
+	type SingularRecommendation,
+	type SingularStageFit,
+} from "../../core/singular.js";
+import {
 	getDefaultSemanticSearchConfig,
 	getSemanticConfigPath,
 	getSemanticIndexDir,
@@ -104,7 +122,9 @@ import {
 	listOllamaLocalModels,
 	listOpenRouterEmbeddingModels,
 	loadMergedSemanticConfig,
+	readScopedSemanticConfig,
 	SemanticConfigMissingError,
+	SemanticIndexRequiredError,
 	SemanticRebuildRequiredError,
 	SemanticSearchRuntime,
 	upsertScopedSemanticSearchConfig,
@@ -245,6 +265,7 @@ type IosmAutomationLoopStatus = "stabilized" | "threshold_reached" | "max_iterat
 
 const IOSM_PROFILE_ONLY_COMMANDS = new Set(["iosm", "cycle-list", "cycle-plan", "cycle-status", "cycle-report"]);
 const CHECKPOINT_LABEL_PREFIX = "checkpoint:";
+const INTERRUPT_ABORT_TIMEOUT_MS = 8_000;
 
 type IosmAutomationRunState = {
 	cancelRequested: boolean;
@@ -276,6 +297,110 @@ type DoctorCheckItem = {
 	detail: string;
 	fix?: string;
 };
+
+type ContractScopeParseResult = {
+	scope: ContractScope | undefined;
+	rest: string[];
+	error?: string;
+};
+
+type ContractFieldKind = "text" | "list";
+type ContractFieldKey = keyof EngineeringContract;
+
+type ContractFieldDefinition = {
+	key: ContractFieldKey;
+	kind: ContractFieldKind;
+	placeholder: string;
+	help: string;
+};
+
+const CONTRACT_FIELD_DEFINITIONS: ContractFieldDefinition[] = [
+	{ key: "goal", kind: "text", placeholder: "Ship X with measurable impact", help: "Single primary objective." },
+	{
+		key: "scope_include",
+		kind: "list",
+		placeholder: "auth/*",
+		help: "What is explicitly in scope.",
+	},
+	{
+		key: "scope_exclude",
+		kind: "list",
+		placeholder: "billing/*",
+		help: "What must remain untouched for this change.",
+	},
+	{
+		key: "constraints",
+		kind: "list",
+		placeholder: "no breaking API changes",
+		help: "Hard constraints that cannot be violated.",
+	},
+	{
+		key: "quality_gates",
+		kind: "list",
+		placeholder: "tests pass",
+		help: "Objective quality checks before merge.",
+	},
+	{
+		key: "definition_of_done",
+		kind: "list",
+		placeholder: "docs updated",
+		help: "Completion criteria.",
+	},
+	{
+		key: "assumptions",
+		kind: "list",
+		placeholder: "API v2 stays backward compatible",
+		help: "Assumptions the plan depends on.",
+	},
+	{
+		key: "non_goals",
+		kind: "list",
+		placeholder: "no redesign in this cycle",
+		help: "Intentional exclusions.",
+	},
+	{
+		key: "risks",
+		kind: "list",
+		placeholder: "migration may affect legacy clients",
+		help: "Known delivery risks.",
+	},
+	{
+		key: "deliverables",
+		kind: "list",
+		placeholder: "CLI command + tests + docs",
+		help: "Expected artifacts.",
+	},
+	{
+		key: "success_metrics",
+		kind: "list",
+		placeholder: "p95 latency < 250ms",
+		help: "Measurable target outcomes.",
+	},
+	{
+		key: "stakeholders",
+		kind: "list",
+		placeholder: "backend team, QA",
+		help: "Who should review/accept the result.",
+	},
+	{
+		key: "owner",
+		kind: "text",
+		placeholder: "team/platform",
+		help: "Owner accountable for delivery.",
+	},
+	{
+		key: "timebox",
+		kind: "text",
+		placeholder: "this sprint",
+		help: "Deadline or delivery window.",
+	},
+	{
+		key: "notes",
+		kind: "text",
+		placeholder: "additional context",
+		help: "Free-form context for this contract.",
+	},
+];
 
 type DoctorCliToolStatus = {
 	tool: string;
@@ -541,11 +666,15 @@ export class InteractiveMode {
 	private pendingWorkingMessage: string | undefined = undefined;
 	private readonly defaultWorkingMessage = "Working...";
 	private activeProfileName: AgentProfileName = "full";
+	private profilePromptSuffix: string | undefined = undefined;
 	private permissionMode: "ask" | "auto" | "yolo" = "ask";
 	private permissionAllowRules: string[] = [];
 	private permissionDenyRules: string[] = [];
 	private permissionPromptLock: Promise<void> = Promise.resolve();
 	private sessionAllowedToolSignatures = new Set<string>();
+	private contractService: ContractService;
+	private singularService: SingularService;
+	private singularLastEffectiveContract: EngineeringContract = {};
 
 	private lastSigintTime = 0;
 	private lastEscapeTime = 0;
@@ -635,6 +764,7 @@ export class InteractiveMode {
 	// IOSM automation state
 	private iosmAutomationRun: IosmAutomationRunState | undefined = undefined;
 	private iosmVerificationSession: AgentSession | undefined = undefined;
+	private singularAnalysisSession: AgentSession | undefined = undefined;
 
 	// Extension UI state
 	private extensionSelector: ExtensionSelectorComponent | undefined = undefined;
@@ -701,8 +831,12 @@ export class InteractiveMode {
 		this.footerDataProvider = new FooterDataProvider();
 		this.footer = new FooterComponent(session, this.footerDataProvider);
 		this.footer.setAutoCompactEnabled(session.autoCompactionEnabled);
-		this.activeProfileName = getAgentProfile(options.profile).name;
+		const profile = getAgentProfile(options.profile);
+		this.activeProfileName = profile.name;
+		this.profilePromptSuffix = profile.systemPromptAppend || undefined;
 		this.mcpRuntime = options.mcpRuntime;
+		this.contractService = new ContractService({ cwd: this.sessionManager.getCwd() });
+		this.singularService = new SingularService({ cwd: this.sessionManager.getCwd() });
 
 		// Apply plan mode and profile badges immediately if set
 		if (options.planMode || this.activeProfileName === "plan") {
@@ -710,6 +844,7 @@ export class InteractiveMode {
 		}
 		this.footer.setActiveProfile(this.activeProfileName);
 		this.session.setIosmAutopilotEnabled(this.activeProfileName === "iosm");
+		this.syncRuntimePromptSuffix();
 		this.permissionMode = this.settingsManager.getPermissionMode();
 		this.permissionAllowRules = this.settingsManager.getPermissionAllowRules();
 		this.permissionDenyRules = this.settingsManager.getPermissionDenyRules();
@@ -722,6 +857,41 @@ export class InteractiveMode {
 		// Register themes from resource loader and initialize
 		setRegisteredThemes(this.session.resourceLoader.getThemes().themes);
 		initTheme(this.settingsManager.getTheme(), true);
+	}
+
+	private syncRuntimePromptSuffix(): void {
+		let contractSuffix: string | undefined;
+		try {
+			contractSuffix = this.contractService.buildPromptContext();
+		} catch {
+			contractSuffix = undefined;
+		}
+		const suffix = [this.profilePromptSuffix, contractSuffix]
+			.map((entry) => entry?.trim())
+			.filter((entry): entry is string => !!entry && entry.length > 0)
+			.join("\n\n");
+		this.session.setSystemPromptSuffix(suffix || undefined);
+	}
+
+	private getContractStateSafe(): ContractState | undefined {
+		try {
+			return this.contractService.getState();
+		} catch (error) {
+			const message = error instanceof Error ? error.message : String(error);
+			this.showWarning(`Contract load failed: ${message}`);
+			return undefined;
+		}
+	}
+
+	private getProfileToolNames(profileName: AgentProfileName): string[] {
+		const profile = getAgentProfile(profileName);
+		const availableTools = new Set(this.session.getAllTools().map((tool) => tool.name));
+		const nextActiveTools = [...profile.tools];
+		if (availableTools.has("task")) nextActiveTools.push("task");
+		if (availableTools.has("todo_write")) nextActiveTools.push("todo_write");
+		if (availableTools.has("todo_read")) nextActiveTools.push("todo_read");
+		if (availableTools.has("ask_user")) nextActiveTools.push("ask_user");
+		return [...new Set(nextActiveTools)];
 	}
 
 	private getToolPermissionSignature(request: ToolPermissionRequest): string {
@@ -1235,6 +1405,54 @@ export class InteractiveMode {
 		return null;
 	}
 
+	private getContractArgumentCompletions(prefix: string): AutocompleteItem[] | null {
+		const subcommands = ["ui", "show", "edit", "clear", "help"];
+		const scopeFlags = ["--scope"];
+		const scopeValues = ["project", "session"];
+		const hasTrailingSpace = /\\s$/.test(prefix);
+		const tokens = this.parseSlashArgs(prefix);
+		const first = tokens[0]?.toLowerCase();
+
+		if (!first || (tokens.length === 1 && !hasTrailingSpace)) {
+			const query = first ?? "";
+			return [...subcommands, ...scopeFlags]
+				.filter((item) => item.includes(query))
+				.map((item) => ({ value: item, label: item }));
+		}
+
+		const scopeIndex = tokens.findIndex((token) => token === "--scope");
+		if (scopeIndex >= 0) {
+			const currentValue = tokens[scopeIndex + 1];
+			if (!currentValue) {
+				return scopeValues.map((value) => ({ value, label: value }));
+			}
+			return scopeValues
+				.filter((value) => value.startsWith(currentValue))
+				.map((value) => ({ value, label: value }));
+		}
+
+		const query = hasTrailingSpace ? "" : (tokens[tokens.length - 1] ?? "");
+		if (query.startsWith("--")) {
+			return scopeFlags.filter((flag) => flag.includes(query)).map((flag) => ({ value: flag, label: flag }));
+		}
+
+		return null;
+	}
+
+	private getSingularArgumentCompletions(prefix: string): AutocompleteItem[] | null {
+		const subcommands = ["help", "last"];
+		const hasTrailingSpace = /\\s$/.test(prefix);
+		const tokens = this.parseSlashArgs(prefix);
+		const first = tokens[0]?.toLowerCase();
+
+		if (!first || (tokens.length === 1 && !hasTrailingSpace)) {
+			const query = first ?? "";
+			return subcommands.filter((item) => item.includes(query)).map((item) => ({ value: item, label: item }));
+		}
+
+		return null;
+	}
+
 	private setupAutocomplete(fdPath: string | undefined): void {
 		// Define commands for autocomplete
 		const builtinCommands = BUILTIN_SLASH_COMMANDS.filter(
@@ -1292,6 +1510,18 @@ export class InteractiveMode {
 		if (semanticCommand) {
 			semanticCommand.getArgumentCompletions = (prefix: string): AutocompleteItem[] | null =>
 				this.getSemanticArgumentCompletions(prefix);
+		}
+
+		const contractCommand = slashCommands.find((command) => command.name === "contract");
+		if (contractCommand) {
+			contractCommand.getArgumentCompletions = (prefix: string): AutocompleteItem[] | null =>
+				this.getContractArgumentCompletions(prefix);
+		}
+
+		const singularCommand = slashCommands.find((command) => command.name === "singular");
+		if (singularCommand) {
+			singularCommand.getArgumentCompletions = (prefix: string): AutocompleteItem[] | null =>
+				this.getSingularArgumentCompletions(prefix);
 		}
 
 		// Convert prompt templates to SlashCommand format for autocomplete
@@ -1583,11 +1813,11 @@ export class InteractiveMode {
 		}
 
 		// Commands and keys
-		const commandsLine =
-			`${pad}${theme.fg("dim", "cmds")}  ` +
-			["model", "login", "mcp", "semantic", "memory", "doctor", "new"]
-				.map((c) => theme.fg("accent", `/${c}`))
-				.join(theme.fg("dim", "  "));
+			const commandsLine =
+				`${pad}${theme.fg("dim", "cmds")}  ` +
+				["model", "login", "contract", "singular", "semantic", "memory", "new"]
+					.map((c) => theme.fg("accent", `/${c}`))
+					.join(theme.fg("dim", "  "));
 
 		const keysLine =
 			`${pad}${theme.fg("dim", "keys")}  ` +
@@ -2063,12 +2293,12 @@ export class InteractiveMode {
 			}
 			if (extensionPaths.length > 0) summaryParts.push(theme.fg("accent", `${extensionPaths.length} extensions`));
 			if (customThemes.length > 0) summaryParts.push(theme.fg("accent", `${customThemes.length} themes`));
-			if (summaryParts.length > 0) {
-				// Build compact resource block: summary + inline items
-				const lines: string[] = [];
-				lines.push(
-					`${theme.fg("dim", "resources")}  ${summaryParts.join(theme.fg("dim", " · "))}`,
-				);
+				if (summaryParts.length > 0) {
+					// Build compact resource block: summary + inline items
+					const lines: string[] = [];
+					lines.push(
+						`${theme.fg("dim", "resources")}  ${summaryParts.join(theme.fg("dim", " · "))}`,
+					);
 
 				// Context: show file basenames inline
 				if (contextFiles.length > 0) {
@@ -2099,8 +2329,13 @@ export class InteractiveMode {
 					lines.push(`  ${theme.fg("muted", "ext")}  ${names.join(theme.fg("dim", ", "))}`);
 				}
 
+				const resourceWidth = Math.max(24, this.ui?.terminal?.columns ?? 120);
+				const safeLines = lines.map((line) =>
+					visibleWidth(line) > resourceWidth ? truncateToWidth(line, resourceWidth, "") : line,
+				);
+
 				this.chatContainer.addChild(new Spacer(1));
-				this.chatContainer.addChild(new Text(lines.join("\n"), 0, 0));
+				this.chatContainer.addChild(new Text(safeLines.join("\n"), 0, 0));
 			}
 		}
 
@@ -2956,6 +3191,7 @@ export class InteractiveMode {
 				this.session.isRetrying ||
 				this.iosmAutomationRun !== undefined ||
 				this.iosmVerificationSession !== undefined ||
+				this.singularAnalysisSession !== undefined ||
 				queuedMessages.steering.length > 0 ||
 				queuedMessages.followUp.length > 0 ||
 				queuedMeta.length > 0;
@@ -3125,6 +3361,16 @@ export class InteractiveMode {
 			if (text === "/semantic" || text.startsWith("/semantic ")) {
 				this.editor.setText("");
 				await this.handleSemanticCommand(text);
+				return;
+			}
+			if (text === "/contract" || text.startsWith("/contract ")) {
+				this.editor.setText("");
+				await this.handleContractCommand(text);
+				return;
+			}
+			if (text === "/singular" || text.startsWith("/singular ")) {
+				this.editor.setText("");
+				await this.handleSingularCommand(text);
 				return;
 			}
 			if (text === "/settings") {
@@ -4365,16 +4611,11 @@ export class InteractiveMode {
 
 	private applyProfile(profileName: AgentProfileName): void {
 		const profile = getAgentProfile(profileName);
-		const availableTools = new Set(this.session.getAllTools().map((tool) => tool.name));
-		const nextActiveTools = [...profile.tools];
-		if (availableTools.has("task")) nextActiveTools.push("task");
-		if (availableTools.has("todo_write")) nextActiveTools.push("todo_write");
-		if (availableTools.has("todo_read")) nextActiveTools.push("todo_read");
-		if (availableTools.has("ask_user")) nextActiveTools.push("ask_user");
-
-		this.session.setActiveToolsByName([...new Set(nextActiveTools)]);
+		const nextActiveTools = this.getProfileToolNames(profile.name);
+		this.session.setActiveToolsByName(nextActiveTools);
 		this.session.setThinkingLevel(profile.thinkingLevel);
-		this.session.setSystemPromptSuffix(profile.systemPromptAppend || undefined);
+		this.profilePromptSuffix = profile.systemPromptAppend || undefined;
+		this.syncRuntimePromptSuffix();
 		this.session.setIosmAutopilotEnabled(profile.name === "iosm");
 
 		this.activeProfileName = profile.name;
@@ -4666,6 +4907,8 @@ export class InteractiveMode {
 		const hasAutomationWork = this.iosmAutomationRun !== undefined;
 		const verificationSession = this.iosmVerificationSession;
 		const hasVerificationWork = verificationSession !== undefined;
+		const singularSession = this.singularAnalysisSession;
+		const hasSingularWork = singularSession !== undefined;
 		const hasMainStreaming = this.session.isStreaming;
 		const hasRetryWork = this.session.isRetrying;
 		const hasCompactionWork = this.session.isCompacting;
@@ -4675,6 +4918,7 @@ export class InteractiveMode {
 			!hasPendingQueuedMessages &&
 			!hasAutomationWork &&
 			!hasVerificationWork &&
+			!hasSingularWork &&
 			!hasMainStreaming &&
 			!hasRetryWork &&
 			!hasCompactionWork &&
@@ -4711,7 +4955,9 @@ export class InteractiveMode {
 				? "Stopping IOSM automation..."
 				: hasVerificationWork
 					? "Stopping IOSM verification..."
-					: "Stopping current run...",
+					: hasSingularWork
+						? "Stopping /singular analysis..."
+						: "Stopping current run...",
 		);
 
 		const abortPromises: Promise<unknown>[] = [];
@@ -4721,8 +4967,35 @@ export class InteractiveMode {
 		if (verificationSession) {
 			abortPromises.push(verificationSession.abort());
 		}
+		if (singularSession) {
+			abortPromises.push(singularSession.abort());
+		}
 		if (abortPromises.length > 0) {
-			await Promise.allSettled(abortPromises);
+			const settleWithTimeout = (promise: Promise<unknown>): Promise<"done" | "timeout"> =>
+				new Promise((resolve) => {
+					let finished = false;
+					const timeout = setTimeout(() => {
+						if (finished) return;
+						finished = true;
+						resolve("timeout");
+					}, INTERRUPT_ABORT_TIMEOUT_MS);
+
+					promise.finally(() => {
+						if (finished) return;
+						finished = true;
+						clearTimeout(timeout);
+						resolve("done");
+					});
+				});
+
+			const settled = await Promise.all(
+				abortPromises.map((promise) => settleWithTimeout(promise)),
+			);
+			if (settled.includes("timeout")) {
+				this.showWarning(
+					`Abort is taking longer than ${Math.round(INTERRUPT_ABORT_TIMEOUT_MS / 1000)}s. Try interrupt again if the run is still active.`,
+				);
+			}
 		}
 		return true;
 	}
@@ -6025,6 +6298,8 @@ export class InteractiveMode {
 	}
 
 	private async handleResumeSession(sessionPath: string): Promise<void> {
+		this.contractService.clear("session");
+
 		// Stop loading animation
 		if (this.loadingAnimation) {
 			this.loadingAnimation.stop();
@@ -6045,6 +6320,7 @@ export class InteractiveMode {
 		// Clear and re-render the chat
 		this.chatContainer.clear();
 		this.renderInitialMessages();
+		this.syncRuntimePromptSuffix();
 		this.refreshBuiltInHeader();
 		this.showStatus("Resumed session");
 	}
@@ -6682,7 +6958,10 @@ export class InteractiveMode {
 		});
 	}
 
-	private parseSemanticScopeOptions(args: string[]): {
+	private parseSemanticScopeOptions(
+		args: string[],
+		usage: string = "Usage: /semantic setup --scope <user|project>",
+	): {
 		scope: SemanticScope | undefined;
 		rest: string[];
 		error?: string;
@@ -6697,7 +6976,7 @@ export class InteractiveMode {
 			if (normalized === "--scope") {
 				const value = (args[index + 1] ?? "").toLowerCase();
 				if (!value) {
-					return { scope, rest, error: "Usage: /semantic setup --scope <user|project>" };
+					return { scope, rest, error: usage };
 				}
 				if (value !== "user" && value !== "project") {
 					return { scope, rest, error: `Invalid semantic scope "${value}". Use user or project.` };
@@ -6747,6 +7026,7 @@ export class InteractiveMode {
 		const lines = [
 			`configured: ${status.configured ? "yes" : "no"}`,
 			`enabled: ${status.enabled ? "yes" : "no"}`,
+			`auto_index: ${status.autoIndex ? "on" : "off"}`,
 			`indexed: ${status.indexed ? "yes" : "no"}`,
 			`stale: ${status.stale ? `yes${status.staleReason ? ` (${status.staleReason})` : ""}` : "no"}`,
 		];
@@ -7085,8 +7365,50 @@ export class InteractiveMode {
 				`scope: ${scope}`,
 				`provider: ${this.getSemanticSetupProviderLabel(providerType)}`,
 				`model: ${nextProvider.model}`,
+				`auto_index: ${nextConfig.autoIndex ? "on" : "off"}`,
 				`config: ${savedPath}`,
 				`index_dir: ${getSemanticIndexDir(cwd, agentDir)}`,
+			].join("\n"),
+		);
+	}
+
+	private resolveSemanticAutoIndexWriteScope(cwd: string, agentDir: string): SemanticScope {
+		const project = readScopedSemanticConfig("project", cwd, agentDir);
+		if (!project.error && project.file.semanticSearch) {
+			return "project";
+		}
+		return "user";
+	}
+
+	private async updateSemanticAutoIndexSetting(options?: {
+		scope?: SemanticScope;
+		value?: boolean;
+	}): Promise<void> {
+		const cwd = this.sessionManager.getCwd();
+		const agentDir = getAgentDir();
+		const merged = loadMergedSemanticConfig(cwd, agentDir);
+		if (!merged.config) {
+			this.showWarning("Semantic search is not configured. Run /semantic setup first.");
+			return;
+		}
+
+		const scope = options?.scope ?? this.resolveSemanticAutoIndexWriteScope(cwd, agentDir);
+		const value = options?.value ?? !merged.config.autoIndex;
+
+		const nextConfig: SemanticSearchConfig = {
+			...merged.config,
+			autoIndex: value,
+		};
+		const savedPath = upsertScopedSemanticSearchConfig(scope, nextConfig, cwd, agentDir);
+		const effective = await this.createSemanticRuntime().status().catch(() => undefined);
+		this.showStatus(`Semantic auto-index ${value ? "enabled" : "disabled"} (${scope}).`);
+		this.showCommandTextBlock(
+			"Semantic Auto-Index",
+			[
+				`scope: ${scope}`,
+				`saved: ${value ? "on" : "off"}`,
+				`effective: ${effective ? (effective.autoIndex ? "on" : "off") : "unknown"}`,
+				`config: ${savedPath}`,
 			].join("\n"),
 		);
 	}
@@ -7101,7 +7423,7 @@ export class InteractiveMode {
 			}
 
 			const summary = status
-				? `configured=${status.configured ? "yes" : "no"} indexed=${status.indexed ? "yes" : "no"} stale=${status.stale ? "yes" : "no"}`
+				? `configured=${status.configured ? "yes" : "no"} auto_index=${status.autoIndex ? "on" : "off"} indexed=${status.indexed ? "yes" : "no"} stale=${status.stale ? "yes" : "no"}`
 				: "status unavailable";
 			const selected = await this.showExtensionSelector(`/semantic manager\n${summary}`, [
 				"Configure provider/model",
@@ -7109,6 +7431,7 @@ export class InteractiveMode {
 				"Index now",
 				"Rebuild index",
 				"Query index",
+				`Automatic indexing: ${status?.autoIndex ? "on" : "off"}`,
 				"Show config/index paths",
 				"Close",
 			]);
@@ -7187,6 +7510,10 @@ export class InteractiveMode {
 				}
 				continue;
 			}
+			if (selected.startsWith("Automatic indexing:")) {
+				await this.updateSemanticAutoIndexSetting();
+				continue;
+			}
 			if (selected === "Show config/index paths") {
 				const runtime = this.createSemanticRuntime();
 				const cwd = this.sessionManager.getCwd();
@@ -7224,6 +7551,11 @@ export class InteractiveMode {
 			);
 			return;
 		}
+		if (error instanceof SemanticIndexRequiredError) {
+			this.showWarning(error.message);
+			this.showWarning("Run /semantic index (or enable automatic indexing in /semantic).");
+			return;
+		}
 		if (error instanceof SemanticRebuildRequiredError) {
 			this.showWarning(error.message);
 			this.showWarning("Run /semantic rebuild.");
@@ -7251,6 +7583,7 @@ export class InteractiveMode {
 					"  /semantic",
 					"  /semantic ui",
 					"  /semantic setup [--scope user|project]",
+					"  /semantic auto-index [on|off] [--scope user|project]",
 					"  /semantic status",
 					"  /semantic index",
 					"  /semantic rebuild",
@@ -7272,6 +7605,36 @@ export class InteractiveMode {
 				return;
 			}
 			await this.runSemanticSetupWizard(parsedScope.scope);
+			return;
+		}
+
+		if (subcommand === "auto-index" || subcommand === "autoindex") {
+			const parsedScope = this.parseSemanticScopeOptions(
+				rest,
+				"Usage: /semantic auto-index [on|off] [--scope user|project]",
+			);
+			if (parsedScope.error) {
+				this.showWarning(parsedScope.error);
+				return;
+			}
+			let value: boolean | undefined;
+			if (parsedScope.rest.length > 1) {
+				this.showWarning("Usage: /semantic auto-index [on|off] [--scope user|project]");
+				return;
+			}
+			if (parsedScope.rest.length === 1) {
+				const mode = parsedScope.rest[0]?.toLowerCase();
+				if (mode === "on" || mode === "enable" || mode === "enabled") value = true;
+				else if (mode === "off" || mode === "disable" || mode === "disabled") value = false;
+				else {
+					this.showWarning(`Unknown auto-index mode "${parsedScope.rest[0]}". Use on|off.`);
+					return;
+				}
+			}
+			await this.updateSemanticAutoIndexSetting({
+				scope: parsedScope.scope,
+				value,
+			});
 			return;
 		}
 
@@ -7337,6 +7700,1102 @@ export class InteractiveMode {
 		}
 
 		this.showWarning(`Unknown /semantic subcommand "${subcommand}". Use /semantic help.`);
+	}
+
+	private parseContractScopeOptions(
+		args: string[],
+		usage = "Usage: /contract <edit|clear> --scope <project|session>",
+	): ContractScopeParseResult {
+		let scope: ContractScope | undefined;
+		const rest: string[] = [];
+
+		for (let index = 0; index < args.length; index++) {
+			const token = args[index] ?? "";
+			const normalized = token.toLowerCase();
+			if (normalized === "--scope") {
+				const value = (args[index + 1] ?? "").toLowerCase().trim();
+				if (!value) {
+					return { scope, rest, error: usage };
+				}
+				if (value !== "project" && value !== "session") {
+					return { scope, rest, error: `Invalid contract scope "${value}". Use project or session.` };
+				}
+				scope = value;
+				index += 1;
+				continue;
+			}
+			rest.push(token);
+		}
+
+		return { scope, rest };
+	}
+
+	private cloneContract(contract: EngineeringContract): EngineeringContract {
+		return normalizeEngineeringContract({
+			...(contract.goal ? { goal: contract.goal } : {}),
+			...(contract.scope_include ? { scope_include: [...contract.scope_include] } : {}),
+			...(contract.scope_exclude ? { scope_exclude: [...contract.scope_exclude] } : {}),
+			...(contract.constraints ? { constraints: [...contract.constraints] } : {}),
+			...(contract.quality_gates ? { quality_gates: [...contract.quality_gates] } : {}),
+			...(contract.definition_of_done ? { definition_of_done: [...contract.definition_of_done] } : {}),
+			...(contract.assumptions ? { assumptions: [...contract.assumptions] } : {}),
+			...(contract.non_goals ? { non_goals: [...contract.non_goals] } : {}),
+			...(contract.risks ? { risks: [...contract.risks] } : {}),
+			...(contract.deliverables ? { deliverables: [...contract.deliverables] } : {}),
+			...(contract.success_metrics ? { success_metrics: [...contract.success_metrics] } : {}),
+			...(contract.stakeholders ? { stakeholders: [...contract.stakeholders] } : {}),
+			...(contract.owner ? { owner: contract.owner } : {}),
+			...(contract.timebox ? { timebox: contract.timebox } : {}),
+			...(contract.notes ? { notes: contract.notes } : {}),
+		});
+	}
+
+	private formatContractSection(title: string, contract: EngineeringContract): string {
+		const payload = Object.keys(contract).length > 0 ? contract : {};
+		return `${title}:\n${JSON.stringify(payload, null, 2)}`;
+	}
+
+	private formatContractFieldPreview(field: ContractFieldDefinition, value: unknown): string {
+		if (field.kind === "text") {
+			if (typeof value !== "string" || value.trim().length === 0) return "(empty)";
+			return value.trim();
+		}
+		if (!Array.isArray(value) || value.length === 0) return "(empty)";
+		const values = value.filter((item): item is string => typeof item === "string" && item.trim().length > 0);
+		if (values.length === 0) return "(empty)";
+		const preview = values.slice(0, 2).join("; ");
+		return values.length > 2 ? `${preview} (+${values.length - 2})` : preview;
+	}
+
+	private showContractState(state: ContractState): void {
+		this.showCommandTextBlock(
+			"Contract",
+			[
+				`project_path: ${state.projectPath}${state.hasProjectFile ? "" : " (missing)"}`,
+				"",
+				this.formatContractSection("Project", state.project),
+				"",
+				this.formatContractSection("Session overlay", state.sessionOverlay),
+				"",
+				this.formatContractSection("Effective", state.effective),
+			].join("\n"),
+		);
+	}
+
+	private async editContractFieldValue(
+		scope: ContractScope,
+		field: ContractFieldDefinition,
+		draft: EngineeringContract,
+	): Promise<EngineeringContract | undefined> {
+		const payload = draft as Record<string, unknown>;
+		const current = payload[field.key];
+
+		if (field.kind === "text") {
+			const entered = await this.showExtensionInput(
+				`/contract ${scope}: ${field.key}\n${field.help}\nEnter empty value to clear.`,
+				typeof current === "string" && current.trim().length > 0 ? current : field.placeholder,
+			);
+			if (entered === undefined) return undefined;
+			const nextPayload: Record<string, unknown> = { ...payload };
+			const normalized = entered.trim();
+			if (normalized.length === 0) {
+				delete nextPayload[field.key];
+			} else {
+				nextPayload[field.key] = normalized;
+			}
+			return normalizeEngineeringContract(nextPayload);
+		}
+
+		const prefill = Array.isArray(current)
+			? current.filter((item): item is string => typeof item === "string").join("\n")
+			: "";
+		const edited = await this.showExtensionEditor(
+			`/contract ${scope}: ${field.key}\n${field.help}\nOne item per line. Empty value clears the field.`,
+			prefill,
+		);
+		if (edited === undefined) return undefined;
+		const values = edited
+			.split(/\r?\n/)
+			.map((line) => line.trim())
+			.filter((line) => line.length > 0);
+		const nextPayload: Record<string, unknown> = { ...payload };
+		if (values.length === 0) {
+			delete nextPayload[field.key];
+		} else {
+			nextPayload[field.key] = values;
+		}
+		return normalizeEngineeringContract(nextPayload);
+	}
+
+	private formatContractEditorSummary(scope: ContractScope, draft: EngineeringContract): string {
+		const setCount = CONTRACT_FIELD_DEFINITIONS.filter((field) => {
+			const value = (draft as Record<string, unknown>)[field.key];
+			if (field.kind === "text") return typeof value === "string" && value.trim().length > 0;
+			return Array.isArray(value) && value.length > 0;
+		}).length;
+		return `/contract editor (${scope})\nfilled=${setCount}/${CONTRACT_FIELD_DEFINITIONS.length}`;
+	}
+
+	private async editContractScope(scope: ContractScope): Promise<void> {
+		const state = this.getContractStateSafe();
+		if (!state) return;
+		let draft = this.cloneContract(scope === "project" ? state.project : state.sessionOverlay);
+
+		while (true) {
+			const fieldOptions = CONTRACT_FIELD_DEFINITIONS.map((field) => {
+				const value = (draft as Record<string, unknown>)[field.key];
+				return {
+					field,
+					label: `Edit ${field.key}: ${this.formatContractFieldPreview(field, value)}`,
+				};
+			});
+			const selected = await this.showExtensionSelector(
+				`${this.formatContractEditorSummary(scope, draft)}\nHow to use: select a field and press Enter to edit. Changes are auto-saved immediately.`,
+				[
+					...fieldOptions.map((entry) => entry.label),
+					"Open JSON preview",
+					"Delete scope contract",
+					"Cancel",
+				],
+			);
+			if (!selected || selected.startsWith("Cancel")) {
+				this.showStatus("Contract edit cancelled.");
+				return;
+			}
+
+			if (selected.startsWith("Open JSON preview")) {
+				this.showCommandTextBlock(
+					`Contract Draft (${scope})`,
+					JSON.stringify(Object.keys(draft).length > 0 ? draft : {}, null, 2),
+				);
+				continue;
+			}
+
+			if (selected.startsWith("Delete scope contract")) {
+				if (scope === "project") {
+					const confirm = await this.showExtensionConfirm(
+						"Delete project contract?",
+						`${state.projectPath}\nThis removes .iosm/contract.json`,
+					);
+					if (!confirm) {
+						this.showStatus("Project contract delete cancelled.");
+						continue;
+					}
+				}
+				this.contractService.clear(scope);
+				this.syncRuntimePromptSuffix();
+				this.showStatus(`Contract cleared (${scope}).`);
+				return;
+			}
+
+			const fieldEntry = fieldOptions.find((entry) => entry.label === selected);
+			const field = fieldEntry?.field;
+			if (!field) {
+				this.showWarning("Unknown contract field selection.");
+				continue;
+			}
+			const updated = await this.editContractFieldValue(scope, field, draft);
+			if (!updated) {
+				this.showStatus(`Field edit cancelled (${field.key}).`);
+				continue;
+			}
+			draft = updated;
+			try {
+				this.contractService.save(scope, draft);
+				this.syncRuntimePromptSuffix();
+				this.showStatus(`Saved ${field.key} (${scope}).`);
+			} catch (error) {
+				this.showWarning(error instanceof Error ? error.message : String(error));
+			}
+		}
+	}
+
+	private async runContractInteractiveMenu(): Promise<void> {
+		while (true) {
+			const state = this.getContractStateSafe();
+			if (!state) return;
+			const selected = await this.showExtensionSelector(
+				[
+					`/contract manager`,
+					`project=${state.hasProjectFile ? "yes" : "no"} session_keys=${Object.keys(state.sessionOverlay).length} effective_keys=${Object.keys(state.effective).length}`,
+					`How to use: open effective to inspect merged JSON, edit session for temporary changes, edit project for persistent changes.`,
+					`Field edits are auto-saved right after Enter.`,
+				].join("\n"),
+				[
+					"Open effective contract",
+					"Edit session contract",
+					"Edit project contract",
+					"Copy effective -> session",
+					"Copy effective -> project",
+					"Delete session contract",
+					"Delete project contract",
+					"Close",
+				],
+			);
+			if (!selected || selected.startsWith("Close")) {
+				return;
+			}
+
+			if (selected === "Open effective contract") {
+				this.showContractState(state);
+				continue;
+			}
+			if (selected === "Edit session contract") {
+				await this.editContractScope("session");
+				continue;
+			}
+			if (selected === "Edit project contract") {
+				await this.editContractScope("project");
+				continue;
+			}
+			if (selected === "Copy effective -> session") {
+				try {
+					this.contractService.save("session", state.effective);
+					this.syncRuntimePromptSuffix();
+					this.showStatus("Effective contract copied to session overlay.");
+				} catch (error) {
+					this.showWarning(error instanceof Error ? error.message : String(error));
+				}
+				continue;
+			}
+			if (selected === "Copy effective -> project") {
+				try {
+					this.contractService.save("project", state.effective);
+					this.syncRuntimePromptSuffix();
+					this.showStatus("Effective contract copied to project.");
+				} catch (error) {
+					this.showWarning(error instanceof Error ? error.message : String(error));
+				}
+				continue;
+			}
+			if (selected === "Delete session contract") {
+				this.contractService.clear("session");
+				this.syncRuntimePromptSuffix();
+				this.showStatus("Session contract deleted.");
+				continue;
+			}
+			if (selected === "Delete project contract") {
+				const confirm = await this.showExtensionConfirm(
+					"Delete project contract?",
+					`${state.projectPath}\nThis removes .iosm/contract.json`,
+				);
+				if (!confirm) {
+					this.showStatus("Project contract delete cancelled.");
+					continue;
+				}
+				this.contractService.clear("project");
+				this.syncRuntimePromptSuffix();
+				this.showStatus("Project contract deleted.");
+			}
+		}
+	}
+
+	private async handleContractCommand(text: string): Promise<void> {
+		const args = this.parseSlashArgs(text).slice(1);
+		if (args.length === 0 || (args[0]?.toLowerCase() ?? "") === "ui") {
+			await this.runContractInteractiveMenu();
+			return;
+		}
+
+		const subcommand = (args[0] ?? "").toLowerCase();
+		const rest = args.slice(1);
+
+		if (subcommand === "help" || subcommand === "-h" || subcommand === "--help") {
+			this.showCommandTextBlock(
+				"Contract Help",
+				[
+					"Usage:",
+					"  /contract",
+					"  /contract ui",
+					"  /contract show",
+					"  /contract edit --scope <project|session>",
+					"  /contract clear --scope <project|session>",
+					"  /contract help",
+						"",
+						"Editor model:",
+						"  - Fill fields interactively (goal, scope, constraints, quality gates, DoD, risks, etc.)",
+						"  - Each field is saved immediately after Enter (no extra Save step)",
+					].join("\n"),
+				);
+			return;
+		}
+
+		if (subcommand === "show" || subcommand === "status" || subcommand === "open") {
+			const state = this.getContractStateSafe();
+			if (!state) return;
+			this.showContractState(state);
+			return;
+		}
+
+		if (subcommand === "edit") {
+			const parsed = this.parseContractScopeOptions(rest, "Usage: /contract edit --scope <project|session>");
+			if (parsed.error) {
+				this.showWarning(parsed.error);
+				return;
+			}
+			if (parsed.rest.length > 0) {
+				this.showWarning(`Unexpected arguments for /contract edit: ${parsed.rest.join(" ")}`);
+				return;
+			}
+			await this.editContractScope(parsed.scope ?? "session");
+			return;
+		}
+
+		if (subcommand === "clear" || subcommand === "rm" || subcommand === "remove" || subcommand === "delete") {
+			const parsed = this.parseContractScopeOptions(rest, "Usage: /contract clear --scope <project|session>");
+			if (parsed.error) {
+				this.showWarning(parsed.error);
+				return;
+			}
+			if (!parsed.scope) {
+				this.showWarning("Usage: /contract clear --scope <project|session>");
+				return;
+			}
+			if (parsed.rest.length > 0) {
+				this.showWarning(`Unexpected arguments for /contract clear: ${parsed.rest.join(" ")}`);
+				return;
+			}
+			this.contractService.clear(parsed.scope);
+			this.syncRuntimePromptSuffix();
+			this.showStatus(`Contract cleared (${parsed.scope}).`);
+			return;
+		}
+
+		this.showWarning(`Unknown /contract subcommand "${subcommand}". Use /contract help.`);
+	}
+
+	private normalizeSingularComplexity(value: unknown, fallback: SingularComplexity): SingularComplexity {
+		const normalized = typeof value === "string" ? value.trim().toLowerCase() : "";
+		if (normalized === "low" || normalized === "medium" || normalized === "high") {
+			return normalized;
+		}
+		return fallback;
+	}
+
+	private normalizeSingularBlastRadius(value: unknown, fallback: SingularBlastRadius): SingularBlastRadius {
+		const normalized = typeof value === "string" ? value.trim().toLowerCase() : "";
+		if (normalized === "low" || normalized === "medium" || normalized === "high") {
+			return normalized;
+		}
+		return fallback;
+	}
+
+	private normalizeSingularRecommendation(value: unknown, fallback: SingularRecommendation): SingularRecommendation {
+		const normalized = typeof value === "string" ? value.trim().toLowerCase() : "";
+		if (normalized === "implement_now" || normalized === "implement_incrementally" || normalized === "defer") {
+			return normalized;
+		}
+		return fallback;
+	}
+
+	private normalizeSingularStageFit(value: unknown): SingularStageFit | undefined {
+		const normalized = typeof value === "string" ? value.trim().toLowerCase() : "";
+		if (normalized === "needed_now" || normalized === "optional_now" || normalized === "later") {
+			return normalized;
+		}
+		if (normalized === "now") return "needed_now";
+		if (normalized === "optional") return "optional_now";
+		return undefined;
+	}
+
+	private toTrimmedString(value: unknown, maxLength: number, fallback?: string): string | undefined {
+		if (typeof value !== "string") return fallback;
+		const compact = value.replace(/\s+/g, " ").trim();
+		if (!compact) return fallback;
+		if (compact.length <= maxLength) return compact;
+		return compact.slice(0, maxLength).trim();
+	}
+
+	private toTrimmedStringList(value: unknown, maxItems: number, maxLength = 220): string[] {
+		if (!Array.isArray(value)) return [];
+		const lines: string[] = [];
+		for (const item of value) {
+			const normalized = this.toTrimmedString(item, maxLength);
+			if (!normalized) continue;
+			lines.push(normalized);
+			if (lines.length >= maxItems) break;
+		}
+		return lines;
+	}
+
+	private normalizeSingularImpactAnalysis(
+		value: unknown,
+		fallback?: SingularImpactAnalysis,
+	): SingularImpactAnalysis | undefined {
+		if (!value || typeof value !== "object" || Array.isArray(value)) {
+			return fallback;
+		}
+		const payload = value as Record<string, unknown>;
+		const codebase = this.toTrimmedString(payload.codebase, 260, fallback?.codebase ?? "Unknown.");
+		const delivery = this.toTrimmedString(payload.delivery, 260, fallback?.delivery ?? "Unknown.");
+		const risks = this.toTrimmedString(payload.risks, 260, fallback?.risks ?? "Unknown.");
+		const operations = this.toTrimmedString(payload.operations, 260, fallback?.operations ?? "Unknown.");
+		if (!codebase || !delivery || !risks || !operations) return fallback;
+		return {
+			codebase,
+			delivery,
+			risks,
+			operations,
+		};
+	}
+
+	private buildSingularContractPromptSection(contract: EngineeringContract): string {
+		const lines: string[] = [];
+		if (contract.goal) lines.push(`- goal: ${contract.goal}`);
+		if ((contract.scope_include ?? []).length > 0) {
+			lines.push(`- scope_include: ${(contract.scope_include ?? []).slice(0, 8).join("; ")}`);
+		}
+		if ((contract.scope_exclude ?? []).length > 0) {
+			lines.push(`- scope_exclude: ${(contract.scope_exclude ?? []).slice(0, 8).join("; ")}`);
+		}
+		if ((contract.constraints ?? []).length > 0) {
+			lines.push(`- constraints: ${(contract.constraints ?? []).slice(0, 10).join("; ")}`);
+		}
+		if ((contract.quality_gates ?? []).length > 0) {
+			lines.push(`- quality_gates: ${(contract.quality_gates ?? []).slice(0, 10).join("; ")}`);
+		}
+		if ((contract.definition_of_done ?? []).length > 0) {
+			lines.push(`- definition_of_done: ${(contract.definition_of_done ?? []).slice(0, 10).join("; ")}`);
+		}
+		if ((contract.non_goals ?? []).length > 0) {
+			lines.push(`- non_goals: ${(contract.non_goals ?? []).slice(0, 8).join("; ")}`);
+		}
+		return lines.length > 0 ? lines.join("\n") : "- none";
+	}
+
+	private buildSingularAgentPrompt(
+		request: string,
+		baseline: SingularAnalysisResult,
+		contract: EngineeringContract,
+	): string {
+		const filesHint =
+			baseline.matchedFiles.length > 0
+				? baseline.matchedFiles.slice(0, 12).map((item) => `- ${item}`).join("\n")
+				: "- no direct file matches found in heuristic pass";
+
+		return [
+			"You are running a feasibility pass for `/singular`.",
+			"Task: analyze the codebase for this request and decide whether to implement now, incrementally, or defer.",
+			"",
+			"Hard requirements:",
+			"- Inspect repository files with tools before final output (at least one tool call).",
+			"- Return a human-readable markdown report (no JSON).",
+			"- Include exactly three options (Option 1, Option 2, Option 3).",
+			"- Each option must contain concrete file paths when possible.",
+			"",
+			"Use this exact template:",
+			"# Singular Feasibility",
+			"Recommendation: implement_now|implement_incrementally|defer",
+			"Reason: <one concise reason>",
+			"Complexity: low|medium|high",
+			"Blast Radius: low|medium|high",
+			"Stage Fit: needed_now|optional_now|later",
+			"Stage Fit Reason: <why this stage fit>",
+			"Impact - Codebase: <impact>",
+			"Impact - Delivery: <impact>",
+			"Impact - Risks: <impact>",
+			"Impact - Operations: <impact>",
+			"",
+			"## Option 1: <title>",
+			"Summary: <summary>",
+			"Complexity: low|medium|high",
+			"Blast Radius: low|medium|high",
+			"When to choose: <guidance>",
+			"Suggested files:",
+			"- <path>",
+			"Plan:",
+			"1. <step>",
+			"Pros:",
+			"- <pro>",
+			"Cons:",
+			"- <con>",
+			"",
+			"## Option 2: <title>",
+			"... same fields ...",
+			"",
+			"## Option 3: <title>",
+			"... same fields ...",
+			"",
+			`Feature request: ${request}`,
+			"",
+			"Baseline scan summary (heuristic pass):",
+			`- scanned_files: ${baseline.scannedFiles}`,
+			`- source_files: ${baseline.sourceFiles}`,
+			`- test_files: ${baseline.testFiles}`,
+			`- baseline_complexity: ${baseline.baselineComplexity}`,
+			`- baseline_blast_radius: ${baseline.baselineBlastRadius}`,
+			`- baseline_recommendation: ${baseline.recommendation}`,
+			"",
+			"Matched file hints from baseline (verify, do not assume blindly):",
+			filesHint,
+			"",
+			"Active engineering contract:",
+			this.buildSingularContractPromptSection(contract),
+		].join("\n");
+	}
+
+	private extractLabeledValue(text: string, labels: string[], maxLength = 320): string | undefined {
+		for (const label of labels) {
+			const escaped = label.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+			const match = text.match(new RegExp(`^\\s*${escaped}\\s*:\\s*(.+?)\\s*$`, "im"));
+			if (!match?.[1]) continue;
+			const normalized = this.toTrimmedString(match[1], maxLength);
+			if (normalized) return normalized;
+		}
+		return undefined;
+	}
+
+	private parseSingularListSection(block: string, heading: string, maxItems: number): string[] {
+		const headings = [
+			"Summary",
+			"Complexity",
+			"Blast Radius",
+			"When to choose",
+			"Suggested files",
+			"Plan",
+			"Pros",
+			"Cons",
+		];
+		const escapedHeading = heading.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+		const nextHeadings = headings.filter((item) => item !== heading).map((item) => item.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"));
+		const sectionRegex = new RegExp(
+			`(?:^|\\n)\\s*${escapedHeading}\\s*:\\s*([\\s\\S]*?)(?=\\n\\s*(?:${nextHeadings.join("|")})\\s*:|\\n\\s*##\\s*Option\\s*[123]\\s*:|$)`,
+			"i",
+		);
+		const sectionMatch = block.match(sectionRegex);
+		if (!sectionMatch?.[1]) return [];
+
+		const result: string[] = [];
+		const lines = sectionMatch[1].split(/\r?\n/);
+		for (const rawLine of lines) {
+			let line = rawLine.trim();
+			if (!line) continue;
+			line = line.replace(/^[-*]\s+/, "").replace(/^\d+[.)]\s+/, "").trim();
+			if (!line) continue;
+			result.push(line);
+			if (result.length >= maxItems) break;
+		}
+		return result;
+	}
+
+	private parseSingularOptionsFromText(
+		text: string,
+		baseline: SingularAnalysisResult,
+	): { options: SingularOption[]; parsedCount: number } {
+		const optionRegex = /^##\s*Option\s*([123])\s*:\s*(.+?)\s*$/gim;
+		const matches = [...text.matchAll(optionRegex)];
+		const parsed: SingularOption[] = [];
+
+		for (let index = 0; index < matches.length; index += 1) {
+			const current = matches[index];
+			const optionIndexRaw = Number.parseInt(current[1] ?? "", 10);
+			const optionIndex = Number.isInteger(optionIndexRaw) ? Math.max(1, Math.min(3, optionIndexRaw)) - 1 : index;
+			const fallback = baseline.options[optionIndex] ?? baseline.options[Math.min(index, baseline.options.length - 1)];
+			if (!fallback) continue;
+
+			const bodyStart = (current.index ?? 0) + current[0].length;
+			const bodyEnd = index + 1 < matches.length ? (matches[index + 1].index ?? text.length) : text.length;
+			const body = text.slice(bodyStart, bodyEnd);
+			const title = this.toTrimmedString(current[2], 120, fallback.title) ?? fallback.title;
+			const summary = this.extractLabeledValue(body, ["Summary"], 320) ?? fallback.summary;
+			const complexity = this.normalizeSingularComplexity(
+				this.extractLabeledValue(body, ["Complexity"], 24),
+				fallback.complexity,
+			);
+			const blastRadius = this.normalizeSingularBlastRadius(
+				this.extractLabeledValue(body, ["Blast Radius", "Blast"], 24),
+				fallback.blast_radius,
+			);
+			const whenToChoose = this.extractLabeledValue(body, ["When to choose"], 220) ?? fallback.when_to_choose;
+			const suggestedFiles = this.parseSingularListSection(body, "Suggested files", 8);
+			const plan = this.parseSingularListSection(body, "Plan", 8);
+			const pros = this.parseSingularListSection(body, "Pros", 6);
+			const cons = this.parseSingularListSection(body, "Cons", 6);
+
+			parsed.push({
+				id: String(parsed.length + 1),
+				title,
+				summary,
+				complexity,
+				blast_radius: blastRadius,
+				suggested_files: suggestedFiles.length > 0 ? suggestedFiles : fallback.suggested_files,
+				plan: plan.length > 0 ? plan : fallback.plan,
+				pros: pros.length > 0 ? pros : fallback.pros,
+				cons: cons.length > 0 ? cons : fallback.cons,
+				when_to_choose: whenToChoose,
+			});
+		}
+
+		while (parsed.length < 3 && parsed.length < baseline.options.length) {
+			const fallback = baseline.options[parsed.length];
+			parsed.push({
+				...fallback,
+				id: String(parsed.length + 1),
+			});
+		}
+
+		return {
+			options: parsed.slice(0, 3),
+			parsedCount: matches.length,
+		};
+	}
+
+	private parseSingularAgentAnalysisFromText(
+		baseline: SingularAnalysisResult,
+		rawText: string,
+	): { result: SingularAnalysisResult; parsedOptions: number; hasRecommendation: boolean } {
+		const recommendationRaw = this.extractLabeledValue(rawText, ["Recommendation"], 64);
+		const recommendation = this.normalizeSingularRecommendation(recommendationRaw, baseline.recommendation);
+		const recommendationReason =
+			this.extractLabeledValue(rawText, ["Reason", "Recommendation Reason"], 320) ?? baseline.recommendationReason;
+		const baselineComplexity = this.normalizeSingularComplexity(
+			this.extractLabeledValue(rawText, ["Complexity"], 24),
+			baseline.baselineComplexity,
+		);
+		const baselineBlastRadius = this.normalizeSingularBlastRadius(
+			this.extractLabeledValue(rawText, ["Blast Radius", "Blast"], 24),
+			baseline.baselineBlastRadius,
+		);
+		const stageFit = this.normalizeSingularStageFit(this.extractLabeledValue(rawText, ["Stage Fit"], 40)) ?? baseline.stageFit;
+		const stageFitReason = this.extractLabeledValue(rawText, ["Stage Fit Reason"], 280) ?? baseline.stageFitReason;
+		const impactAnalysis: SingularImpactAnalysis = {
+			codebase: this.extractLabeledValue(rawText, ["Impact - Codebase", "Codebase Impact"], 260) ?? "Unknown.",
+			delivery: this.extractLabeledValue(rawText, ["Impact - Delivery", "Delivery Impact"], 260) ?? "Unknown.",
+			risks: this.extractLabeledValue(rawText, ["Impact - Risks", "Risk Impact"], 260) ?? "Unknown.",
+			operations: this.extractLabeledValue(rawText, ["Impact - Operations", "Operations Impact"], 260) ?? "Unknown.",
+		};
+		const { options, parsedCount } = this.parseSingularOptionsFromText(rawText, baseline);
+
+		return {
+			result: {
+				...baseline,
+				recommendation,
+				recommendationReason,
+				baselineComplexity,
+				baselineBlastRadius,
+				stageFit,
+				stageFitReason,
+				impactAnalysis,
+				options,
+			},
+			parsedOptions: parsedCount,
+			hasRecommendation: recommendationRaw !== undefined,
+		};
+	}
+
+	private async runSingularAgentFeasibilityPass(
+		request: string,
+		baseline: SingularAnalysisResult,
+		contract: EngineeringContract,
+	): Promise<SingularAnalysisResult | undefined> {
+		const model = this.session.model;
+		if (!model) {
+			return undefined;
+		}
+
+		const cwd = this.sessionManager.getCwd();
+		const agentDir = getAgentDir();
+		const settingsManager = SettingsManager.create(cwd, agentDir);
+		const authStorage = AuthStorage.create(getAuthPath());
+		const modelRegistry = new ModelRegistry(authStorage, getModelsPath());
+		const resourceLoader = new DefaultResourceLoader({
+			cwd,
+			agentDir,
+			settingsManager,
+			noExtensions: true,
+			noSkills: true,
+			noPromptTemplates: true,
+		});
+		await resourceLoader.reload();
+
+		const { session } = await createAgentSession({
+			cwd,
+			sessionManager: SessionManager.inMemory(),
+			settingsManager,
+			authStorage,
+			modelRegistry,
+			resourceLoader,
+			model,
+			profile: "plan",
+			enableTaskTool: false,
+		});
+
+		let toolCallsStarted = 0;
+		const chunks: string[] = [];
+		const eventBridge = this.createIosmVerificationEventBridge({
+			loaderMessage: `Running /singular feasibility analysis... (${appKey(this.keybindings, "interrupt")} to interrupt)`,
+		});
+		const unsubscribe = session.subscribe((event) => {
+			eventBridge(event);
+			if (event.type === "tool_execution_start") {
+				toolCallsStarted += 1;
+				return;
+			}
+			if (event.type === "message_end" && event.message.role === "assistant") {
+				for (const part of event.message.content) {
+					if (part.type === "text" && part.text.trim()) {
+						chunks.push(part.text.trim());
+					}
+				}
+			}
+		});
+
+		this.singularAnalysisSession = session;
+		try {
+			const primaryPrompt = this.buildSingularAgentPrompt(request, baseline, contract);
+			const strictRetryPrompt = [
+				"Retry strict mode:",
+				"- Inspect repository files using tools first.",
+				"- Return markdown report using the exact template from previous prompt.",
+				"- Include Recommendation and Option 1/2/3 sections.",
+				"- Do not return JSON.",
+			].join("\n");
+
+			const runAttempt = async (promptText: string): Promise<{ text: string; toolCalls: number }> => {
+				const chunkStart = chunks.length;
+				const toolStart = toolCallsStarted;
+				await session.prompt(promptText, {
+					expandPromptTemplates: false,
+					skipIosmAutopilot: true,
+					skipOrchestrationDirective: true,
+					source: "interactive",
+				});
+				return {
+					text: chunks.slice(chunkStart).join("\n\n").trim(),
+					toolCalls: Math.max(0, toolCallsStarted - toolStart),
+				};
+			};
+
+			let attempt = await runAttempt(primaryPrompt);
+			let parsed = this.parseSingularAgentAnalysisFromText(baseline, attempt.text);
+
+			if ((parsed.parsedOptions < 3 || !parsed.hasRecommendation || attempt.toolCalls === 0) && !session.isStreaming) {
+				attempt = await runAttempt(strictRetryPrompt);
+				parsed = this.parseSingularAgentAnalysisFromText(baseline, attempt.text);
+			}
+
+			if ((parsed.parsedOptions < 3 || !parsed.hasRecommendation) || toolCallsStarted === 0) {
+				return undefined;
+			}
+
+			return parsed.result;
+		} finally {
+			if (session.isStreaming) {
+				await session.abort().catch(() => {
+					// best effort
+				});
+			}
+			if (this.singularAnalysisSession === session) {
+				this.singularAnalysisSession = undefined;
+			}
+			unsubscribe();
+			session.dispose();
+		}
+	}
+
+	private formatSingularRunReport(result: SingularAnalysisResult): string {
+		const recommendedId = this.resolveRecommendedSingularOptionId(result);
+		const coverageLine = `${result.scannedFiles} scanned · ${result.sourceFiles} source · ${result.testFiles} tests`;
+		const lines = [
+			`run_id: ${result.runId}`,
+			`request: ${result.request}`,
+			`generated_at: ${result.generatedAt}`,
+			"",
+			"overview:",
+			`  recommendation: ${result.recommendation}`,
+			`  reason: ${result.recommendationReason}`,
+			`  complexity: ${result.baselineComplexity}`,
+			`  blast_radius: ${result.baselineBlastRadius}`,
+			`  repository_coverage: ${coverageLine}`,
+		];
+		if (result.stageFit) {
+			lines.push(`  stage_fit: ${result.stageFit}`);
+		}
+		if (result.stageFitReason) {
+			lines.push(`  stage_fit_reason: ${result.stageFitReason}`);
+		}
+		if (result.impactAnalysis) {
+			lines.push("");
+			lines.push("impact_analysis:");
+			lines.push(`  codebase: ${result.impactAnalysis.codebase}`);
+			lines.push(`  delivery: ${result.impactAnalysis.delivery}`);
+			lines.push(`  risks: ${result.impactAnalysis.risks}`);
+			lines.push(`  operations: ${result.impactAnalysis.operations}`);
+		}
+		if (result.matchedFiles.length > 0) {
+			lines.push("");
+			lines.push(`matched_files: ${result.matchedFiles.slice(0, 8).join(", ")}`);
+		}
+		if (result.contractSignals.length > 0) {
+			lines.push(`contract_signals: ${result.contractSignals.join(", ")}`);
+		}
+		lines.push("");
+		lines.push("implementation_options:");
+		for (const option of result.options) {
+			const recommendedMark = option.id === recommendedId ? " [recommended]" : "";
+			lines.push(
+				`${option.id}. ${option.title}${recommendedMark} [complexity=${option.complexity}, blast=${option.blast_radius}]`,
+			);
+			lines.push(`   ${option.summary}`);
+			if (option.when_to_choose) {
+				lines.push(`   when_to_choose: ${option.when_to_choose}`);
+			}
+			if (option.suggested_files.length > 0) {
+				lines.push(`   files: ${option.suggested_files.slice(0, 8).join(", ")}`);
+			}
+			if (option.plan.length > 0) {
+				lines.push(`   first_step: ${option.plan[0]}`);
+			}
+		}
+		lines.push("");
+		lines.push("next_action:");
+		lines.push("  choose option 1/2/3 to generate a detailed execution draft in editor");
+		return lines.join("\n");
+	}
+
+	private buildSingularExecutionDraft(
+		result: SingularAnalysisResult,
+		option: SingularOption,
+		contract?: EngineeringContract,
+	): string {
+		const effectiveContract = contract ?? this.singularLastEffectiveContract ?? {};
+		const defaultQualityGates = [
+			"Targeted tests for changed flows pass.",
+			"No regressions in adjacent user paths.",
+			"Logs/metrics updated for the new behavior.",
+		];
+		const defaultDoD = [
+			"Core behavior implemented and manually validated.",
+			"Automated coverage added for critical path.",
+			"Documentation/changelog updated for user-visible changes.",
+		];
+		const qualityGates =
+			(effectiveContract.quality_gates ?? []).length > 0
+				? (effectiveContract.quality_gates ?? []).slice(0, 10)
+				: defaultQualityGates;
+		const definitionOfDone =
+			(effectiveContract.definition_of_done ?? []).length > 0
+				? (effectiveContract.definition_of_done ?? []).slice(0, 10)
+				: defaultDoD;
+		const constraints = (effectiveContract.constraints ?? []).slice(0, 10);
+		const scopeInclude = (effectiveContract.scope_include ?? []).slice(0, 10);
+		const scopeExclude = (effectiveContract.scope_exclude ?? []).slice(0, 10);
+		const risksFromOption = option.cons.slice(0, 6);
+		const files = option.suggested_files.slice(0, 14);
+		const planSteps = option.plan.length > 0 ? option.plan : ["Implement minimal working path for selected option."];
+
+		const lines = [
+			"# Singular Execution Plan",
+			"",
+			`Request: ${result.request}`,
+			`Selected option: ${option.id}. ${option.title}`,
+			`Decision context: recommendation=${result.recommendation}, complexity=${option.complexity}, blast_radius=${option.blast_radius}`,
+			...(result.stageFit ? [`Stage fit: ${result.stageFit}`] : []),
+			...(result.stageFitReason ? [`Stage fit reason: ${result.stageFitReason}`] : []),
+			...(option.when_to_choose ? [`When to choose: ${option.when_to_choose}`] : []),
+			"",
+			"## 1) Scope and Boundaries",
+			"In scope:",
+			...(scopeInclude.length > 0 ? scopeInclude.map((item) => `- ${item}`) : ["- Deliver selected option with minimal blast radius."]),
+			"Out of scope:",
+			...(scopeExclude.length > 0 ? scopeExclude.map((item) => `- ${item}`) : ["- Broad refactors outside touched modules."]),
+			"Hard constraints:",
+			...(constraints.length > 0 ? constraints.map((item) => `- ${item}`) : ["- Keep backward compatibility for existing behavior."]),
+			"",
+			"## 2) Implementation Phases",
+			"Phase A - Preparation",
+			"1. Confirm acceptance criteria and edge cases for the selected option.",
+			"2. Lock touched modules and define rollback strategy before coding.",
+			"Phase B - Implementation",
+			...planSteps.map((step, index) => `${index + 1}. ${step}`),
+			"Phase C - Hardening",
+			"1. Run targeted regression checks on impacted flows.",
+			"2. Address review findings and update docs if behavior changed.",
+			"",
+			"## 3) Priority Files",
+		];
+		lines.push(...(files.length > 0 ? files.map((filePath) => `- ${filePath}`) : ["- Determine target files during code scan."]));
+		lines.push(
+			"",
+			"## 4) Validation and Quality Gates",
+			"Functional checks:",
+			"- Validate main user flow end-to-end.",
+			"- Validate failure/edge path handling.",
+			"Quality gates:",
+			...qualityGates.map((gate) => `- [ ] ${gate}`),
+			"",
+			"## 5) Risk Controls and Rollout",
+			...(result.impactAnalysis?.risks ? [`- Risk focus: ${result.impactAnalysis.risks}`] : ["- Risk focus: maintain safe rollout with quick rollback."]),
+			...(risksFromOption.length > 0 ? risksFromOption.map((risk) => `- [ ] Mitigate: ${risk}`) : ["- [ ] Track and mitigate newly discovered risks during implementation."]),
+			"- [ ] Prepare rollback checkpoint before merge.",
+			"- [ ] Use incremental rollout/feature-flag if blast radius is medium or high.",
+			"",
+			"## 6) Definition of Done",
+			...definitionOfDone.map((item) => `- [ ] ${item}`),
+			"",
+			"## 7) Delivery Notes",
+			"- Keep commits scoped by phase (prep -> impl -> hardening).",
+			"- Include tests and docs in the same delivery stream.",
+		);
+		return lines.join("\n");
+	}
+
+	private resolveRecommendedSingularOptionId(result: SingularAnalysisResult): string {
+		if (result.recommendation === "defer") {
+			return "3";
+		}
+		if (result.recommendation === "implement_incrementally") {
+			const incremental = result.options.find((option) => /increment|mvp|phased/i.test(`${option.title} ${option.summary}`));
+			return incremental?.id ?? "1";
+		}
+		const nonDefer = result.options.find((option) => !/defer|later|postpone/i.test(`${option.title} ${option.summary}`));
+		return nonDefer?.id ?? "1";
+	}
+
+	private async promptSingularDecision(result: SingularAnalysisResult): Promise<void> {
+		const recommendedId = this.resolveRecommendedSingularOptionId(result);
+		const options = result.options.map((option) => {
+			const recommendedSuffix = option.id === recommendedId ? " (Recommended)" : "";
+			return `Option ${option.id}${recommendedSuffix}: ${option.title} [risk=${option.blast_radius}]`;
+		});
+		options.push("Close without decision");
+		const selected = await this.showExtensionSelector("/singular: choose next step", options);
+		if (!selected || selected === "Close without decision") return;
+
+		const match = selected.match(/^Option\s+(\d+)/);
+		if (!match) return;
+		const picked = result.options.find((option) => option.id === match[1]);
+		if (!picked) return;
+
+		this.showCommandTextBlock(
+			"Singular Decision",
+			[
+				`selected: ${picked.id}. ${picked.title}`,
+				`summary: ${picked.summary}`,
+				`complexity: ${picked.complexity}`,
+				`blast_radius: ${picked.blast_radius}`,
+				...(picked.when_to_choose ? [`when_to_choose: ${picked.when_to_choose}`] : []),
+				"",
+				"plan:",
+				...picked.plan.map((step, index) => `${index + 1}. ${step}`),
+				"",
+				"pros:",
+				...picked.pros.map((item) => `- ${item}`),
+				"",
+				"cons:",
+				...picked.cons.map((item) => `- ${item}`),
+			].join("\n"),
+		);
+
+		if (picked.id === "3" || result.recommendation === "defer") {
+			this.showStatus("Singular: defer option selected, implementation postponed.");
+			return;
+		}
+
+		this.editor.setText(this.buildSingularExecutionDraft(result, picked, this.singularLastEffectiveContract));
+		this.showStatus("Singular: detailed execution draft generated in editor.");
+	}
+
+	private showSingularLastSummary(): void {
+		const last = this.singularService.getLastRun();
+		if (!last) {
+			this.showWarning("No /singular analyses found yet.");
+			return;
+		}
+		this.showCommandTextBlock(
+			"Singular Last Run",
+			[
+				`run_id: ${last.runId}`,
+				`generated_at: ${last.generatedAt ?? "unknown"}`,
+				`recommendation: ${last.recommendation ?? "unknown"}`,
+				`request: ${last.request ?? "unknown"}`,
+				`analysis_path: ${last.analysisPath}`,
+				...(last.metaPath ? [`meta_path: ${last.metaPath}`] : []),
+			].join("\n"),
+		);
+	}
+
+	private async runSingularAnalysis(request: string): Promise<void> {
+		let effectiveContract: EngineeringContract = {};
+		try {
+			effectiveContract = this.contractService.getState().effective;
+		} catch (error) {
+			const message = error instanceof Error ? error.message : String(error);
+			this.showWarning(`Contract unavailable, continuing /singular without contract overlay: ${message}`);
+		}
+		this.singularLastEffectiveContract = effectiveContract;
+
+		try {
+			this.showStatus("Singular: preparing baseline scan...");
+			const baseline = await this.singularService.analyze({
+				request,
+				autosave: false,
+				contract: effectiveContract,
+			});
+
+			let result = baseline;
+			if (!this.session.model) {
+				this.showWarning("No model selected. /singular used heuristic analysis only. Use /model to enable agent feasibility pass.");
+			} else {
+				try {
+					const enriched = await this.runSingularAgentFeasibilityPass(request, baseline, effectiveContract);
+					if (enriched) {
+						result = enriched;
+					} else {
+						this.showWarning("Agent feasibility pass returned incomplete output. Showing heuristic fallback.");
+					}
+				} catch (error) {
+					const message = error instanceof Error ? error.message : String(error);
+					this.showWarning(`Agent feasibility pass failed. Showing heuristic fallback: ${message}`);
+				}
+			}
+
+			this.singularService.saveAnalysis(result);
+			this.showStatus(`Singular analysis complete: ${result.runId}`);
+			this.showCommandTextBlock("Singular Analysis", this.formatSingularRunReport(result));
+			await this.promptSingularDecision(result);
+		} catch (error) {
+			const message = error instanceof Error ? error.message : String(error);
+			this.showError(`Singular analysis failed: ${message}`);
+		}
+	}
+
+	private async handleSingularCommand(text: string): Promise<void> {
+		const args = this.parseSlashArgs(text).slice(1);
+		if (args.length === 0) {
+			this.showWarning("Usage: /singular <feature request>");
+			return;
+		}
+
+		const subcommand = (args[0] ?? "").toLowerCase();
+		if (subcommand === "help" || subcommand === "-h" || subcommand === "--help") {
+			this.showCommandTextBlock(
+				"Singular Help",
+				[
+					"Usage:",
+					"  /singular <feature request>",
+					"  /singular last",
+					"  /singular help",
+					"",
+					"Examples:",
+					"  /singular add account dashboard",
+					"  /singular introduce RBAC for API",
+				].join("\n"),
+			);
+			return;
+		}
+
+		if (subcommand === "last" && args.length === 1) {
+			this.showSingularLastSummary();
+			return;
+		}
+
+		const request = args.join(" ").trim();
+		if (!request) {
+			this.showWarning("Usage: /singular <feature request>");
+			return;
+		}
+		await this.runSingularAnalysis(request);
 	}
 
 	private parseCheckpointNameFromLabel(label: string | undefined): string | undefined {
@@ -7546,6 +9005,7 @@ export class InteractiveMode {
 		);
 		const hasMcpIssues = checks.some((check) => check.label === "MCP servers" && check.level !== "ok");
 		const hasSemanticIssues = checks.some((check) => check.label === "Semantic index" && check.level !== "ok");
+		const hasContractIssues = checks.some((check) => check.label === "Contract state" && check.level !== "ok");
 		const hasResourceIssues = checks.some((check) => check.label === "Resources" && check.level !== "ok");
 
 		while (true) {
@@ -7562,6 +9022,9 @@ export class InteractiveMode {
 			}
 			if (hasSemanticIssues) {
 				options.push("Open semantic manager");
+			}
+			if (hasContractIssues) {
+				options.push("Open contract manager");
 			}
 			if (this.permissionMode === "yolo") {
 				options.push("Set permissions mode to ask");
@@ -7599,6 +9062,10 @@ export class InteractiveMode {
 				await this.handleSemanticCommand("/semantic");
 				return;
 			}
+			if (selected === "Open contract manager") {
+				await this.handleContractCommand("/contract");
+				return;
+			}
 			if (selected === "Set permissions mode to ask") {
 				this.permissionMode = "ask";
 				this.settingsManager.setPermissionMode("ask");
@@ -7614,12 +9081,14 @@ export class InteractiveMode {
 				const agentDir = getAgentDir();
 				this.showCommandTextBlock(
 					"Runtime Paths",
-					[
-						`auth.json: ${getAuthPath()}`,
-						`models.json: ${getModelsPath()}`,
-						`semantic(user): ${getSemanticConfigPath("user", cwd, agentDir)}`,
-						`semantic(project): ${getSemanticConfigPath("project", cwd, agentDir)}`,
-						`semantic(index): ${getSemanticIndexDir(cwd, agentDir)}`,
+						[
+							`auth.json: ${getAuthPath()}`,
+							`models.json: ${getModelsPath()}`,
+							`contract(project): ${this.contractService.getProjectPath()}`,
+							`singular(analyses): ${this.singularService.getAnalysesRoot()}`,
+							`semantic(user): ${getSemanticConfigPath("user", cwd, agentDir)}`,
+							`semantic(project): ${getSemanticConfigPath("project", cwd, agentDir)}`,
+							`semantic(index): ${getSemanticIndexDir(cwd, agentDir)}`,
 					].join("\n"),
 				);
 				continue;
@@ -7656,6 +9125,13 @@ export class InteractiveMode {
 			semanticStatus = await this.createSemanticRuntime().status();
 		} catch (error) {
 			semanticStatusError = error instanceof Error ? error.message : String(error);
+		}
+		let contractState: ContractState | undefined;
+		let contractStateError: string | undefined;
+		try {
+			contractState = this.contractService.getState();
+		} catch (error) {
+			contractStateError = error instanceof Error ? error.message : String(error);
 		}
 
 		const checks: DoctorCheckItem[] = [];
@@ -7743,9 +9219,25 @@ export class InteractiveMode {
 			addCheck(
 				"ok",
 				"Semantic index",
-				`${semanticStatus.provider}/${semanticStatus.model} · files=${semanticStatus.files} chunks=${semanticStatus.chunks}`,
+				`${semanticStatus.provider}/${semanticStatus.model} · auto_index=${semanticStatus.autoIndex ? "on" : "off"} · files=${semanticStatus.files} chunks=${semanticStatus.chunks}`,
 			);
 		}
+
+		if (contractStateError) {
+			addCheck("fail", "Contract state", contractStateError, "Fix .iosm/contract.json or run /contract clear --scope project.");
+		} else if (!contractState) {
+			addCheck("warn", "Contract state", "Unavailable", "Run /contract show to inspect state.");
+		} else if (!contractState.hasProjectFile && Object.keys(contractState.sessionOverlay).length === 0) {
+			addCheck("warn", "Contract state", "No project/session contract active", "Run /contract to define constraints and quality gates.");
+		} else {
+			addCheck(
+				"ok",
+				"Contract state",
+				`project=${contractState.hasProjectFile ? "yes" : "no"} session_keys=${Object.keys(contractState.sessionOverlay).length} effective_keys=${Object.keys(contractState.effective).length}`,
+			);
+		}
+
+		addCheck("ok", "Singular analyzer", "Available via /singular <request>");
 
 		if (missingCliTools.length > 0) {
 			addCheck(
@@ -8268,9 +9760,13 @@ export class InteractiveMode {
 		await this.session.prompt(userInput);
 	}
 
-	private createIosmVerificationEventBridge(options?: { loaderMessage?: string }): (event: AgentSessionEvent) => void {
+	private createIosmVerificationEventBridge(options?: {
+		loaderMessage?: string;
+		hideAssistantText?: boolean;
+	}): (event: AgentSessionEvent) => void {
 		const loaderMessage =
 			options?.loaderMessage ?? `Verifying workspace... (${appKey(this.keybindings, "interrupt")} to interrupt)`;
+		const hideAssistantText = options?.hideAssistantText === true;
 		let verifyStreamingComponent: AssistantMessageComponent | undefined;
 		let verifyStreamingMessage: AssistantMessage | undefined;
 		const verifyPendingTools = new Map<string, ToolExecutionComponent>();
@@ -8292,7 +9788,7 @@ export class InteractiveMode {
 					break;
 
 				case "message_start":
-					if (event.message.role === "assistant") {
+					if (event.message.role === "assistant" && !hideAssistantText) {
 						verifyStreamingComponent = new AssistantMessageComponent(
 							undefined,
 							false,
@@ -10988,6 +12484,8 @@ The agent will automatically receive IOSM context on every turn.`;
 	}
 
 	private async handleClearCommand(): Promise<void> {
+		this.contractService.clear("session");
+
 		// Stop loading animation
 		if (this.loadingAnimation) {
 			this.loadingAnimation.stop();
@@ -11005,6 +12503,7 @@ The agent will automatically receive IOSM context on every turn.`;
 		this.streamingComponent = undefined;
 		this.streamingMessage = undefined;
 		this.pendingTools.clear();
+		this.syncRuntimePromptSuffix();
 
 		this.chatContainer.addChild(new Spacer(1));
 		this.chatContainer.addChild(new Text(`${theme.fg("accent", "✓ New session started")}`, 1, 1));

@@ -135,6 +135,7 @@ Schema (`semanticSearch` object):
 {
   "semanticSearch": {
     "enabled": true,
+    "autoIndex": true,
     "provider": {
       "type": "openrouter",
       "model": "openai/text-embedding-3-small",
@@ -165,6 +166,10 @@ Schema (`semanticSearch` object):
   }
 }
 ```
+
+`autoIndex` controls query-time automatic refresh:
+- `true` (default): `query` automatically refreshes stale index (and rebuilds when required)
+- `false`: stale/missing index must be updated manually via `iosm semantic index` / `rebuild`
 
 Index storage (global cache):
 

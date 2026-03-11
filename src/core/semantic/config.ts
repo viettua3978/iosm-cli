@@ -15,6 +15,7 @@ const DEFAULT_EXCLUDE_GLOBS = ["**/.git/**", "**/node_modules/**", "**/dist/**",
 
 const DEFAULT_CONFIG: SemanticSearchConfig = {
 	enabled: true,
+	autoIndex: true,
 	provider: {
 		type: "openrouter",
 		model: "openai/text-embedding-3-small",
@@ -125,6 +126,7 @@ function parseSemanticConfigFile(path: string): SemanticConfigFile {
 
 	result.semanticSearch = {
 		enabled: asBoolean(rawSemantic.enabled),
+		autoIndex: asBoolean(rawSemantic.autoIndex),
 		provider,
 		index,
 	};
@@ -164,6 +166,7 @@ function resolveSemanticSearchConfig(
 
 	return {
 		enabled: partial.enabled ?? DEFAULT_CONFIG.enabled,
+		autoIndex: partial.autoIndex ?? DEFAULT_CONFIG.autoIndex,
 		provider: {
 			type: providerType,
 			model,
@@ -262,6 +265,7 @@ export function upsertScopedSemanticSearchConfig(
 		...current.file,
 		semanticSearch: {
 			enabled: config.enabled,
+			autoIndex: config.autoIndex,
 			provider: {
 				type: config.provider.type,
 				model: config.provider.model,
@@ -287,6 +291,7 @@ export function upsertScopedSemanticSearchConfig(
 export function getDefaultSemanticSearchConfig(): SemanticSearchConfig {
 	return {
 		enabled: DEFAULT_CONFIG.enabled,
+		autoIndex: DEFAULT_CONFIG.autoIndex,
 		provider: { ...DEFAULT_CONFIG.provider },
 		index: {
 			includeGlobs: [...DEFAULT_CONFIG.index.includeGlobs],

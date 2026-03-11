@@ -11,9 +11,11 @@ describe("semantic integration regressions", () => {
 		expect("semantic_search" in perCwdTools).toBe(true);
 	});
 
-	it("exposes /semantic in slash commands", () => {
+	it("exposes /semantic and /singular in slash commands", () => {
 		const slashNames = BUILTIN_SLASH_COMMANDS.map((command) => command.name);
 		expect(slashNames).toContain("semantic");
+		expect(slashNames).toContain("singular");
+		expect(slashNames).not.toContain("shadow");
 	});
 
 	it("enables semantic_search in full/explore/iosm profiles", () => {

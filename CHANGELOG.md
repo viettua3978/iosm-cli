@@ -9,6 +9,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 _No unreleased changes._
 
+## [0.2.0] - 2026-03-11
+
+### Added
+
+- **Interactive engineering contract manager (`/contract`)** — field-by-field contract editing with immediate save-on-enter and automatic JSON generation for project scope
+- **Layered contract model** — explicit `project`, `session`, and `effective` contract layers with copy/delete flows and merged runtime enforcement
+- **Singular feasibility mode (`/singular`)** — command-first feasibility analysis that combines repository baseline scan with a standard agent pass and returns exactly three implementation options
+- **Option-driven execution handoff** — `/singular` now produces concrete file targets, step plans, trade-offs, and decision guidance before implementation starts
+- **Regression coverage for large paste UX** — multiline unbracketed paste now covered by dedicated tests to ensure one submission flow and compact marker rendering
+
+### Changed
+
+- **Feasibility workflow naming** — `/blast` replaced by `/singular` for feature feasibility decisions
+- **Profile cleanup** — `/shadow` workflow removed to avoid duplication with plan-oriented analysis
+- **Contract interaction model** — removed extra save step in field editor; entering value immediately persists to selected scope
+
+### Fixed
+
+- **TUI width safety** — startup resources block now truncates long lines to terminal width, preventing render crashes on narrow terminals
+- **Paste queue behavior** — large pasted multiline input is treated as a single paste event instead of fragmented queued submissions
+
+### Documentation
+
+- Expanded README with dedicated decision workflow section (`/contract` vs `/singular`), command migration notes, and clearer contract layer distinctions
+- Extended interactive mode docs with explicit `effective/session/project` explanations and migration guidance from removed commands
+- Updated CLI reference with interactive feasibility/contract command behavior and migration notes
+
 ## [0.1.3] - 2026-03-10
 
 ### Added

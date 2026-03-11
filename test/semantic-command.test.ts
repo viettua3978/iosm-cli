@@ -48,6 +48,7 @@ describe("semantic command", () => {
 			const output = logSpy.mock.calls.map(([line]) => String(line)).join("\n");
 			expect(output).toContain("Semantic search status");
 			expect(output).toContain("configured: no");
+			expect(output).toContain("auto_index: off");
 			expect(output).toContain("config_user:");
 			expect(output).toContain("config_project:");
 			expect(errSpy).not.toHaveBeenCalled();

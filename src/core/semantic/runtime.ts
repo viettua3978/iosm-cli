@@ -30,6 +30,7 @@ import type {
 } from "./types.js";
 import {
 	SemanticConfigMissingError,
+	SemanticIndexRequiredError,
 	SemanticRebuildRequiredError,
 } from "./types.js";
 
@@ -142,6 +143,7 @@ export class SemanticSearchRuntime {
 				action: "status",
 				configured: false,
 				enabled: false,
+				autoIndex: false,
 				indexed: false,
 				stale: true,
 				staleReason: "missing_index",
@@ -162,6 +164,7 @@ export class SemanticSearchRuntime {
 			action: "status",
 			configured: true,
 			enabled: config.enabled,
+			autoIndex: config.autoIndex,
 			indexed: loaded.exists && !!loaded.meta,
 			stale: stale.stale,
 			staleReason: stale.reason,
@@ -205,6 +208,21 @@ export class SemanticSearchRuntime {
 				status.staleReason === "chunking_changed" ||
 				status.staleReason === "index_filters_changed" ||
 				status.staleReason === "dimension_mismatch";
+			if (!config.autoIndex) {
+				if (!status.indexed) {
+					throw new SemanticIndexRequiredError(
+						"Semantic index is missing and auto-indexing is disabled. Run /semantic index (or iosm semantic index), or enable auto-indexing in /semantic.",
+					);
+				}
+				if (requiresRebuild) {
+					throw new SemanticRebuildRequiredError(
+						`Semantic index is stale${status.staleReason ? ` (${status.staleReason})` : ""} and auto-indexing is disabled. Run /semantic rebuild.`,
+					);
+				}
+				throw new SemanticIndexRequiredError(
+					`Semantic index is stale${status.staleReason ? ` (${status.staleReason})` : ""} and auto-indexing is disabled. Run /semantic index (or enable auto-indexing in /semantic).`,
+				);
+			}
 			await this.buildIndex(requiresRebuild);
 			autoRefreshed = true;
 		}

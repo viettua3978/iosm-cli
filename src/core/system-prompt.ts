@@ -192,7 +192,7 @@ export function buildSystemPrompt(options: BuildSystemPromptOptions = {}): strin
 			"Use semantic_search for intent/meaning queries that are hard to express with regex; use rg/ast_grep for exact symbol and syntax matches",
 		);
 		addGuideline(
-			"If semantic_search reports stale/missing index, run semantic_search status and then semantic_search index (or rebuild when required) before semantic queries",
+			"semantic_search query can auto-refresh stale indexes when semantic auto-index is enabled (default); if disabled or if provider/chunk/filter changes require it, run semantic_search index/rebuild explicitly",
 		);
 	}
 
@@ -242,6 +242,10 @@ export function buildSystemPrompt(options: BuildSystemPromptOptions = {}): strin
 	addGuideline("Do not claim success without evidence; if you could not verify, say so explicitly");
 	addGuideline("Complete the requested task end-to-end when possible instead of stopping at analysis");
 	addGuideline("For code review requests, lead with findings and risks before summaries");
+	addGuideline(
+		"When an active engineering contract is present in context, treat its constraints, quality gates, and definition_of_done as execution requirements unless user overrides them.",
+	);
+	addGuideline("For major feature forks, run a /singular feasibility pass before coding to compare implementation options.");
 
 	for (const guideline of promptGuidelines ?? []) {
 		const normalized = guideline.trim();

@@ -30,6 +30,7 @@ export interface SemanticIndexConfig {
 
 export interface SemanticSearchConfig {
 	enabled: boolean;
+	autoIndex: boolean;
 	provider: SemanticProviderConfig;
 	index: SemanticIndexConfig;
 }
@@ -37,6 +38,7 @@ export interface SemanticSearchConfig {
 export interface SemanticConfigFile {
 	semanticSearch?: Partial<{
 		enabled: boolean;
+		autoIndex: boolean;
 		provider: Partial<{
 			type: SemanticProviderType;
 			model: string;
@@ -129,6 +131,7 @@ export interface SemanticStatusResult {
 	action: "status";
 	configured: boolean;
 	enabled: boolean;
+	autoIndex: boolean;
 	indexed: boolean;
 	stale: boolean;
 	staleReason?: SemanticStaleReason;
@@ -184,5 +187,12 @@ export class SemanticRebuildRequiredError extends Error {
 	constructor(message: string) {
 		super(message);
 		this.name = "SemanticRebuildRequiredError";
+	}
+}
+
+export class SemanticIndexRequiredError extends Error {
+	constructor(message: string) {
+		super(message);
+		this.name = "SemanticIndexRequiredError";
 	}
 }

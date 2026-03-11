@@ -53,7 +53,9 @@ iosm --continue
 | `/model` | Open provider-first model selector (`provider -> model`) | `/model` |
 | `/scoped-models` | Manage model rotation | `/scoped-models` |
 | `/mcp` | Open MCP manager UI and run MCP subcommands | `/mcp` |
-| `/semantic` | Open semantic search manager (`setup/status/index/rebuild/query`) | `/semantic` |
+| `/semantic` | Open semantic search manager (`setup/auto-index/status/index/rebuild/query`) | `/semantic` |
+| `/contract` | Interactive engineering contract editor (field-by-field, auto JSON build) | `/contract` |
+| `/singular` | Feature feasibility analyzer with implementation options and recommendation | `/singular add account dashboard` |
 | `/memory` | Interactive memory manager (`add/edit/remove/scope/path`) | `/memory` |
 | `/settings` | View/modify settings | `/settings` |
 | `/hotkeys` | View keyboard shortcuts | `/hotkeys` |
@@ -99,9 +101,137 @@ iosm --continue
 
 `/mcp add` without flags starts a guided wizard in the terminal UI.
 `/semantic` opens an interactive setup/status/index/query manager for embeddings search.
+Manager includes `Automatic indexing` toggle (default `on`) to control query-time auto-refresh.
 `/semantic setup` now auto-loads model catalogs for OpenRouter (`/api/v1/embeddings/models`) and Ollama (`/api/tags`) with manual fallback.
 In `/semantic setup`, the headers step is optional: press `Enter` on empty input to skip.
 `/memory` opens an interactive manager. `/memory <text>` saves a note to `memory.md` and reloads session context. Use `/memory edit <index> <text>` for direct updates.
+`/contract` edits contract fields interactively (`goal`, scope, constraints, quality gates, DoD, risks, etc.), then writes JSON automatically.
+`/singular <request>` runs a two-pass feasibility analysis (baseline scan + standard agent pass), builds concrete implementation options, and asks user to choose one.
+`/blast` and `/shadow` are removed from active interactive workflow.
+
+### `/contract` Detailed Guide
+
+`/contract` is a layered contract editor with two sources and one merged output:
+
+| Layer | Scope | Persistence | Storage |
+|------|-------|-------------|---------|
+| `project` | Project-wide baseline | Persistent | `.iosm/contract.json` |
+| `session` | Current session override | Temporary | In-memory session overlay |
+| `effective` | `project + session` merged result | Derived | Computed at runtime |
+
+Important merge rule:
+- `session` overrides `project` for the same keys.
+- `effective` is what the runtime actually uses.
+
+#### Quick Difference: Effective vs Session vs Project
+
+- `Open effective contract` is read-only and shows what runtime is enforcing right now.
+- `Edit session contract` changes only this session (temporary overlay, not persisted to disk).
+- `Edit project contract` changes `.iosm/contract.json` (persistent baseline for future sessions).
+
+#### Manager Actions
+
+| Action | What it does | When to use |
+|------|---------------|-------------|
+| `Open effective contract` | Shows the merged JSON currently enforced by runtime | Verify final active constraints |
+| `Edit session contract` | Edits temporary overrides for current session | Experiments, one-off constraints |
+| `Edit project contract` | Edits persistent project contract file | Team-wide stable defaults |
+| `Copy effective -> session` | Saves merged state into session layer | Freeze current merged state for this run |
+| `Copy effective -> project` | Saves merged state into project file | Promote temporary decisions to baseline |
+| `Delete session contract` | Clears temporary overlay | Reset session overrides |
+| `Delete project contract` | Removes `.iosm/contract.json` | Full baseline reset |
+
+#### Field Editor Behavior
+
+- Select a field and press `Enter`.
+- Input text (single-line or multi-line list depending on field type).
+- Press `Enter` to submit.
+- Change is saved immediately to selected scope (`session` or `project`).
+- Empty input clears that field.
+
+There is no separate "Save" step in field editor mode.
+
+#### Common Workflows
+
+1. Temporary tightening for one run:
+   - Open `/contract`
+   - `Edit session contract`
+   - Set `constraints` and `quality_gates`
+   - Confirm via `Open effective contract`
+
+2. Promote temporary policy to project baseline:
+   - Open `/contract`
+   - `Copy effective -> project`
+   - Review `.iosm/contract.json` in VCS
+
+3. Recover from aggressive temporary overrides:
+   - Open `/contract`
+   - `Delete session contract`
+   - Re-open `effective` and verify fallback to `project`
+
+### `/singular` Detailed Guide
+
+`/singular` is a command-first feasibility mode (no pre-menu).  
+Pattern: `/singular <feature request>`
+
+Examples:
+- `/singular add account dashboard`
+- `/singular introduce RBAC for API`
+- `/singular redesign billing reconciliation flow`
+
+#### What Happens Internally
+
+1. Baseline repository pass:
+   - Scans project files and estimates baseline complexity/blast radius.
+   - Collects likely impacted files and contract signals.
+
+2. Standard agent feasibility pass:
+   - Launches an isolated standard agent run (`plan` profile) with repository tools.
+   - Agent inspects real files and returns structured feasibility JSON.
+   - Produces recommendation, impact analysis, and implementation variants.
+
+3. Merge + persistence:
+   - Agent insights are merged with baseline data.
+   - Analysis is saved to `.iosm/singular/<run-id>/analysis.json` (+ `meta.json`).
+
+#### Output Shape
+
+Each run includes:
+- `recommendation`: `implement_now | implement_incrementally | defer`
+- `reason`: why this recommendation is best for current stage
+- `complexity` and `blast_radius`
+- `stage_fit`: `needed_now | optional_now | later`
+- `impact_analysis`: codebase, delivery, risks, operations
+- `implementation_options` (exactly 3 variants):
+  - Option 1: practical/recommended path
+  - Option 2: alternative approach
+  - Option 3: defer / do not implement now
+
+Each option includes:
+- summary and trade-offs (`pros`/`cons`)
+- concrete file targets (`suggested_files`)
+- step-by-step plan (`plan`)
+- `when_to_choose` guidance
+
+#### Decision Flow
+
+After analysis, selector opens with variants:
+- choose Option 1 / Option 2 / Option 3
+- or close without decision
+
+If Option 1 or 2 is selected, execution draft is inserted into editor (ready to run).  
+If Option 3 is selected, run is explicitly marked as postponed.
+
+#### Fallback Behavior
+
+If no model is selected (or agent pass fails), `/singular` still returns a heuristic baseline analysis.  
+Use `/model` to enable full agent feasibility pass.
+
+#### Command Migration
+
+- `/singular` is the feasibility command to use.
+- `/blast` is deprecated/removed.
+- `/shadow` is removed.
 
 ---
 

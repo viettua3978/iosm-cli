@@ -64,6 +64,7 @@ describe("semantic runtime", () => {
 			{
 				semanticSearch: {
 					enabled: true,
+					autoIndex: false,
 					provider: {
 						type: "custom_openai",
 						model: "test-embedding-small",
@@ -113,7 +114,7 @@ describe("semantic runtime", () => {
 		rmSync(tempDir, { recursive: true, force: true });
 	});
 
-	it("indexes and queries with incremental refresh", async () => {
+	it("indexes and queries with optional incremental refresh", async () => {
 		const runtime = new SemanticSearchRuntime({
 			cwd: projectDir,
 			agentDir,
@@ -121,6 +122,7 @@ describe("semantic runtime", () => {
 
 		const statusBefore = await runtime.status();
 		expect(statusBefore.configured).toBe(true);
+		expect(statusBefore.autoIndex).toBe(false);
 		expect(statusBefore.indexed).toBe(false);
 
 		const indexResult = await runtime.index();
@@ -148,6 +150,38 @@ describe("semantic runtime", () => {
 		const staleStatus = await runtime.status();
 		expect(staleStatus.stale).toBe(true);
 
+		await expect(runtime.query("temporary auth token rule", 5)).rejects.toThrow(
+			"auto-indexing is disabled",
+		);
+
+		writeScopedSemanticConfig(
+			"user",
+			{
+				semanticSearch: {
+					enabled: true,
+					autoIndex: true,
+					provider: {
+						type: "custom_openai",
+						model: "test-embedding-small",
+						baseUrl: "http://127.0.0.1:18080/v1",
+						apiKeyEnv: "SEMANTIC_TEST_API_KEY",
+						batchSize: 16,
+						timeoutMs: 30000,
+					},
+					index: {
+						includeGlobs: ["src/**/*.{ts,js,md,json,yaml,yml}"],
+						excludeGlobs: ["**/node_modules/**", "**/.git/**", "**/.iosm/**"],
+						chunkMaxChars: 700,
+						chunkOverlapChars: 120,
+						maxFileBytes: 262144,
+						maxFiles: 5000,
+					},
+				},
+			},
+			projectDir,
+			agentDir,
+		);
+
 		const refreshedQuery = await runtime.query("temporary auth token rule", 5);
 		expect(refreshedQuery.autoRefreshed).toBe(true);
 		expect(refreshedQuery.hits.length).toBeGreaterThan(0);
@@ -167,6 +201,7 @@ describe("semantic runtime", () => {
 			{
 				semanticSearch: {
 					enabled: true,
+					autoIndex: false,
 					provider: {
 						type: "custom_openai",
 						model: "test-embedding-dim6",

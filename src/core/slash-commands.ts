@@ -55,7 +55,17 @@ export const BUILTIN_SLASH_COMMANDS: ReadonlyArray<BuiltinSlashCommand> = [
 	{
 		name: "semantic",
 		description:
-			"Semantic search manager: /semantic (interactive UI), /semantic setup|status|index|rebuild|query <text> [--top-k N]",
+			"Semantic search manager: /semantic (interactive UI), /semantic setup|auto-index|status|index|rebuild|query <text> [--top-k N]",
+	},
+	{
+		name: "contract",
+		description:
+			"Engineering contract manager: /contract (interactive field editor), /contract show|edit|clear --scope <project|session>",
+	},
+	{
+		name: "singular",
+		description:
+			"Feature feasibility analyzer: /singular <request> (builds implementation options and recommendations)",
 	},
 	{ name: "settings", description: "Open settings menu" },
 	{

@@ -112,7 +112,25 @@ iosm semantic query "<text>" [--top-k N]
 
 Notes:
 - If semantic config is missing, the command prints actionable paths and suggests `/semantic setup`.
-- `query` auto-refreshes stale indexes incrementally; provider/chunk/filter changes require `rebuild`.
+- `query` auto-refreshes stale indexes only when `semanticSearch.autoIndex=true` (default is `true`).
+- When auto-index is off, run `iosm semantic index` (or `rebuild` for provider/chunk/filter changes).
+
+### Interactive feasibility/contract commands
+
+These commands run inside interactive mode (`iosm`), not as top-level CLI subcommands:
+
+- `/contract` — interactive engineering contract manager:
+  - edit fields one-by-one
+  - autosave on `Enter`
+  - auto-build `.iosm/contract.json` for project scope
+- `/singular <feature request>` — command-first feasibility analyzer:
+  - baseline repository scan + standard agent pass
+  - outputs exactly 3 implementation options with recommendation
+  - lets user choose option `1/2/3` before implementation
+
+Migration notes:
+- `/blast` removed in favor of `/singular`
+- `/shadow` removed
 
 ---
 

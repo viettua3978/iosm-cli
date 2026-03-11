@@ -1300,13 +1300,68 @@ describe("subagent orchestration", () => {
 			profile: "meta",
 		});
 
+	const text = (result.content[0] as { type: "text"; text: string }).text;
+	expect(text).toContain("### Delegated Subtasks");
+	expect(delegateCalls).toBe(1);
+	expect(result.details?.profile).toBe("meta");
+	expect(result.details?.delegatedTasks).toBe(1);
+	expect(result.details?.delegatedSucceeded).toBe(1);
+	expect(result.details?.delegatedFailed).toBe(0);
+	});
+
+	it("executes nested delegated subtasks for meta-hosted tasks", async () => {
+		const cwd = makeTempDir();
+		const calls: string[] = [];
+		const tool = createTaskTool(
+			cwd,
+			async (options) => {
+				calls.push(options.prompt);
+				if (options.prompt.includes("root-nested-task")) {
+					return {
+						output:
+							'Root analysis.\n<delegate_task profile="full" description="Implementation stream">child-implementation-task</delegate_task>',
+						stats: { toolCallsStarted: 1, toolCallsCompleted: 1, assistantMessages: 1 },
+					};
+				}
+				if (options.prompt.includes("child-implementation-task")) {
+					return {
+						output:
+							'Child implementation planning.\n<delegate_task profile="explore" description="Inspect retry points">nested-explore-task</delegate_task>\n<delegate_task profile="plan" description="Design backoff metrics">nested-plan-task</delegate_task>',
+						stats: { toolCallsStarted: 1, toolCallsCompleted: 1, assistantMessages: 1 },
+					};
+				}
+				if (options.prompt.includes("nested-explore-task")) {
+					return {
+						output: "Nested explore complete.",
+						stats: { toolCallsStarted: 1, toolCallsCompleted: 1, assistantMessages: 1 },
+					};
+				}
+				if (options.prompt.includes("nested-plan-task")) {
+					return {
+						output: "Nested plan complete.",
+						stats: { toolCallsStarted: 1, toolCallsCompleted: 1, assistantMessages: 1 },
+					};
+				}
+				return { output: "unexpected" };
+			},
+			{
+				hostProfileName: "meta",
+			},
+		);
+
+		const result = await tool.execute("call_nested_meta_host", {
+			description: "nested meta host",
+			prompt: "root-nested-task",
+			profile: "meta",
+		});
+
 		const text = (result.content[0] as { type: "text"; text: string }).text;
-		expect(text).toContain("### Delegated Subtasks");
-		expect(delegateCalls).toBe(1);
-		expect(result.details?.profile).toBe("meta");
-		expect(result.details?.delegatedTasks).toBe(1);
-		expect(result.details?.delegatedSucceeded).toBe(1);
-		expect(result.details?.delegatedFailed).toBe(0);
+		expect(text).toContain("##### Nested Delegated Subtasks");
+		expect(text).toContain("Nested explore complete.");
+		expect(text).toContain("Nested plan complete.");
+		expect(result.details?.delegatedTasks).toBe(3);
+		expect(calls.some((prompt) => prompt.includes("nested-explore-task"))).toBe(true);
+		expect(calls.some((prompt) => prompt.includes("nested-plan-task"))).toBe(true);
 	});
 
 	it("rejects write-capable background policy", async () => {

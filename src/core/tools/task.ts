@@ -171,6 +171,8 @@ export interface TaskToolOptions {
 	availableCustomSubagentHints?: Array<{ name: string; description: string }>;
 	/** Returns pending live meta updates entered during an active run. */
 	getMetaMessages?: () => readonly string[];
+	/** Active profile of the host session that is invoking the task tool. */
+	hostProfileName?: string;
 }
 
 /** Tool names available per profile */
@@ -321,9 +323,11 @@ function parseBoundedInt(raw: string | undefined, fallback: number, min: number,
 	return Math.max(min, Math.min(max, parsed));
 }
 
-function shouldAutoDelegate(input: { profile?: string; agentName?: string }): boolean {
+function shouldAutoDelegate(input: { profile?: string; agentName?: string; hostProfile?: string }): boolean {
 	const profile = input.profile?.trim().toLowerCase();
 	if (profile === "meta") return true;
+	const hostProfile = input.hostProfile?.trim().toLowerCase();
+	if (hostProfile === "meta") return true;
 	const agentName = input.agentName?.trim().toLowerCase();
 	return !!agentName && agentName.includes("orchestrator");
 }
@@ -331,12 +335,14 @@ function shouldAutoDelegate(input: { profile?: string; agentName?: string }): bo
 function deriveAutoDelegateParallelHint(
 	profile: string | undefined,
 	agentName: string | undefined,
+	hostProfile: string | undefined,
 	description: string,
 	prompt: string,
 ): number | undefined {
 	const normalizedProfile = profile?.trim().toLowerCase();
 	const isMetaProfile = normalizedProfile === "meta";
-	if (!shouldAutoDelegate({ profile: normalizedProfile, agentName })) return undefined;
+	const isMetaHost = hostProfile?.trim().toLowerCase() === "meta";
+	if (!shouldAutoDelegate({ profile: normalizedProfile, agentName, hostProfile })) return undefined;
 	const text = `${description}\n${prompt}`.trim();
 	if (!text) return 1;
 	const normalized = text.replace(/\s+/g, " ").trim();
@@ -371,7 +377,7 @@ function deriveAutoDelegateParallelHint(
 	if (hasCodeBlock) {
 		score += 1;
 	}
-	if (isMetaProfile && score > 0) {
+	if ((isMetaProfile || isMetaHost) && score > 0) {
 		// Meta profile is intentionally parallel-biased for non-trivial work.
 		score += 1;
 	}
@@ -904,6 +910,7 @@ export function createTaskTool(
 				let normalizedAgentName = agentName?.trim() || undefined;
 				let normalizedProfile = profile.trim().toLowerCase();
 				if (!normalizedProfile) normalizedProfile = "full";
+				const normalizedHostProfile = options?.hostProfileName?.trim().toLowerCase();
 
 				let customSubagent = resolveCustom(normalizedAgentName);
 				if (normalizedAgentName && !customSubagent) {
@@ -934,25 +941,48 @@ export function createTaskTool(
 				const blocked = new Set(customSubagent.disallowedTools);
 				tools = tools.filter((tool) => !blocked.has(tool));
 			}
-			const delegationDepth = maxDelegationDepthFromEnv;
-				const requestedDelegateParallelHint =
-					typeof delegateParallelHint === "number" && Number.isInteger(delegateParallelHint)
-						? Math.max(1, Math.min(10, delegateParallelHint))
-						: undefined;
+				const delegationDepth = maxDelegationDepthFromEnv;
+					const requestedDelegateParallelHint =
+						typeof delegateParallelHint === "number" && Number.isInteger(delegateParallelHint)
+							? Math.max(1, Math.min(10, delegateParallelHint))
+							: undefined;
 				const autoDelegateParallelHint =
 					requestedDelegateParallelHint === undefined
-						? deriveAutoDelegateParallelHint(effectiveProfile, normalizedAgentName, description, prompt)
+						? deriveAutoDelegateParallelHint(
+								effectiveProfile,
+								normalizedAgentName,
+								normalizedHostProfile,
+								description,
+								prompt,
+							)
 						: undefined;
 				let effectiveDelegateParallelHint = requestedDelegateParallelHint ?? autoDelegateParallelHint;
-				const effectiveMaxDelegations = Math.max(
+				const effectiveDelegationDepth =
+					effectiveProfile === "meta" || normalizedHostProfile === "meta" || normalizedAgentName?.toLowerCase().includes("orchestrator")
+						? Math.max(delegationDepth, 2)
+						: delegationDepth;
+				let effectiveMaxDelegations = Math.max(
 					0,
 					Math.min(maxDelegationsPerTaskFromEnv, effectiveDelegateParallelHint ?? maxDelegationsPerTaskFromEnv),
 				);
-				const effectiveMaxDelegateParallel = Math.max(
+				let effectiveMaxDelegateParallel = Math.max(
 					1,
 					Math.min(maxDelegatedParallelFromEnv, effectiveDelegateParallelHint ?? maxDelegatedParallelFromEnv),
 				);
-				const preferredDelegationFloor = effectiveProfile === "meta" ? 3 : 2;
+				const preferredDelegationFloor = effectiveProfile === "meta" || normalizedHostProfile === "meta" ? 3 : 2;
+				const applyMetaDelegationFloor =
+					requestedDelegateParallelHint === undefined &&
+					(effectiveProfile === "meta" || normalizedHostProfile === "meta");
+				if (applyMetaDelegationFloor) {
+					effectiveMaxDelegations = Math.max(
+						effectiveMaxDelegations,
+						Math.min(maxDelegationsPerTaskFromEnv, preferredDelegationFloor),
+					);
+					effectiveMaxDelegateParallel = Math.max(
+						effectiveMaxDelegateParallel,
+						Math.min(maxDelegatedParallelFromEnv, preferredDelegationFloor),
+					);
+				}
 				const minDelegationsPreferred =
 					(effectiveDelegateParallelHint ?? 0) >= 2 && effectiveMaxDelegations >= 2
 						? Math.min(preferredDelegationFloor, effectiveMaxDelegations, effectiveDelegateParallelHint ?? preferredDelegationFloor)
@@ -961,7 +991,7 @@ export function createTaskTool(
 				customSubagent?.systemPrompt ??
 				systemPromptByProfile[effectiveProfile] ??
 				systemPromptByProfile.full;
-			const systemPrompt = withDelegationPrompt(baseSystemPrompt, delegationDepth, effectiveMaxDelegations);
+			const systemPrompt = withDelegationPrompt(baseSystemPrompt, effectiveDelegationDepth, effectiveMaxDelegations);
 			const promptWithInstructions =
 				customSubagent?.instructions && customSubagent.instructions.trim().length > 0
 					? `${customSubagent.instructions.trim()}\n\nUser task:\n${prompt}`
@@ -1259,7 +1289,7 @@ export function createTaskTool(
 
 						let parsedDelegation = parseDelegationRequests(
 							output,
-							delegationDepth > 0 ? effectiveMaxDelegations : 0,
+							effectiveDelegationDepth > 0 ? effectiveMaxDelegations : 0,
 						);
 						if (minDelegationsPreferred > 0 && parsedDelegation.requests.length < minDelegationsPreferred) {
 							emitProgress({
@@ -1283,10 +1313,10 @@ export function createTaskTool(
 							output = secondPass.output;
 							subagentSessionId = secondPass.sessionId ?? subagentSessionId;
 							runStats = secondPass.stats ?? runStats;
-							parsedDelegation = parseDelegationRequests(
-								output,
-								delegationDepth > 0 ? effectiveMaxDelegations : 0,
-							);
+								parsedDelegation = parseDelegationRequests(
+									output,
+									effectiveDelegationDepth > 0 ? effectiveMaxDelegations : 0,
+								);
 						}
 
 						if (minDelegationsPreferred > 0 && parsedDelegation.requests.length < minDelegationsPreferred) {
@@ -1375,9 +1405,177 @@ export function createTaskTool(
 							});
 						};
 
-						const runDelegate = async (index: number): Promise<void> => {
-							throwIfAborted();
-							const request = parsedDelegation.requests[index];
+							const executeNestedDelegates = async (
+								requests: DelegationRequest[],
+								parentCwd: string,
+								depthRemaining: number,
+								lineage: string,
+							): Promise<{
+								sections: string[];
+								warnings: string[];
+							}> => {
+								if (requests.length === 0 || depthRemaining <= 0) {
+									return { sections: [], warnings: [] };
+								}
+
+								const nestedWarnings: string[] = [];
+								const sections: string[] = [];
+
+								for (const [nestedIndex, nestedRequest] of requests.entries()) {
+									const requestLabel = `${lineage}${nestedIndex + 1}`;
+									const requestedNestedAgent = nestedRequest.agent?.trim() || undefined;
+									const nestedCustomSubagent = resolveCustom(requestedNestedAgent);
+									if (requestedNestedAgent && !nestedCustomSubagent) {
+										nestedWarnings.push(
+											`Nested delegated task "${nestedRequest.description}" requested unknown agent "${requestedNestedAgent}". Falling back to profile "${nestedRequest.profile}".`,
+										);
+									}
+									const nestedProfileRaw = nestedCustomSubagent?.profile ?? nestedRequest.profile;
+									const normalizedNestedProfile = nestedProfileRaw.trim().toLowerCase();
+									const nestedProfile =
+										normalizedNestedProfile && toolsByProfile[normalizedNestedProfile]
+											? normalizedNestedProfile
+											: "full";
+									const nestedProfileLabel = nestedCustomSubagent?.name
+										? `${nestedCustomSubagent.name}/${nestedProfile}`
+										: nestedProfile;
+									let nestedTools = nestedCustomSubagent?.tools
+										? [...nestedCustomSubagent.tools]
+										: [...(toolsByProfile[nestedProfile] ?? toolsByProfile.explore)];
+									if (nestedCustomSubagent?.disallowedTools?.length) {
+										const blocked = new Set(nestedCustomSubagent.disallowedTools);
+										nestedTools = nestedTools.filter((tool) => !blocked.has(tool));
+									}
+									const nestedBaseSystemPrompt =
+										nestedCustomSubagent?.systemPrompt ??
+										systemPromptByProfile[nestedProfile] ??
+										systemPromptByProfile.full;
+									const nestedSystemPrompt = withDelegationPrompt(
+										nestedBaseSystemPrompt,
+										Math.max(0, depthRemaining - 1),
+										effectiveMaxDelegations,
+									);
+									const requestedNestedCwd = nestedRequest.cwd
+										? path.resolve(parentCwd, nestedRequest.cwd)
+										: nestedCustomSubagent?.cwd ?? parentCwd;
+									if (!existsSync(requestedNestedCwd) || !statSync(requestedNestedCwd).isDirectory()) {
+										recordFailureCause("dependency_env");
+										delegatedFailed += 1;
+										delegatedTasks += 1;
+										sections.push(
+											`###### ${requestLabel}. ${nestedRequest.description} (${nestedProfileLabel})\nERROR [cause=dependency_env]: nested delegate skipped: missing cwd`,
+										);
+										continue;
+									}
+
+									let nestedReleaseLock: (() => void) | undefined;
+									let nestedReleaseIsolation: (() => void) | undefined;
+									let nestedCwd = requestedNestedCwd;
+									try {
+										if (writeCapableProfiles.has(nestedProfile) && nestedRequest.lockKey?.trim()) {
+											const lock = getOrCreateWriteLock(nestedRequest.lockKey.trim());
+											nestedReleaseLock = await lock.acquire();
+										}
+										if (nestedRequest.isolation === "worktree") {
+											const isolated = provisionWorktree(
+												cwd,
+												requestedNestedCwd,
+												`${runId}_nested_${requestLabel.replace(/\./g, "_")}`,
+											);
+											nestedCwd = isolated.runCwd;
+											nestedReleaseIsolation = isolated.cleanup;
+										}
+
+										const nestedPromptWithInstructions =
+											nestedCustomSubagent?.instructions && nestedCustomSubagent.instructions.trim().length > 0
+												? `${nestedCustomSubagent.instructions.trim()}\n\nUser task:\n${nestedRequest.prompt}`
+												: nestedRequest.prompt;
+										const nestedSharedMemoryGuidance = buildSharedMemoryGuidance(
+											sharedMemoryRunId,
+											sharedMemoryTaskId,
+										);
+										const nestedPrompt = `${nestedPromptWithInstructions}\n\n${nestedSharedMemoryGuidance}`;
+										const nestedModelOverride =
+											nestedRequest.model?.trim() || nestedCustomSubagent?.model?.trim() || undefined;
+										const nestedSharedMemoryContext: SharedMemoryContext = {
+											rootCwd: cwd,
+											runId: sharedMemoryRunId,
+											taskId: sharedMemoryTaskId,
+											delegateId: requestLabel,
+											profile: nestedProfile,
+										};
+
+										const nestedResult = await runner({
+											systemPrompt: nestedSystemPrompt,
+											tools: nestedTools,
+											prompt: nestedPrompt,
+											cwd: nestedCwd,
+											modelOverride: nestedModelOverride,
+											sharedMemoryContext: nestedSharedMemoryContext,
+											signal: _signal,
+											onProgress: (progress) => {
+												emitProgress({
+													kind: "subagent_progress",
+													phase: "running",
+													message: `delegate ${requestLabel}: ${progress.message}`,
+													cwd: progress.cwd ?? nestedCwd,
+													activeTool: progress.activeTool,
+												});
+											},
+										});
+										throwIfAborted();
+
+										let nestedOutput = typeof nestedResult === "string" ? nestedResult : nestedResult.output;
+										const nestedStats = typeof nestedResult === "string" ? undefined : nestedResult.stats;
+										delegatedTasks += 1;
+										delegatedSucceeded += 1;
+										delegatedStats.toolCallsStarted += nestedStats?.toolCallsStarted ?? 0;
+										delegatedStats.toolCallsCompleted += nestedStats?.toolCallsCompleted ?? 0;
+										delegatedStats.assistantMessages += nestedStats?.assistantMessages ?? 0;
+
+										const parsedNestedDelegation = parseDelegationRequests(
+											nestedOutput,
+											depthRemaining > 1 ? effectiveMaxDelegations : 0,
+										);
+										nestedOutput = parsedNestedDelegation.cleanedOutput;
+										nestedWarnings.push(...parsedNestedDelegation.warnings.map((warning) => `Nested child ${requestLabel}: ${warning}`));
+
+										let nestedSection = `###### ${requestLabel}. ${nestedRequest.description} (${nestedProfileLabel})\n${nestedOutput.trim() || "(no output)"}`;
+										if (parsedNestedDelegation.requests.length > 0 && depthRemaining > 1) {
+											const deeper = await executeNestedDelegates(
+												parsedNestedDelegation.requests,
+												nestedCwd,
+												depthRemaining - 1,
+												`${requestLabel}.`,
+											);
+											nestedWarnings.push(...deeper.warnings);
+											if (deeper.sections.length > 0) {
+												nestedSection = `${nestedSection}\n\n##### Nested Delegated Subtasks\n\n${deeper.sections.join("\n\n")}`;
+											}
+										}
+										sections.push(nestedSection);
+									} catch (error) {
+										const message = error instanceof Error ? error.message : String(error);
+										const cause = classifyFailureCause(message);
+										recordFailureCause(cause);
+										delegatedTasks += 1;
+										delegatedFailed += 1;
+										sections.push(
+											`###### ${requestLabel}. ${nestedRequest.description} (${nestedProfileLabel})\nERROR [cause=${cause}]: ${message}`,
+										);
+									} finally {
+										nestedReleaseIsolation?.();
+										nestedReleaseLock?.();
+										cleanupWriteLock(nestedRequest.lockKey?.trim());
+									}
+								}
+
+								return { sections, warnings: nestedWarnings };
+							};
+
+							const runDelegate = async (index: number): Promise<void> => {
+								throwIfAborted();
+								const request = parsedDelegation.requests[index];
 							const requestedChildAgent = request.agent?.trim() || undefined;
 							const childCustomSubagent = resolveCustom(requestedChildAgent);
 							if (requestedChildAgent && !childCustomSubagent) {
@@ -1421,11 +1619,11 @@ export function createTaskTool(
 								childCustomSubagent?.systemPrompt ??
 								systemPromptByProfile[childProfile] ??
 								systemPromptByProfile.full;
-							const childSystemPrompt = withDelegationPrompt(
-								childBaseSystemPrompt,
-								Math.max(0, delegationDepth - 1),
-								effectiveMaxDelegations,
-							);
+								const childSystemPrompt = withDelegationPrompt(
+									childBaseSystemPrompt,
+									Math.max(0, effectiveDelegationDepth - 1),
+									effectiveMaxDelegations,
+								);
 								const requestedChildCwd = request.cwd
 									? path.resolve(subagentCwd, request.cwd)
 									: childCustomSubagent?.cwd ?? subagentCwd;
@@ -1597,11 +1795,27 @@ export function createTaskTool(
 										}
 									}
 
-								const parsedChildDelegation = parseDelegationRequests(childOutput, 0);
+								const parsedChildDelegation = parseDelegationRequests(
+									childOutput,
+									effectiveDelegationDepth > 1 ? effectiveMaxDelegations : 0,
+								);
 								childOutput = parsedChildDelegation.cleanedOutput;
 								delegationWarnings.push(
 									...parsedChildDelegation.warnings.map((warning) => `Child ${index + 1}: ${warning}`),
 								);
+								let nestedSection = "";
+								if (parsedChildDelegation.requests.length > 0 && effectiveDelegationDepth > 1) {
+									const nested = await executeNestedDelegates(
+										parsedChildDelegation.requests,
+										childCwd,
+										effectiveDelegationDepth - 1,
+										`${index + 1}.`,
+									);
+									delegationWarnings.push(...nested.warnings);
+									if (nested.sections.length > 0) {
+										nestedSection = `\n\n##### Nested Delegated Subtasks\n\n${nested.sections.join("\n\n")}`;
+									}
+								}
 								delegatedSucceeded += 1;
 								if (delegateItems[index]) {
 									delegateItems[index].status = "done";
@@ -1615,7 +1829,7 @@ export function createTaskTool(
 										? `${normalizedChildOutput.slice(0, Math.max(1, maxDelegatedOutputCharsFromEnv - 3))}...`
 										: normalizedChildOutput;
 								delegatedSections[index] =
-									`#### ${index + 1}. ${request.description} (${childProfileLabel})\n${childOutputExcerpt}`;
+									`#### ${index + 1}. ${request.description} (${childProfileLabel})\n${childOutputExcerpt}${nestedSection}`;
 								emitProgress({
 									kind: "subagent_progress",
 									phase: "running",

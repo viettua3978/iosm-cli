@@ -1,32 +1,143 @@
 # Orchestration & Subagents
 
-`iosm-cli` supports delegated execution through subagents — specialized AI agents that handle task delegation, parallel execution, and multi-agent workflows.
+`iosm-cli` now uses a **swarm-first** execution model for complex/risky changes.
 
-## Overview
+Canonical path:
+- `/singular` -> choose option
+- effective `/contract` applied (or bootstrap required)
+- `/swarm` execution runtime
+- optional `/iosm` optimization loop
 
-Subagents allow you to:
-- **Delegate tasks** to specialized agents with isolated context windows
-- **Run agents in parallel** for independent analyses or implementations
-- **Orchestrate teams** with dependency ordering and lock-based coordination
-- **Track runs** with full transcripts and result aggregation
+Core consistency model:
+- **Scopes -> Touches -> Locks -> Gates -> Done**
 
 ---
 
 ## User-Level Entry Points
 
-### 1. Natural Language Delegation
+### 1. Decision-first flow (recommended)
 
-Simply describe what you want delegated, and the agent handles orchestration:
-
-```
-You: Launch 3 agents to analyze security, performance, and code quality separately
-
-Agent: I'll create 3 parallel subagents for each analysis area...
+```bash
+/singular "Refactor auth and split session handling from token validation"
+# choose Option 1/2/3
+# choose Start with Swarm (Recommended)
 ```
 
-### 2. Slash Command Orchestration
+### 2. Direct swarm execution
 
-Use `/orchestrate` for explicit control:
+```bash
+/swarm run "Refactor auth and reduce integration risk" --max-parallel 3 --budget-usd 12
+```
+
+### 3. Agent mention / delegated tasks
+
+```text
+@security-auditor Review the authentication module for vulnerabilities
+```
+
+---
+
+## `/swarm` Command Surface
+
+### Syntax
+
+```bash
+/swarm run <task> [--max-parallel N] [--budget-usd X]
+/swarm from-singular <run-id> --option <1|2|3> [--max-parallel N] [--budget-usd X]
+/swarm watch [run-id]
+/swarm retry <run-id> <task-id> [--reset-brief]
+/swarm resume <run-id>
+/swarm help
+```
+
+### Notes
+
+- `/swarm` will not execute without an effective `/contract`.
+- Run-level `--max-parallel` supports `1..20`.
+- Within a single swarm task, the execution agent can fan out delegated subagents in parallel (up to 10) when the subtask is decomposable.
+- Tasks/delegates with the same `run_id` can exchange intermediate state via `shared_memory_write` / `shared_memory_read`.
+- Standalone `task` calls without explicit `run_id` use an internal run/task id, so shared memory still works inside that task execution (root + delegates).
+- If contract is missing, bootstrap menu is blocking:
+  - `Auto-draft from task (Recommended)`
+  - `Guided Q&A`
+  - `Open manual /contract editor`
+- Medium/large repositories use Project Index planning by default.
+- Semantic index is optional enrichment; when stale/missing, swarm continues with guided recommendations.
+- Scheduler guards are enabled by default:
+  - `progress heuristic` (prioritizes high-impact tasks when progress stalls)
+  - `conflict density guard` (reduces parallelism under heavy touch overlap)
+- High-risk spawn candidates require confirmation (approve/reject/abort run).
+
+---
+
+## Command Separation
+
+- Use direct prompt to the main agent for simple tasks.
+- Use legacy `/orchestrate ...` when you explicitly want manual multi-agent splitting with old team-run semantics.
+- Use canonical `/swarm ...` as multi-agent orchestration runtime for complex/risky work.
+- `/orchestrate --swarm` was removed to avoid command ambiguity.
+
+---
+
+## Runtime Artifacts
+
+Swarm run artifacts are written to:
+
+```text
+.iosm/orchestrate/<run-id>/
+├── run.json
+├── dag.json
+├── state.json
+├── events.jsonl
+├── checkpoints/
+│   └── latest.json
+└── reports/
+    ├── integration_report.md
+    ├── gates.json
+    └── shared_context.md
+```
+
+Swarm run history is native to `/swarm` commands (`watch`, `retry`, `resume`), not mirrored into legacy team-run storage.
+
+---
+
+## Visibility & Recovery
+
+### Watch
+
+```bash
+/swarm watch [run-id]
+```
+
+Shows live snapshot fields:
+- run status
+- ready/running/blocked/done/error counts
+- budget usage and 80% warning state
+- locks and current touches map
+- ETA ticks, throughput per tick, critical path estimate, theoretical speedup, and top bottleneck tasks
+
+### Retry
+
+```bash
+/swarm retry <run-id> <task-id> [--reset-brief]
+```
+
+- retries one failed/blocked task under retry taxonomy
+- optional `--reset-brief` lets you edit task brief before retry
+
+### Resume
+
+```bash
+/swarm resume <run-id>
+```
+
+Resumes from checkpoint + snapshot state.
+
+---
+
+## Legacy `/orchestrate` (non-swarm)
+
+Legacy orchestration remains available for existing workflows:
 
 ```bash
 /orchestrate --parallel --agents 3 \
@@ -35,150 +146,7 @@ Use `/orchestrate` for explicit control:
   Analyze security, optimize performance, verify IOSM compliance
 ```
 
-### 3. Agent Mention
-
-Reference a specific agent by name:
-
-```
-@security-auditor Review the authentication module for vulnerabilities
-```
-
----
-
-## `/orchestrate` Command
-
-### Syntax
-
-```bash
-/orchestrate [flags] <task description>
-```
-
-### Execution Flags
-
-| Flag | Description | Example |
-|------|-------------|---------|
-| `--parallel` | Run agents concurrently | `--parallel` |
-| `--sequential` | Run agents one after another | `--sequential` |
-| `--agents <N>` | Number of agents to spawn | `--agents 3` |
-| `--max-parallel <N>` | Concurrency limit for parallel runs | `--max-parallel 2` |
-
-### Profile & Context Flags
-
-| Flag | Description | Example |
-|------|-------------|---------|
-| `--profile <name>` | Single profile for all agents | `--profile explore` |
-| `--profiles p1,p2,...` | Per-agent profile assignment | `--profiles explore,full,iosm_verifier` |
-| `--cwd path1,path2,...` | Per-agent working directories | `--cwd .,src,test` |
-
-### Coordination Flags
-
-| Flag | Description | Example |
-|------|-------------|---------|
-| `--locks lock1,lock2,...` | Write serialization domains | `--locks db,config` |
-| `--depends 2>1,3>2` | Dependency ordering | `--depends 2>1` (agent 2 waits for 1) |
-| `--worktree` | Git worktree isolation | `--worktree` |
-
----
-
-## Usage Examples
-
-### Parallel Independent Analysis
-
-Three agents analyze different aspects simultaneously:
-
-```bash
-/orchestrate --parallel --agents 3 \
-  --profiles explore,explore,explore \
-  --cwd src/auth,src/api,src/data \
-  Analyze code quality and suggest improvements
-```
-
-### Sequential Pipeline
-
-Agent 2 depends on Agent 1's output:
-
-```bash
-/orchestrate --sequential --agents 2 \
-  --depends 2>1 \
-  First: analyze the codebase architecture. \
-  Second: propose a refactoring plan based on the analysis.
-```
-
-### Parallel with Write Isolation
-
-For concurrent changes that might conflict:
-
-```bash
-/orchestrate --parallel --worktree --agents 2 \
-  Agent 1: refactor auth module \
-  Agent 2: refactor payment module
-```
-
-### Locked Write Coordination
-
-Serialize writes to shared resources:
-
-```bash
-/orchestrate --parallel --agents 3 \
-  --locks database-schema \
-  All agents: optimize your assigned module's database queries
-```
-
-### Full Team Orchestration
-
-```bash
-/orchestrate --parallel --agents 4 \
-  --profiles iosm_analyst,explore,iosm_verifier,full \
-  --max-parallel 2 \
-  1: Collect baseline metrics \
-  2: Identify optimization opportunities \
-  3: Verify current quality gate compliance \
-  4: Implement the top-priority fix
-```
-
----
-
-## Visibility & Tracking
-
-### View Subagent Runs
-
-```bash
-/subagent-runs
-```
-
-Lists all subagent runs with:
-- Run ID, status (running/complete/failed)
-- Agent profile and task description
-- Timestamps and duration
-
-### Resume a Subagent Run
-
-```bash
-/subagent-resume <run-id> [extra instructions]
-```
-
-Continue or refine a previous subagent's work:
-
-```bash
-/subagent-resume run-abc123 "Focus more on error handling"
-```
-
-### Team Run Status
-
-```bash
-/team-runs                     # List team orchestration runs
-/team-status <team-run-id>     # Detailed status of a specific team run
-```
-
-### Artifacts
-
-Subagent transcripts and team records are stored in:
-
-```
-.iosm/subagents/
-├── runs/     # Individual subagent transcripts
-└── teams/    # Team orchestration records
-```
+Use legacy mode when you explicitly need old team-run semantics.
 
 ---
 
@@ -217,57 +185,16 @@ Always provide:
 
 # View all available agents
 /agents
-
-# Use in orchestration
-/orchestrate --agents 1 --profile security-auditor \
-  Audit the authentication module
 ```
 
-### System Agents
-
-Built-in system agents available by default include auditor, verifier, and executor roles. View them with `/agents`.
+Built-in system agents remain available; inspect via `/agents`.
 
 ---
 
-## Parallel Safety Model
+## Safety Guidance
 
-### When to Use Locks
-
-Use `lock_key` domains when multiple agents might write to the same files:
-
-```bash
-/orchestrate --parallel --agents 2 \
-  --locks "config-files" \
-  Both modify shared configuration
-```
-
-### When to Use Worktrees
-
-Use `--worktree` for large-scale concurrent edits:
-
-```bash
-/orchestrate --parallel --worktree --agents 3 \
-  Each refactor a major module independently
-```
-
-### When No Coordination Is Needed
-
-Keep independent analyses lock-free:
-
-```bash
-/orchestrate --parallel --agents 3 \
-  --profiles explore,explore,explore \
-  Each analyze a different module (read-only)
-```
-
----
-
-## Best Practices
-
-1. **Keep tasks independent** — Each agent works best with a well-defined, independent scope
-2. **Narrow responsibilities** — One agent, one clear task
-3. **Use appropriate profiles** — Read-only tasks don't need `full` profile
-4. **Aggregate results** — The orchestrating agent synthesizes all subagent outputs
-5. **Clarify constraints** — Specify boundaries and expected output format
-6. **Monitor progress** — Use `/subagent-runs` and `/team-status` to track execution
-7. **Start small** — Begin with 2-3 agents and scale up as needed
+- Use `/contract` to lock execution scope before running swarm.
+- Prefer `/singular` when scope/impact is unclear.
+- Use `/swarm watch` frequently on medium/high-risk runs.
+- Use `/checkpoint`/`/rollback` before broad refactors.
+- Follow up with `/iosm` for measurable post-change quality improvements.

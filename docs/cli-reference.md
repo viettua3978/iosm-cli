@@ -126,7 +126,17 @@ These commands run inside interactive mode (`iosm`), not as top-level CLI subcom
 - `/singular <feature request>` — command-first feasibility analyzer:
   - baseline repository scan + standard agent pass
   - outputs exactly 3 implementation options with recommendation
-  - lets user choose option `1/2/3` before implementation
+  - lets user choose option `1/2/3`, then `Start with Swarm` or `Continue without Swarm`
+- `/swarm` — canonical gated execution runtime:
+  - `/swarm run <task> [--max-parallel N] [--budget-usd X]`
+  - `/swarm from-singular <run-id> --option <1|2|3> [--max-parallel N] [--budget-usd X]`
+  - `/swarm watch [run-id]`
+  - `/swarm retry <run-id> <task-id> [--reset-brief]`
+  - `/swarm resume <run-id>`
+  - limits: `--max-parallel` supports `1..20`; delegated intra-task fan-out supports up to `10`
+  - consistency model: `Scopes -> Touches -> Locks -> Gates -> Done`
+  - built-in scheduler guards: progress heuristic + conflict density guard
+  - high-risk spawn candidates are confirmation-gated
 
 Migration notes:
 - `/blast` removed in favor of `/singular`

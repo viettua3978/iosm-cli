@@ -1,4 +1,4 @@
-<h1 align="center">IOSM CLI v0.2.0</h1>
+<h1 align="center">IOSM CLI v0.2.1</h1>
 
 <p align="center">
   <strong>AI Engineering Runtime for Professional Developers</strong>
@@ -26,7 +26,7 @@
 It is a runtime for production codebases:
 - a terminal-native coding agent with direct filesystem and shell tooling
 - primary operating profiles: **full** (default) and **iosm** (advanced, methodology-driven engineering cycles)
-- smart orchestration for complex tasks: parallel/sequential agents, dependency ordering, lock coordination, and worktree isolation
+- swarm-first orchestration for complex tasks: `Scopes -> Touches -> Locks -> Gates -> Done`, continuous dispatch, retries, checkpoints
 - built-in semantic embeddings search (`semantic_search` tool + `/semantic` + `iosm semantic`)
 - repeatable codebase improvement workflows via **IOSM** (Improve -> Optimize -> Shrink -> Modularize)
 - auditable artifact history for cycles, decisions, and metric evolution across runs
@@ -131,30 +131,28 @@ Shift+Tab         # switch profile to iosm
 ```
 
 Core commands to unlock full runtime value:
-- `/orchestrate` — run parallel/sequential subagents with dependencies, locks, and optional worktrees
+- direct prompt to main agent — default for simple tasks (single-agent flow)
+- `/orchestrate` — manual legacy multi-agent orchestration (explicit team-run control)
+- `/swarm` — recommended multi-agent orchestration runtime for complex/risky changes (`run`, `from-singular`, `watch`, `retry`, `resume`)
 - `/init` + `/iosm` — execute measurable IOSM cycles with artifacts and quality gates
 - `/mcp` — connect external tool ecosystems in interactive UI
 - `/semantic` — configure semantic provider, build/rebuild embeddings index, run meaning-based retrieval
 - `/memory` — persist project facts and constraints across sessions
 
-## Real-World Example: Agent-Orchestrated IOSM Refactor
+## Real-World Example: Swarm-First IOSM Refactor
 
 ```console
 $ iosm
-IOSM CLI v0.2.0 [full]
+IOSM CLI v0.2.1 [full]
 
-you> Refactor authentication module with parallel agents, then finalize in IOSM mode
-iosm> /orchestrate --parallel --agents 4 \
-      --profiles iosm_analyst,explore,iosm_verifier,full \
-      --depends 3>1,4>2 --locks schema,config --worktree \
-      Refactor auth and reduce integration risk
-iosm> Team run started: #77
-
-iosm> agent[1] architecture map complete
-iosm> agent[2] implementation patch set prepared
-iosm> agent[3] verification suite and rollback checks ready
-iosm> agent[4] integration validation passed
-iosm> Consolidated patch plan generated
+you> /singular Refactor auth and split session handling from token validation
+iosm> Option 1 selected
+iosm> Start with Swarm (Recommended)
+iosm> /swarm from-singular 2026-03-10-210201 --option 1
+iosm> Swarm run started: swarm_1741632000000_ab12cd
+iosm> status: running (ready/running/blocked/done visible via /swarm watch)
+iosm> Touches -> Locks -> Gates pipeline completed
+iosm> integration report written to .iosm/orchestrate/swarm_1741632000000_ab12cd/reports/
 
 iosm> switch profile: iosm (Shift+Tab)
 iosm> /init
@@ -168,13 +166,10 @@ iosm> Result: simplicity +18%, modularity +11%, performance +6%
 iosm> Artifacts written to .iosm/cycles/2026-03-10-001/
 ```
 
-For broader tasks, delegate in parallel:
+For plain-language execution without `/singular`:
 
 ```bash
-/orchestrate --parallel --agents 4 \
-  --profiles iosm_analyst,explore,iosm_verifier,full \
-  --depends 3>1,4>2 --locks schema,config --worktree \
-  Refactor auth and reduce integration risk
+/swarm run "Refactor auth and reduce integration risk" --max-parallel 3 --budget-usd 12
 ```
 
 ## Architecture Overview
@@ -190,7 +185,7 @@ Agent Runtime (interactive + JSON + JSON-RPC + SDK)
    ↓
 Tooling Layer (read/edit/bash + search/structural/data/security tools + MCP tools)
    ↓
-Orchestration Engine (/orchestrate, subagents, dependencies, locks, worktrees)
+Swarm Runtime (/swarm run|from-singular|watch|retry|resume)
    ↓
 IOSM Layer (/init, /iosm cycles, metrics, governance)
    ↓
@@ -199,8 +194,8 @@ Artifacts + Memory (.iosm/cycles/*, checkpoints, /memory state)
 
 ## Design Principles
 
-- **AI executes structured engineering loops, not ad hoc chats.** Core flow is orchestration + IOSM cycle execution (`/orchestrate` -> `/init` -> `/iosm`).
-- **Complex work needs orchestration.** Parallel agents, dependency ordering, locks, and optional worktree isolation reduce collision and blast radius.
+- **AI executes structured engineering loops, not ad hoc chats.** Core flow for risky tasks is ` /singular -> /contract -> /swarm -> /iosm `.
+- **Complex work needs controlled execution.** Swarm applies `Scopes -> Touches -> Locks -> Gates -> Done` with continuous dispatch and bounded retries.
 - **Refactoring must be measurable.** IOSM cycles capture baseline, hypotheses, and metric deltas instead of untracked edits.
 - **Every important run must be auditable.** Artifacts and memory preserve decisions and outcomes across sessions.
 - **Adoption should be progressive.** Start in `full` profile for speed; move to `iosm` profile for advanced cycles and governance when needed.
@@ -211,7 +206,7 @@ Artifacts + Memory (.iosm/cycles/*, checkpoints, /memory state)
 
 | Profile | Best For | What `/init` Does | Advanced Command |
 |------|----------|-------------------|------------------|
-| **full** (default) | Daily coding for any level | Generates/updates `AGENTS.md` from real repo scan and prepares `.iosm/agents/` | Use `/orchestrate` and built-in tools directly |
+| **full** (default) | Daily coding for any level | Generates/updates `AGENTS.md` from real repo scan and prepares `.iosm/agents/` | Use `/swarm` (canonical) and built-in tools directly |
 | **iosm** (advanced) | High-risk refactors and system-level engineering loops | Bootstraps full IOSM workspace (`iosm.yaml`, `IOSM.md`, `.iosm/cycles/...`) with optional agent verification | `/iosm [target-index] [--max-iterations N] [--force-init]` |
 
 Typical advanced flow:
@@ -222,30 +217,43 @@ iosm --profile iosm
 /iosm 0.95 --max-iterations 5
 ```
 
-## Smart Orchestration
+## Swarm-First Execution
 
-For complex work, use explicit multi-agent orchestration instead of one long monolithic prompt.
+For complex/risky work, use the canonical swarm runtime instead of one monolithic prompt.
 
-`/orchestrate` supports:
-- parallel or sequential execution (`--parallel` / `--sequential`)
-- controlled concurrency (`--max-parallel`)
-- per-agent profiles and working directories (`--profiles`, `--cwd`)
-- dependency DAGs (`--depends 2>1,3>2`)
-- write safety (`--locks`) and optional git worktree isolation (`--worktree`)
+Default routing rule:
+- simple tasks -> direct prompt to one agent
+- manual legacy multi-agent split -> `/orchestrate`
+- complex/risky changes (multi-agent orchestration level) -> `/swarm`
+
+`/swarm` supports:
+- contract-bound execution (run blocks until effective `/contract` exists)
+- run-level parallel workers via `--max-parallel` (1..20)
+- continuous dispatch over DAG tasks (ready -> locks -> gates -> checkpoint)
+- intra-task parallelism: one swarm task can fan out to delegated subagents (up to 10) when beneficial
+- run-scoped shared memory (`shared_memory_write` / `shared_memory_read`) across tasks and delegates that share the same `run_id`
+- standalone `task` executions auto-generate internal `run_id/task_id`, enabling shared memory for root + delegates without manual IDs
+- hierarchical touches-based locking and lock downgrade
+- task gates + run gates separation
+- retries by taxonomy (`permission`, `dependency/import`, `test`, `timeout`, `unknown`)
+- checkpoints/recovery (`/swarm resume`) and focused retries (`/swarm retry`)
+- scheduler guards (`progress heuristic` + `conflict density guard`) for stable throughput under contention
+- high-risk spawn candidates require explicit confirmation during run
 
 Example:
 
 ```bash
-/orchestrate --parallel --agents 4 \
-  --profiles iosm_analyst,explore,iosm_verifier,full \
-  --max-parallel 2 \
-  --depends 3>1,4>2 \
-  --locks schema,config \
-  --worktree \
-  Improve auth reliability and performance with verification gates
+/swarm run "Improve auth reliability and performance with verification gates" \
+  --max-parallel 3 \
+  --budget-usd 15
 ```
 
-Track and resume delegated execution with `/subagent-runs`, `/subagent-resume`, `/team-runs`, and `/team-status`.
+Bridge from decision mode:
+
+```bash
+/singular "Refactor auth and split session handling from token validation"
+# choose option -> Start with Swarm (Recommended)
+```
 
 ## Core Commands
 
@@ -254,10 +262,12 @@ Track and resume delegated execution with `/subagent-runs`, `/subagent-resume`, 
 | Start clean context | `/new` or `/clear` | Reset session state before a new task or after context drift |
 | Configure auth | `/login` or `/auth` | Set provider credentials with guided flow |
 | Select active model | `/model` | Choose provider/model category for current workload |
-| Launch multi-agent execution | `/orchestrate ...` | Split complex tasks across agents with dependencies, locks, and optional worktrees |
+| Launch controlled execution | `/swarm run ...` | Execute complex tasks with contract boundaries, locks, gates, retries, and checkpoints |
+| Bridge decision to execution | `/swarm from-singular ...` | Apply selected `/singular` option under effective contract policy |
+| Legacy orchestration | `/orchestrate --parallel ...` | Keep previous team-run flow when you explicitly need legacy semantics |
 | Initialize IOSM workspace | `/init` | Bootstrap/update IOSM files and cycle workspace |
 | Run IOSM cycle | `/iosm [target-index] [--max-iterations N]` | Execute measurable improve/verify loops with artifact output |
-| Track delegated runs | `/subagent-runs`, `/subagent-resume`, `/team-runs`, `/team-status` | Monitor and resume orchestration pipelines |
+| Track swarm runs | `/swarm watch`, `/swarm resume`, `/swarm retry` | Observe state, resume checkpoints, and recover failed tasks |
 | Manage MCP servers | `/mcp` | Inspect/add/enable external tool servers interactively |
 | Manage semantic search | `/semantic` | Configure provider with auto model discovery (OpenRouter/Ollama), index codebase, query by intent/meaning |
 | Define engineering contract | `/contract` | Field-by-field interactive contract editor with auto-save and automatic JSON generation |
@@ -290,7 +300,8 @@ Key manager actions:
   - `Option 2`: alternative strategy with different trade-offs.
   - `Option 3`: defer/do-not-implement-now path.
 - Each option includes affected files, step-by-step plan, risks, and when-to-choose guidance.
-- User selects `1/2/3` (or exits) before coding starts.
+- User selects `1/2/3`, then chooses `Start with Swarm` or `Continue without Swarm`.
+- `Start with Swarm` executes selected option via `/swarm from-singular ...` under effective `/contract`.
 
 Legacy note:
 - `/blast` and `/shadow` are removed from active workflow.

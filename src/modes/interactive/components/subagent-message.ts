@@ -95,6 +95,18 @@ function formatDuration(ms: number): string {
 	return `${minutes}m ${seconds}s`;
 }
 
+function formatElapsedClock(ms: number): string {
+	const totalSeconds = Math.max(0, Math.floor(ms / 1000));
+	const hours = Math.floor(totalSeconds / 3600);
+	const minutes = Math.floor((totalSeconds % 3600) / 60);
+	const seconds = totalSeconds % 60;
+	const pad2 = (value: number): string => value.toString().padStart(2, "0");
+	if (hours > 0) {
+		return `${pad2(hours)}:${pad2(minutes)}:${pad2(seconds)}`;
+	}
+	return `${pad2(minutes)}:${pad2(seconds)}`;
+}
+
 function shortenPath(path: string): string {
 	const home = homedir();
 	return path.startsWith(home) ? `~${path.slice(home.length)}` : path;
@@ -277,6 +289,9 @@ export class SubagentMessageComponent extends Box {
 				}
 				if (info.agent) {
 					metadata.push(theme.fg("muted", `agent ${info.agent}`));
+				}
+				if (typeof info.durationMs === "number" && info.durationMs >= 0) {
+					metadata.push(theme.fg("muted", `elapsed ${formatElapsedClock(info.durationMs)}`));
 				}
 				if (info.isolation && info.isolation !== "none") {
 					metadata.push(theme.fg("muted", `iso ${info.isolation}`));

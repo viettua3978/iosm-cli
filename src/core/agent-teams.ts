@@ -1,5 +1,6 @@
 import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import lockfile from "proper-lockfile";
 
 export type TeamTaskStatus = "pending" | "running" | "done" | "error" | "cancelled";
 
@@ -29,6 +30,11 @@ function getTeamsDir(cwd: string): string {
 
 function getTeamRunPath(cwd: string, runId: string): string {
 	return join(getTeamsDir(cwd), `${runId}.json`);
+}
+
+function sleepSync(ms: number): void {
+	const waiter = new Int32Array(new SharedArrayBuffer(4));
+	Atomics.wait(waiter, 0, 0, ms);
 }
 
 export function createTeamRun(input: {
@@ -103,25 +109,43 @@ export function updateTeamTaskStatus(input: {
 	taskId: string;
 	status: TeamTaskStatus;
 }): TeamRunRecord | undefined {
-	const existing = getTeamRun(input.cwd, input.runId);
-	if (!existing) return undefined;
-
-	const nextTasks = existing.tasks.map((task) =>
-		task.id === input.taskId ? { ...task, status: input.status } : task,
-	);
-	if (!nextTasks.some((task) => task.id === input.taskId)) {
-		return undefined;
-	}
-
-	const next: TeamRunRecord = {
-		...existing,
-		tasks: nextTasks,
-	};
+	const runPath = getTeamRunPath(input.cwd, input.runId);
+	if (!existsSync(runPath)) return undefined;
+	let release: (() => void) | undefined;
 	try {
 		mkdirSync(getTeamsDir(input.cwd), { recursive: true });
-		writeFileSync(getTeamRunPath(input.cwd, input.runId), JSON.stringify(next, null, 2), "utf8");
+		const maxLockAttempts = 12;
+		for (let attempt = 1; attempt <= maxLockAttempts; attempt += 1) {
+			try {
+				release = lockfile.lockSync(runPath, { realpath: false });
+				break;
+			} catch (error) {
+				const code = error && typeof error === "object" && "code" in error ? String(error.code) : "";
+				if (code !== "ELOCKED" || attempt === maxLockAttempts) {
+					return undefined;
+				}
+				sleepSync(Math.min(120, 10 + attempt * 10));
+			}
+		}
+		if (!release) return undefined;
+		const raw = readFileSync(runPath, "utf8");
+		const existing = JSON.parse(raw) as TeamRunRecord;
+		const nextTasks = existing.tasks.map((task) =>
+			task.id === input.taskId ? { ...task, status: input.status } : task,
+		);
+		if (!nextTasks.some((task) => task.id === input.taskId)) {
+			return undefined;
+		}
+
+		const next: TeamRunRecord = {
+			...existing,
+			tasks: nextTasks,
+		};
+		writeFileSync(runPath, JSON.stringify(next, null, 2), "utf8");
 		return next;
 	} catch {
 		return undefined;
+	} finally {
+		release?.();
 	}
 }

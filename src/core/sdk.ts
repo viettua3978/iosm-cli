@@ -14,8 +14,10 @@ import type { ResourceLoader } from "./resource-loader.js";
 import { DefaultResourceLoader } from "./resource-loader.js";
 import { SessionManager } from "./session-manager.js";
 import { SettingsManager } from "./settings-manager.js";
+import type { SharedMemoryContext } from "./shared-memory.js";
 import { loadCustomSubagents, resolveCustomSubagentReference } from "./subagents.js";
 import { time } from "./timings.js";
+import { createSharedMemoryReadTool, createSharedMemoryWriteTool } from "./tools/shared-memory.js";
 import { patchAgentForParallelTaskExecution } from "./parallel-task-agent.js";
 import {
 	allTools,
@@ -461,6 +463,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				prompt: string;
 				cwd: string;
 				modelOverride?: string;
+				sharedMemoryContext?: SharedMemoryContext;
 				signal?: AbortSignal;
 				onProgress?: (progress: TaskToolProgress) => void;
 			}): Promise<
@@ -481,6 +484,12 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 					}
 					subModel = resolved;
 				}
+				const sharedMemoryTools: ToolDefinition[] | undefined = runnerOptions.sharedMemoryContext
+					? [
+							createSharedMemoryWriteTool(runnerOptions.sharedMemoryContext) as unknown as ToolDefinition,
+							createSharedMemoryReadTool(runnerOptions.sharedMemoryContext) as unknown as ToolDefinition,
+						]
+					: undefined;
 				const { session: sub } = await createAgentSession({
 					cwd: runnerOptions.cwd,
 					agentDir,
@@ -490,6 +499,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 					tools: createToolsFromNames(runnerOptions.cwd, runnerOptions.tools, {
 						semantic: { authStorage, agentDir },
 					}),
+					customTools: sharedMemoryTools,
 					sessionManager: SessionManager.inMemory(),
 					settingsManager,
 					enableTaskTool: false, // prevent recursive subagent spawning

@@ -228,7 +228,7 @@ const BUILTIN_SUBAGENTS: CustomSubagentDefinition[] = [
 			"4) Synthesize: provide integrated results, unresolved risks, and next actions.",
 			"",
 			"Delegation policy:",
-			"- Decide number of delegates based on task complexity (usually 1-6).",
+			"- Decide number of delegates based on task complexity (usually 1-10).",
 			"- Run independent read-heavy work in parallel by emitting multiple delegate blocks.",
 			"- For write-capable delegates touching overlapping areas, provide lock_key to avoid edit collisions.",
 			"- Use depends_on to enforce ordering for dependent steps (for example verification after implementation).",

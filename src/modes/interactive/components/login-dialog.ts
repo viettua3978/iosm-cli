@@ -1,6 +1,6 @@
 import { getOAuthProviders } from "@mariozechner/pi-ai/oauth";
 import { Container, type Focusable, getEditorKeybindings, Input, Spacer, Text, type TUI } from "@mariozechner/pi-tui";
-import { exec } from "child_process";
+import { spawn } from "node:child_process";
 import { theme } from "../theme/theme.js";
 import { DynamicBorder } from "./dynamic-border.js";
 import { keyHint } from "./keybinding-hints.js";
@@ -78,6 +78,31 @@ export class LoginDialogComponent extends Container implements Focusable {
 		this.onComplete(false, "Login cancelled");
 	}
 
+	private tryOpenBrowser(url: string): void {
+		const safeUrl = url.trim();
+		if (!safeUrl) return;
+		const closeChild = (command: string, args: string[]): void => {
+			const child = spawn(command, args, {
+				stdio: "ignore",
+				detached: true,
+			});
+			child.on("error", () => {
+				// best effort: hyperlink in TUI is still available for manual open
+			});
+			child.unref();
+		};
+		if (process.platform === "darwin") {
+			closeChild("open", [safeUrl]);
+			return;
+		}
+		if (process.platform === "win32") {
+			// Use cmd built-in `start` without interpolating user input into a shell string.
+			closeChild("cmd.exe", ["/d", "/s", "/c", "start", "", safeUrl]);
+			return;
+		}
+		closeChild("xdg-open", [safeUrl]);
+	}
+
 	/**
 	 * Called by onAuth callback - show URL and optional instructions
 	 */
@@ -95,9 +120,7 @@ export class LoginDialogComponent extends Container implements Focusable {
 			this.contentContainer.addChild(new Text(theme.fg("warning", instructions), 1, 0));
 		}
 
-		// Try to open browser
-		const openCmd = process.platform === "darwin" ? "open" : process.platform === "win32" ? "start" : "xdg-open";
-		exec(`${openCmd} "${url}"`);
+		this.tryOpenBrowser(url);
 
 		this.tui.requestRender();
 	}

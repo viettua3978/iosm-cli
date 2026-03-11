@@ -4,6 +4,14 @@ import { spawnSync } from "node:child_process";
 import type { AgentTool } from "@mariozechner/pi-agent-core";
 import { type Static, Type } from "@sinclair/typebox";
 import { getTeamRun, updateTeamTaskStatus } from "../agent-teams.js";
+import {
+	buildRetrospectiveDirective,
+	classifyFailureCause,
+	formatFailureCauseCounts,
+	isRetrospectiveRetryable,
+	type FailureCause,
+} from "../failure-retrospective.js";
+import type { SharedMemoryContext } from "../shared-memory.js";
 import type { CustomSubagentDefinition } from "../subagents.js";
 
 /**
@@ -53,6 +61,7 @@ export type SubagentRunner = (options: {
 	prompt: string;
 	cwd: string;
 	modelOverride?: string;
+	sharedMemoryContext?: SharedMemoryContext;
 	signal?: AbortSignal;
 	onProgress?: (progress: TaskToolProgress) => void;
 }) => Promise<string | SubagentRunResult>;
@@ -69,21 +78,10 @@ const taskSchema = Type.Object({
 			description: "Optional custom subagent name loaded from .iosm/agents or global agents directory.",
 		}),
 	),
-	profile: Type.Union(
-		[
-			Type.Literal("explore"),
-			Type.Literal("plan"),
-			Type.Literal("iosm"),
-			Type.Literal("iosm_analyst"),
-			Type.Literal("iosm_verifier"),
-			Type.Literal("cycle_planner"),
-			Type.Literal("full"),
-		],
-		{
-			description:
-				"Subagent capability profile: explore (read-only), plan (read + bash, no edits), iosm (full tools + IOSM methodology), iosm_analyst (read + bash for IOSM artifacts), iosm_verifier (artifact-focused checks), cycle_planner (cycle planning), full (all tools)",
-		},
-	),
+	profile: Type.String({
+		description:
+			"Subagent capability profile. Recommended values: explore, plan, iosm, iosm_analyst, iosm_verifier, cycle_planner, full. For custom agents, pass the agent name via `agent`, not `profile`.",
+	}),
 	cwd: Type.Optional(
 		Type.String({
 			description:
@@ -99,13 +97,13 @@ const taskSchema = Type.Object({
 	run_id: Type.Optional(
 		Type.String({
 			description:
-				"Optional orchestration run id (from /orchestrate). Use with task_id so the team board can track status.",
+				"Optional orchestration run id (from /orchestrate or /swarm). Use with task_id so the team board can track status. When omitted, task mode uses an internal run id for shared-memory collaboration within this task execution.",
 		}),
 	),
 	task_id: Type.Optional(
 		Type.String({
 			description:
-				"Optional orchestration task id (for example task_1). Use with run_id to update the team board.",
+				"Optional orchestration task id (for example task_1). Use with run_id to update the team board. When omitted, task mode uses an internal task id so task-scoped shared memory still works.",
 		}),
 	),
 	model: Type.Optional(
@@ -124,6 +122,14 @@ const taskSchema = Type.Object({
 		Type.Union([Type.Literal("none"), Type.Literal("worktree")], {
 			description:
 				"Optional isolation mode. Set to worktree to run this subagent in a temporary git worktree.",
+		}),
+	),
+	delegate_parallel_hint: Type.Optional(
+		Type.Integer({
+			minimum: 1,
+			maximum: 10,
+			description:
+				"Optional hint for intra-task delegation fan-out. Higher value allows more delegated subtasks to run in parallel inside a single task execution.",
 		}),
 	),
 });
@@ -154,6 +160,9 @@ export interface TaskToolDetails {
 	delegatedTasks?: number;
 	delegatedSucceeded?: number;
 	delegatedFailed?: number;
+	retrospectiveAttempts?: number;
+	retrospectiveRecovered?: number;
+	failureCauses?: Partial<Record<FailureCause, number>>;
 }
 
 export interface TaskToolOptions {
@@ -196,6 +205,7 @@ const delegationTagName = "delegate_task";
 type DelegationRequest = {
 	description: string;
 	profile: string;
+	agent?: string;
 	prompt: string;
 	cwd?: string;
 	lockKey?: string;
@@ -239,6 +249,10 @@ class Semaphore {
 			next();
 		}
 	}
+
+	isIdle(): boolean {
+		return this.active === 0 && this.queue.length === 0;
+	}
 }
 
 class Mutex {
@@ -263,20 +277,36 @@ class Mutex {
 			next();
 		}
 	}
+
+	isIdle(): boolean {
+		return !this.locked && this.waiters.length === 0;
+	}
 }
 
-const maxParallelFromEnv = Number.parseInt(process.env.IOSM_SUBAGENT_MAX_PARALLEL ?? "4", 10);
-const subagentSemaphore = new Semaphore(
-	Number.isInteger(maxParallelFromEnv) && maxParallelFromEnv > 0 ? Math.min(maxParallelFromEnv, 20) : 4,
-);
+const maxParallelFromEnv = parseBoundedInt(process.env.IOSM_SUBAGENT_MAX_PARALLEL, 20, 1, 20);
+const subagentSemaphore = new Semaphore(maxParallelFromEnv);
 const maxDelegationDepthFromEnv = parseBoundedInt(process.env.IOSM_SUBAGENT_MAX_DELEGATION_DEPTH, 1, 0, 3);
 const maxDelegationsPerTaskFromEnv = parseBoundedInt(
 	process.env.IOSM_SUBAGENT_MAX_DELEGATIONS_PER_TASK,
-	2,
+	10,
 	0,
 	10,
 );
-const maxDelegatedParallelFromEnv = parseBoundedInt(process.env.IOSM_SUBAGENT_MAX_DELEGATE_PARALLEL, 4, 1, 10);
+const maxDelegatedParallelFromEnv = parseBoundedInt(process.env.IOSM_SUBAGENT_MAX_DELEGATE_PARALLEL, 10, 1, 10);
+const emptyOutputRetriesFromEnv = parseBoundedInt(process.env.IOSM_SUBAGENT_EMPTY_OUTPUT_RETRIES, 1, 0, 2);
+const retrospectiveRetriesFromEnv = parseBoundedInt(process.env.IOSM_SUBAGENT_RETRO_RETRIES, 1, 0, 1);
+const orchestrationDependencyWaitTimeoutMsFromEnv = parseBoundedInt(
+	process.env.IOSM_ORCHESTRATION_DEPENDENCY_WAIT_TIMEOUT_MS,
+	120_000,
+	5_000,
+	900_000,
+);
+const orchestrationDependencyPollMsFromEnv = parseBoundedInt(
+	process.env.IOSM_ORCHESTRATION_DEPENDENCY_POLL_MS,
+	150,
+	50,
+	2_000,
+);
 const maxDelegatedOutputCharsFromEnv = parseBoundedInt(process.env.IOSM_SUBAGENT_DELEGATED_OUTPUT_MAX_CHARS, 6000, 500, 20_000);
 const maxMetaUpdatesPerCheckpoint = parseBoundedInt(process.env.IOSM_SUBAGENT_META_MAX_ITEMS, 5, 1, 20);
 const maxMetaUpdateChars = parseBoundedInt(process.env.IOSM_SUBAGENT_META_MAX_CHARS, 600, 100, 4000);
@@ -287,6 +317,62 @@ function parseBoundedInt(raw: string | undefined, fallback: number, min: number,
 	const parsed = raw ? Number.parseInt(raw, 10) : fallback;
 	if (!Number.isInteger(parsed)) return fallback;
 	return Math.max(min, Math.min(max, parsed));
+}
+
+function shouldAutoDelegateByAgent(agentName: string | undefined): boolean {
+	if (!agentName) return false;
+	const normalized = agentName.trim().toLowerCase();
+	return normalized.includes("orchestrator");
+}
+
+function deriveAutoDelegateParallelHint(
+	agentName: string | undefined,
+	description: string,
+	prompt: string,
+): number | undefined {
+	if (!shouldAutoDelegateByAgent(agentName)) return undefined;
+	const text = `${description}\n${prompt}`.trim();
+	if (!text) return 1;
+	const normalized = text.replace(/\s+/g, " ").trim();
+	const words = normalized.length > 0 ? normalized.split(/\s+/).length : 0;
+	const clauses = normalized
+		.split(/[.;:,\n]+/g)
+		.map((item) => item.trim())
+		.filter((item) => item.length > 0).length;
+	const pathLikeMatches = normalized.match(/\b(?:[A-Za-z0-9_.-]+\/)+[A-Za-z0-9_.-]+\b/g) ?? [];
+	const fileLikeMatches = normalized.match(/\b[A-Za-z0-9_.-]+\.[A-Za-z0-9]{1,8}\b/g) ?? [];
+	const listMarkers = text.match(/(?:^|\n)\s*(?:[-*]|\d+[.)])\s+/g)?.length ?? 0;
+	const hasCodeBlock = text.includes("```");
+
+	let score = 0;
+	if (words >= 40) {
+		score += 2;
+	} else if (words >= 20) {
+		score += 1;
+	}
+	if (clauses >= 5) {
+		score += 2;
+	} else if (clauses >= 3) {
+		score += 1;
+	}
+	if (listMarkers >= 2) {
+		score += 1;
+	}
+	const referenceCount = pathLikeMatches.length + fileLikeMatches.length;
+	if (referenceCount >= 3 || (referenceCount >= 1 && words >= 20)) {
+		score += 1;
+	}
+	if (hasCodeBlock) {
+		score += 1;
+	}
+
+	if (score >= 6) return 10;
+	if (score >= 5) return 8;
+	if (score >= 4) return 6;
+	if (score >= 3) return 4;
+	if (score >= 2) return 3;
+	if (score >= 1) return 2;
+	return 1;
 }
 
 function normalizeSpacing(text: string): string {
@@ -337,7 +423,19 @@ function isAbortError(error: unknown): boolean {
 	return false;
 }
 
-function buildDelegationProtocolPrompt(depthRemaining: number): string {
+function mergeRunStats(
+	base: SubagentRunResult["stats"] | undefined,
+	next: SubagentRunResult["stats"] | undefined,
+): SubagentRunResult["stats"] | undefined {
+	if (!base && !next) return undefined;
+	return {
+		toolCallsStarted: (base?.toolCallsStarted ?? 0) + (next?.toolCallsStarted ?? 0),
+		toolCallsCompleted: (base?.toolCallsCompleted ?? 0) + (next?.toolCallsCompleted ?? 0),
+		assistantMessages: (base?.assistantMessages ?? 0) + (next?.assistantMessages ?? 0),
+	};
+}
+
+function buildDelegationProtocolPrompt(depthRemaining: number, maxDelegations: number): string {
 	if (depthRemaining <= 0) {
 		return [
 			`Delegation protocol: depth limit reached.`,
@@ -345,17 +443,32 @@ function buildDelegationProtocolPrompt(depthRemaining: number): string {
 		].join("\n");
 	}
 	return [
-		`Delegation protocol (optional): if you discover a concrete follow-up that is better done by a separate specialist, emit up to ${maxDelegationsPerTaskFromEnv} XML block(s):`,
-		`<${delegationTagName} profile="explore|plan|iosm|iosm_analyst|iosm_verifier|cycle_planner|full" description="short title" cwd="optional relative path" lock_key="optional lock key" model="optional model override" isolation="none|worktree" depends_on="optional indices like 1|3">`,
+		`Delegation protocol (optional): if you discover concrete independent follow-ups, emit up to ${maxDelegations} XML block(s):`,
+		`<${delegationTagName} profile="explore|plan|iosm|iosm_analyst|iosm_verifier|cycle_planner|full" agent="optional custom subagent name" description="short title" cwd="optional relative path" lock_key="optional lock key" model="optional model override" isolation="none|worktree" depends_on="optional indices like 1|3">`,
 		"Detailed delegated task prompt",
 		`</${delegationTagName}>`,
 		`Only emit blocks when necessary. Keep normal analysis/answer text outside those blocks.`,
+		`When shared_memory tools are available, exchange intermediate state through shared_memory_write/shared_memory_read instead of repeating large context.`,
 	].join("\n");
 }
 
-function withDelegationPrompt(basePrompt: string, depthRemaining: number): string {
-	const protocol = buildDelegationProtocolPrompt(depthRemaining);
+function withDelegationPrompt(basePrompt: string, depthRemaining: number, maxDelegations: number): string {
+	const protocol = buildDelegationProtocolPrompt(depthRemaining, maxDelegations);
 	return `${basePrompt}\n\n${protocol}`;
+}
+
+function buildSharedMemoryGuidance(runId: string, taskId: string | undefined): string {
+	return [
+		"[SHARED_MEMORY]",
+		`run_id: ${runId}`,
+		`task_id: ${taskId ?? "(none)"}`,
+		"Use shared_memory_write/shared_memory_read to exchange intermediate state across parallel agents and delegates.",
+		"Guidelines:",
+		"- Use scope=run for cross-agent data and scope=task for task-local notes.",
+		"- Keep entries compact and key-based (for example: findings/auth, plan/step-1, risks/session).",
+		"- Read before overwrite when collaborating on the same key.",
+		"[/SHARED_MEMORY]",
+	].join("\n");
 }
 
 function parseDelegationRequests(output: string, maxRequests: number): ParsedDelegationRequests {
@@ -398,6 +511,7 @@ function parseDelegationRequests(output: string, maxRequests: number): ParsedDel
 		requests.push({
 			description: (attrs.description ?? `delegated task ${requests.length + 1}`).trim(),
 			profile,
+			agent: attrs.agent?.trim() || undefined,
 			prompt,
 			cwd: attrs.cwd?.trim() || undefined,
 			lockKey: attrs.lock_key?.trim() || undefined,
@@ -434,6 +548,14 @@ function getOrCreateWriteLock(cwd: string): Mutex {
 	return created;
 }
 
+function cleanupWriteLock(lockKey: string | undefined): void {
+	if (!lockKey) return;
+	const key = getCwdLockKey(lockKey);
+	const existing = cwdWriteLocks.get(key);
+	if (!existing || !existing.isIdle()) return;
+	cwdWriteLocks.delete(key);
+}
+
 function getRunParallelLimit(cwd: string, runId: string): number | undefined {
 	const teamRun = getTeamRun(cwd, runId);
 	if (!teamRun) return undefined;
@@ -454,6 +576,108 @@ function getOrCreateOrchestrationSemaphore(cwd: string, runId: string): Semaphor
 	const created = new Semaphore(limit);
 	orchestrationSemaphores.set(key, created);
 	return created;
+}
+
+function isTeamTaskTerminal(status: string | undefined): boolean {
+	return status === "done" || status === "error" || status === "cancelled";
+}
+
+function cleanupOrchestrationSemaphore(cwd: string, runId: string): void {
+	const prefix = `${path.resolve(cwd).toLowerCase()}::${runId}::`;
+	const run = getTeamRun(cwd, runId);
+	const canDeleteForRun = !run || run.tasks.every((task) => isTeamTaskTerminal(task.status));
+	if (!canDeleteForRun) return;
+	for (const [key, semaphore] of orchestrationSemaphores.entries()) {
+		if (!key.startsWith(prefix)) continue;
+		if (!semaphore.isIdle()) continue;
+		orchestrationSemaphores.delete(key);
+	}
+}
+
+function waitForWithAbort(ms: number, signal?: AbortSignal): Promise<void> {
+	if (!signal) {
+		return new Promise((resolve) => setTimeout(resolve, ms));
+	}
+	if (signal.aborted) {
+		return Promise.reject(new Error("Operation aborted"));
+	}
+	return new Promise((resolve, reject) => {
+		const timer = setTimeout(() => {
+			signal.removeEventListener("abort", onAbort);
+			resolve();
+		}, ms);
+		const onAbort = (): void => {
+			clearTimeout(timer);
+			signal.removeEventListener("abort", onAbort);
+			reject(new Error("Operation aborted"));
+		};
+		signal.addEventListener("abort", onAbort, { once: true });
+	});
+}
+
+async function waitForOrchestrationDependencies(input: {
+	cwd: string;
+	runId: string;
+	taskId: string;
+	signal?: AbortSignal;
+	onWaiting?: (message: string) => void;
+}): Promise<void> {
+	const started = Date.now();
+	let lastWaiting = "";
+	while (true) {
+		if (input.signal?.aborted) {
+			throw new Error("Operation aborted");
+		}
+		const run = getTeamRun(input.cwd, input.runId);
+		if (!run) {
+			return;
+		}
+		const current = run.tasks.find((task) => task.id === input.taskId);
+		if (!current) {
+			throw new Error(`Orchestration metadata missing task ${input.taskId} in run ${input.runId}.`);
+		}
+		const dependencies = current.dependsOn ?? [];
+		if (dependencies.length === 0) {
+			return;
+		}
+		const dependencyTasks = dependencies.map((id) => run.tasks.find((task) => task.id === id));
+		const missing = dependencyTasks
+			.map((task, index) => (task ? undefined : dependencies[index]))
+			.filter((value): value is string => typeof value === "string");
+		if (missing.length > 0) {
+			throw new Error(
+				`Orchestration metadata invalid for ${input.taskId}: missing dependency task(s) ${missing.join(", ")}.`,
+			);
+		}
+		const failed = dependencyTasks.filter(
+			(task): task is NonNullable<typeof task> => !!task && (task.status === "error" || task.status === "cancelled"),
+		);
+		if (failed.length > 0) {
+			throw new Error(
+				`Blocked by failed dependency: ${failed.map((task) => `${task.id}=${task.status}`).join(", ")}.`,
+			);
+		}
+		const pending = dependencyTasks.filter(
+			(task): task is NonNullable<typeof task> => !!task && task.status !== "done",
+		);
+		if (pending.length === 0) {
+			return;
+		}
+		const waitedMs = Date.now() - started;
+		if (waitedMs >= orchestrationDependencyWaitTimeoutMsFromEnv) {
+			throw new Error(
+				`Timed out waiting for dependencies of ${input.taskId}: ${pending
+					.map((task) => `${task.id}=${task.status}`)
+					.join(", ")}.`,
+			);
+		}
+		const waiting = pending.map((task) => `${task.id}=${task.status}`).join(", ");
+		if (waiting !== lastWaiting) {
+			lastWaiting = waiting;
+			input.onWaiting?.(waiting);
+		}
+		await waitForWithAbort(orchestrationDependencyPollMsFromEnv, input.signal);
+	}
 }
 
 function persistSubagentTranscript(input: {
@@ -508,7 +732,7 @@ function persistSubagentTranscript(input: {
 
 type BackgroundRunStatus = {
 	runId: string;
-	status: "queued" | "running" | "done" | "error";
+	status: "queued" | "running" | "done" | "error" | "cancelled";
 	createdAt: string;
 	startedAt?: string;
 	finishedAt?: string;
@@ -637,28 +861,62 @@ export function createTaskTool(
 				model: requestedModel,
 				background,
 				isolation,
+				delegate_parallel_hint: delegateParallelHint,
 			}: TaskToolInput,
 			_signal?: AbortSignal,
 			onUpdate?,
 		) => {
+			const updateTrackedTaskStatus = (status: "running" | "done" | "error" | "cancelled"): void => {
+				if (!orchestrationRunId || !orchestrationTaskId) return;
+				updateTeamTaskStatus({
+					cwd,
+					runId: orchestrationRunId,
+					taskId: orchestrationTaskId,
+					status,
+				});
+			};
 			const throwIfAborted = (): void => {
 				if (_signal?.aborted) {
+					updateTrackedTaskStatus("cancelled");
 					throw new Error("Operation aborted");
 				}
 			};
 
-			const runId = `subagent_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
-			const customSubagent =
-				agentName && options?.resolveCustomSubagent ? options.resolveCustomSubagent(agentName) : undefined;
-			if (agentName && !customSubagent) {
-				const available =
-					options?.availableCustomSubagents && options.availableCustomSubagents.length > 0
-						? ` Available custom agents: ${options.availableCustomSubagents.join(", ")}.`
-						: "";
-				throw new Error(`Unknown subagent: ${agentName}.${available}`);
-			}
+				const runId = `subagent_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
+				const sharedMemoryRunId = orchestrationRunId?.trim() || runId;
+				const sharedMemoryTaskId = orchestrationTaskId?.trim() || runId;
+				const availableCustomNames = options?.availableCustomSubagents ?? [];
+				const resolveCustom = (name: string | undefined): CustomSubagentDefinition | undefined => {
+					if (!name || !options?.resolveCustomSubagent) return undefined;
+					return options.resolveCustomSubagent(name);
+				};
 
-			const effectiveProfile = customSubagent?.profile ?? profile;
+				let normalizedAgentName = agentName?.trim() || undefined;
+				let normalizedProfile = profile.trim().toLowerCase();
+				if (!normalizedProfile) normalizedProfile = "full";
+
+				let customSubagent = resolveCustom(normalizedAgentName);
+				if (normalizedAgentName && !customSubagent) {
+					const available =
+						availableCustomNames.length > 0 ? ` Available custom agents: ${availableCustomNames.join(", ")}.` : "";
+					throw new Error(`Unknown subagent: ${normalizedAgentName}.${available}`);
+				}
+
+				// Recovery path: if model placed a custom agent name into `profile`, remap automatically.
+				if (!customSubagent) {
+					const profileAsAgent = resolveCustom(normalizedProfile);
+					if (profileAsAgent) {
+						customSubagent = profileAsAgent;
+						normalizedAgentName = profileAsAgent.name;
+						normalizedProfile = (profileAsAgent.profile ?? "full").trim().toLowerCase();
+					}
+				}
+
+				if (!toolsByProfile[normalizedProfile]) {
+					normalizedProfile = "full";
+				}
+
+				const effectiveProfile = customSubagent?.profile ?? normalizedProfile;
 			let tools = customSubagent?.tools
 				? [...customSubagent.tools]
 				: [...(toolsByProfile[effectiveProfile] ?? toolsByProfile.explore)];
@@ -667,11 +925,32 @@ export function createTaskTool(
 				tools = tools.filter((tool) => !blocked.has(tool));
 			}
 			const delegationDepth = maxDelegationDepthFromEnv;
+			const requestedDelegateParallelHint =
+				typeof delegateParallelHint === "number" && Number.isInteger(delegateParallelHint)
+					? Math.max(1, Math.min(10, delegateParallelHint))
+					: undefined;
+				const autoDelegateParallelHint =
+					requestedDelegateParallelHint === undefined
+						? deriveAutoDelegateParallelHint(normalizedAgentName, description, prompt)
+						: undefined;
+			const effectiveDelegateParallelHint = requestedDelegateParallelHint ?? autoDelegateParallelHint;
+			const effectiveMaxDelegations = Math.max(
+				0,
+				Math.min(maxDelegationsPerTaskFromEnv, effectiveDelegateParallelHint ?? maxDelegationsPerTaskFromEnv),
+			);
+			const effectiveMaxDelegateParallel = Math.max(
+				1,
+				Math.min(maxDelegatedParallelFromEnv, effectiveDelegateParallelHint ?? maxDelegatedParallelFromEnv),
+			);
+			const minDelegationsPreferred =
+				(effectiveDelegateParallelHint ?? 0) >= 2 && effectiveMaxDelegations >= 2
+					? Math.min(2, effectiveMaxDelegations)
+					: 0;
 			const baseSystemPrompt =
 				customSubagent?.systemPrompt ??
 				systemPromptByProfile[effectiveProfile] ??
 				systemPromptByProfile.full;
-			const systemPrompt = withDelegationPrompt(baseSystemPrompt, delegationDepth);
+			const systemPrompt = withDelegationPrompt(baseSystemPrompt, delegationDepth, effectiveMaxDelegations);
 			const promptWithInstructions =
 				customSubagent?.instructions && customSubagent.instructions.trim().length > 0
 					? `${customSubagent.instructions.trim()}\n\nUser task:\n${prompt}`
@@ -748,11 +1027,56 @@ export function createTaskTool(
 				let releaseSlot: (() => void) | undefined;
 				let releaseWriteLock: (() => void) | undefined;
 				let releaseIsolation: (() => void) | undefined;
+				const explicitRootLockKey = lockKey?.trim();
 				let subagentCwd = requestedSubagentCwd;
 				let worktreePath: string | undefined;
 				let runStats: SubagentRunResult["stats"] | undefined;
 				try {
 					throwIfAborted();
+					if (orchestrationRunId && orchestrationTaskId) {
+						try {
+							await waitForOrchestrationDependencies({
+								cwd,
+								runId: orchestrationRunId,
+								taskId: orchestrationTaskId,
+								signal: _signal,
+								onWaiting: (waiting) => {
+									emitProgress({
+										kind: "subagent_progress",
+										phase: "queued",
+										message: `waiting for dependencies: ${waiting}`,
+										cwd: requestedSubagentCwd,
+										activeTool: undefined,
+									});
+								},
+							});
+							} catch (error) {
+								if (_signal?.aborted || isAbortError(error)) {
+									updateTrackedTaskStatus("cancelled");
+									throw new Error("Operation aborted");
+								}
+								const message = error instanceof Error ? error.message : String(error);
+								const cause = classifyFailureCause(message);
+								updateTrackedTaskStatus("error");
+								const details: TaskToolDetails = {
+									profile: effectiveProfile,
+									description,
+									outputLength: 0,
+									cwd: requestedSubagentCwd,
+									agent: customSubagent?.name,
+									lockKey: lockKey?.trim() || undefined,
+									runId,
+									taskId: orchestrationTaskId,
+									model: effectiveModelOverride,
+									isolation: useWorktree ? "worktree" : "none",
+									worktreePath,
+									waitMs: Date.now() - queuedAt,
+									background: runInBackground,
+									failureCauses: { [cause]: 1 },
+								};
+								throw Object.assign(new Error(`Subagent failed: ${message}`), { details });
+							}
+						}
 					const orchestrationSemaphore =
 						orchestrationRunId && orchestrationTaskId
 							? getOrCreateOrchestrationSemaphore(cwd, orchestrationRunId)
@@ -763,20 +1087,12 @@ export function createTaskTool(
 					}
 					releaseSlot = await subagentSemaphore.acquire();
 					throwIfAborted();
-					if (orchestrationRunId && orchestrationTaskId) {
-						updateTeamTaskStatus({
-							cwd,
-							runId: orchestrationRunId,
-							taskId: orchestrationTaskId,
-							status: "running",
-						});
-					}
+					updateTrackedTaskStatus("running");
 					if (writeCapableProfiles.has(effectiveProfile)) {
-						const explicitLockKey = lockKey?.trim();
 						// Parallel orchestration should remain truly parallel by default.
 						// Serialize write-capable agents only when an explicit lock_key is provided.
-						if (explicitLockKey) {
-							const lock = getOrCreateWriteLock(explicitLockKey);
+						if (explicitRootLockKey) {
+							const lock = getOrCreateWriteLock(explicitRootLockKey);
 							releaseWriteLock = await lock.acquire();
 						}
 					}
@@ -794,24 +1110,128 @@ export function createTaskTool(
 						activeTool: undefined,
 					});
 
-					let output: string;
-					let subagentSessionId: string | undefined;
-					let delegatedTasks = 0;
-					let delegatedSucceeded = 0;
-					let delegatedFailed = 0;
-					const delegationWarnings: string[] = [];
-					const delegatedSections: Array<string | undefined> = [];
-					const delegatedStats = {
-						toolCallsStarted: 0,
-						toolCallsCompleted: 0,
-						assistantMessages: 0,
-					};
-					try {
-						const rootMeta = formatMetaCheckpoint(options?.getMetaMessages?.());
-						const rootPrompt =
-							rootMeta.section && rootMeta.appliedCount > 0
-								? `${promptWithInstructions}\n\n${rootMeta.section}`
-								: promptWithInstructions;
+						let output: string;
+						let subagentSessionId: string | undefined;
+						let delegatedTasks = 0;
+						let delegatedSucceeded = 0;
+						let delegatedFailed = 0;
+						let retrospectiveAttempts = 0;
+						let retrospectiveRecovered = 0;
+						const delegationWarnings: string[] = [];
+						const delegatedSections: Array<string | undefined> = [];
+						const failureCauses: Partial<Record<FailureCause, number>> = {};
+						const delegatedStats = {
+							toolCallsStarted: 0,
+							toolCallsCompleted: 0,
+							assistantMessages: 0,
+						};
+						const recordFailureCause = (cause: FailureCause): void => {
+							failureCauses[cause] = (failureCauses[cause] ?? 0) + 1;
+						};
+						const rootSharedMemoryContext: SharedMemoryContext = {
+							rootCwd: cwd,
+							runId: sharedMemoryRunId,
+							taskId: sharedMemoryTaskId,
+							profile: effectiveProfile,
+						};
+						try {
+							const runRootPass = async (runPrompt: string): Promise<{
+								output: string;
+								sessionId?: string;
+								stats?: SubagentRunResult["stats"];
+							}> => {
+								let emptyAttempt = 0;
+								let retrospectiveAttempt = 0;
+								let mergedStats: SubagentRunResult["stats"] | undefined;
+								let sessionId: string | undefined;
+								let promptForAttempt = runPrompt;
+								while (true) {
+									try {
+										const result = await runner({
+											systemPrompt,
+											tools,
+											prompt: promptForAttempt,
+											cwd: subagentCwd,
+											modelOverride: effectiveModelOverride,
+											sharedMemoryContext: rootSharedMemoryContext,
+											signal: _signal,
+											onProgress: (progress) => emitProgress(progress),
+										});
+										throwIfAborted();
+
+										let attemptOutput: string;
+										let attemptStats: SubagentRunResult["stats"] | undefined;
+										if (typeof result === "string") {
+											attemptOutput = result;
+										} else {
+											attemptOutput = result.output;
+											attemptStats = result.stats;
+											sessionId = result.sessionId ?? sessionId;
+										}
+										mergedStats = mergeRunStats(mergedStats, attemptStats);
+										if (attemptOutput.trim().length > 0) {
+											if (retrospectiveAttempt > 0) {
+												retrospectiveRecovered += 1;
+											}
+											return {
+												output: attemptOutput,
+												sessionId,
+												stats: mergedStats,
+											};
+										}
+										if (emptyAttempt >= emptyOutputRetriesFromEnv) {
+											const totalAttempts = emptyAttempt + 1;
+											throw new Error(
+												`Subagent returned empty output after ${totalAttempts} attempt${totalAttempts === 1 ? "" : "s"}.`,
+											);
+										}
+										emptyAttempt += 1;
+										emitProgress({
+											kind: "subagent_progress",
+											phase: "running",
+											message: `root subagent returned empty output; retry ${emptyAttempt}/${emptyOutputRetriesFromEnv}`,
+											cwd: subagentCwd,
+											activeTool: undefined,
+										});
+									} catch (error) {
+										if (_signal?.aborted || isAbortError(error)) {
+											throw new Error("Operation aborted");
+										}
+										const message = error instanceof Error ? error.message : String(error);
+										const cause = classifyFailureCause(message);
+										recordFailureCause(cause);
+										const canRetryRetrospective =
+											retrospectiveAttempt < retrospectiveRetriesFromEnv && isRetrospectiveRetryable(cause);
+										if (!canRetryRetrospective) {
+											throw Object.assign(new Error(message), { failureCause: cause as FailureCause });
+										}
+										retrospectiveAttempt += 1;
+										retrospectiveAttempts += 1;
+										const directive = buildRetrospectiveDirective({
+											cause,
+											errorMessage: message,
+											attempt: retrospectiveAttempt,
+											target: "root",
+										});
+										promptForAttempt = `${runPrompt}\n\n${directive}`;
+										emitProgress({
+											kind: "subagent_progress",
+											phase: "running",
+											message: `root retrospective retry ${retrospectiveAttempt}/${retrospectiveRetriesFromEnv} (${cause})`,
+											cwd: subagentCwd,
+											activeTool: undefined,
+										});
+									}
+								}
+							};
+
+							const rootMeta = formatMetaCheckpoint(options?.getMetaMessages?.());
+							const rootSharedMemoryGuidance = buildSharedMemoryGuidance(sharedMemoryRunId, sharedMemoryTaskId);
+							const rootPromptBase = `${promptWithInstructions}\n\n${rootSharedMemoryGuidance}`;
+							const rootPrompt =
+								rootMeta.section && rootMeta.appliedCount > 0
+									? `${rootPromptBase}\n\n${rootMeta.section}`
+									: rootPromptBase;
 						if (rootMeta.appliedCount > 0) {
 							emitProgress({
 								kind: "subagent_progress",
@@ -821,28 +1241,51 @@ export function createTaskTool(
 								activeTool: undefined,
 							});
 						}
-						const result = await runner({
-							systemPrompt,
-							tools,
-							prompt: rootPrompt,
-							cwd: subagentCwd,
-							modelOverride: effectiveModelOverride,
-							signal: _signal,
-							onProgress: (progress) => emitProgress(progress),
-						});
-						throwIfAborted();
-						if (typeof result === "string") {
-							output = result;
-						} else {
-							output = result.output;
-							subagentSessionId = result.sessionId;
-							runStats = result.stats;
+						const firstPass = await runRootPass(rootPrompt);
+						output = firstPass.output;
+						subagentSessionId = firstPass.sessionId;
+						runStats = firstPass.stats;
+
+						let parsedDelegation = parseDelegationRequests(
+							output,
+							delegationDepth > 0 ? effectiveMaxDelegations : 0,
+						);
+						if (minDelegationsPreferred > 0 && parsedDelegation.requests.length < minDelegationsPreferred) {
+							emitProgress({
+								kind: "subagent_progress",
+								phase: "running",
+								message: `delegation preference unmet (${parsedDelegation.requests.length}/${minDelegationsPreferred}), retrying with stronger split guidance`,
+								cwd: subagentCwd,
+								activeTool: undefined,
+							});
+							const enforcedPrompt = [
+								rootPrompt,
+								"",
+								"[DELEGATION_ENFORCEMENT]",
+								`Prefer emitting at least ${minDelegationsPreferred} <delegate_task> blocks for independent sub-work when beneficial.`,
+								`Target parallel fan-out: up to ${effectiveMaxDelegateParallel}.`,
+								"If decomposition is not beneficial, you may keep single-agent execution and optionally output one line:",
+								"DELEGATION_IMPOSSIBLE: <reason>",
+								"[/DELEGATION_ENFORCEMENT]",
+							].join("\n");
+							const secondPass = await runRootPass(enforcedPrompt);
+							output = secondPass.output;
+							subagentSessionId = secondPass.sessionId ?? subagentSessionId;
+							runStats = secondPass.stats ?? runStats;
+							parsedDelegation = parseDelegationRequests(
+								output,
+								delegationDepth > 0 ? effectiveMaxDelegations : 0,
+							);
 						}
 
-						const parsedDelegation = parseDelegationRequests(
-							output,
-							delegationDepth > 0 ? maxDelegationsPerTaskFromEnv : 0,
-						);
+						if (minDelegationsPreferred > 0 && parsedDelegation.requests.length < minDelegationsPreferred) {
+							const impossibleReason =
+								output.match(/^\s*DELEGATION_IMPOSSIBLE\s*:\s*(.+)$/im)?.[1]?.trim() ?? "not provided";
+							delegationWarnings.push(
+								`Delegation fallback: kept single-agent execution (preferred >=${minDelegationsPreferred} delegates, got ${parsedDelegation.requests.length}). Reason: ${impossibleReason}.`,
+							);
+						}
+
 						output = parsedDelegation.cleanedOutput;
 						delegationWarnings.push(...parsedDelegation.warnings);
 						const delegateTotal = parsedDelegation.requests.length;
@@ -869,38 +1312,47 @@ export function createTaskTool(
 						});
 						delegatedTasks += delegateTotal;
 						if (delegateTotal > 0) {
-							emitProgress({
-								kind: "subagent_progress",
-								phase: "running",
-								message: `delegation scheduler: ${delegateTotal} task(s), max parallel ${Math.min(delegateTotal, maxDelegatedParallelFromEnv)}`,
-								cwd: subagentCwd,
-								activeTool: undefined,
-								delegateTotal,
-								delegateItems,
-							});
-						}
+								emitProgress({
+									kind: "subagent_progress",
+									phase: "running",
+									message: `delegation scheduler: ${delegateTotal} task(s), max parallel ${Math.min(delegateTotal, effectiveMaxDelegateParallel)}`,
+									cwd: subagentCwd,
+									activeTool: undefined,
+									delegateTotal,
+									delegateItems,
+								});
+							}
 
 						const pendingIndices = new Set<number>(Array.from({ length: delegateTotal }, (_v, i) => i));
 						const runningDelegates = new Map<number, Promise<void>>();
-						const maxDelegateParallel = Math.max(1, Math.min(delegateTotal || 1, maxDelegatedParallelFromEnv));
+						const maxDelegateParallel = Math.max(1, Math.min(delegateTotal || 1, effectiveMaxDelegateParallel));
 
 						const statusOf = (idx: number): TaskDelegateProgressStatus =>
 							delegateItems[idx]?.status ?? "pending";
+						const formatDelegateTarget = (request: DelegationRequest): string => {
+							const agent = request.agent?.trim();
+							return agent ? `${agent}/${request.profile}` : request.profile;
+						};
 
-						const markDelegateFailed = (index: number, message: string, details?: string): void => {
-							const request = parsedDelegation.requests[index];
-							if (delegateItems[index]) {
-								delegateItems[index].status = "failed";
-							}
-							delegatedFailed += 1;
-							if (details) {
-								delegationWarnings.push(details);
-							}
-							delegatedSections[index] =
-								`#### ${index + 1}. ${request.description} (${request.profile})\nERROR: ${message}`;
-							emitProgress({
-								kind: "subagent_progress",
-								phase: "running",
+							const markDelegateFailed = (
+								index: number,
+								message: string,
+								details?: string,
+								cause?: FailureCause,
+							): void => {
+								const request = parsedDelegation.requests[index];
+								if (delegateItems[index]) {
+									delegateItems[index].status = "failed";
+								}
+								delegatedFailed += 1;
+								if (details) {
+									delegationWarnings.push(cause ? `${details} [cause=${cause}]` : details);
+								}
+								const causeLabel = cause ? ` [cause=${cause}]` : "";
+								delegatedSections[index] = `#### ${index + 1}. ${request.description} (${formatDelegateTarget(request)})\nERROR${causeLabel}: ${message}`;
+								emitProgress({
+									kind: "subagent_progress",
+									phase: "running",
 								message,
 								cwd: subagentCwd,
 								activeTool: undefined,
@@ -915,7 +1367,22 @@ export function createTaskTool(
 						const runDelegate = async (index: number): Promise<void> => {
 							throwIfAborted();
 							const request = parsedDelegation.requests[index];
-							const childProfile = request.profile;
+							const requestedChildAgent = request.agent?.trim() || undefined;
+							const childCustomSubagent = resolveCustom(requestedChildAgent);
+							if (requestedChildAgent && !childCustomSubagent) {
+								delegationWarnings.push(
+									`Delegated task "${request.description}" requested unknown agent "${requestedChildAgent}". Falling back to profile "${request.profile}".`,
+								);
+							}
+							const childProfileRaw = childCustomSubagent?.profile ?? request.profile;
+							const normalizedChildProfile = childProfileRaw.trim().toLowerCase();
+							const childProfile =
+								normalizedChildProfile && toolsByProfile[normalizedChildProfile]
+									? normalizedChildProfile
+									: "full";
+							const childProfileLabel = childCustomSubagent?.name
+								? `${childCustomSubagent.name}/${childProfile}`
+								: childProfile;
 							if (delegateItems[index]) {
 								delegateItems[index].status = "running";
 							}
@@ -928,33 +1395,46 @@ export function createTaskTool(
 								delegateIndex: index + 1,
 								delegateTotal,
 								delegateDescription: request.description,
-								delegateProfile: childProfile,
+								delegateProfile: childProfileLabel,
 								delegateItems,
 							});
 
-							const childTools = [...(toolsByProfile[childProfile] ?? toolsByProfile.explore)];
+							let childTools = childCustomSubagent?.tools
+								? [...childCustomSubagent.tools]
+								: [...(toolsByProfile[childProfile] ?? toolsByProfile.explore)];
+							if (childCustomSubagent?.disallowedTools?.length) {
+								const blocked = new Set(childCustomSubagent.disallowedTools);
+								childTools = childTools.filter((tool) => !blocked.has(tool));
+							}
 							const childBaseSystemPrompt =
-								systemPromptByProfile[childProfile] ?? systemPromptByProfile.full;
+								childCustomSubagent?.systemPrompt ??
+								systemPromptByProfile[childProfile] ??
+								systemPromptByProfile.full;
 							const childSystemPrompt = withDelegationPrompt(
 								childBaseSystemPrompt,
 								Math.max(0, delegationDepth - 1),
+								effectiveMaxDelegations,
 							);
-							const requestedChildCwd = request.cwd ? path.resolve(subagentCwd, request.cwd) : subagentCwd;
-							if (!existsSync(requestedChildCwd) || !statSync(requestedChildCwd).isDirectory()) {
-								markDelegateFailed(
-									index,
-									`delegate ${index + 1}/${delegateTotal} skipped: missing cwd`,
-									`Delegated task "${request.description}" skipped: cwd does not exist (${requestedChildCwd}).`,
-								);
-								return;
-							}
+								const requestedChildCwd = request.cwd
+									? path.resolve(subagentCwd, request.cwd)
+									: childCustomSubagent?.cwd ?? subagentCwd;
+								if (!existsSync(requestedChildCwd) || !statSync(requestedChildCwd).isDirectory()) {
+									recordFailureCause("dependency_env");
+									markDelegateFailed(
+										index,
+										`delegate ${index + 1}/${delegateTotal} skipped: missing cwd`,
+										`Delegated task "${request.description}" skipped: cwd does not exist (${requestedChildCwd}).`,
+										"dependency_env",
+									);
+									return;
+								}
 
 							let childReleaseLock: (() => void) | undefined;
 							let childReleaseIsolation: (() => void) | undefined;
+							const explicitChildLock = request.lockKey?.trim();
 							let childCwd = requestedChildCwd;
 							try {
 								throwIfAborted();
-								const explicitChildLock = request.lockKey?.trim();
 								if (writeCapableProfiles.has(childProfile) && explicitChildLock) {
 									const lock = getOrCreateWriteLock(explicitChildLock);
 									childReleaseLock = await lock.acquire();
@@ -966,14 +1446,23 @@ export function createTaskTool(
 									childReleaseIsolation = isolated.cleanup;
 								}
 
-								const delegateMeta = formatMetaCheckpoint(options?.getMetaMessages?.());
-								const delegatePrompt =
-									delegateMeta.section && delegateMeta.appliedCount > 0
-										? `${request.prompt}\n\n${delegateMeta.section}`
-										: request.prompt;
-								if (delegateMeta.appliedCount > 0) {
-									emitProgress({
-										kind: "subagent_progress",
+									const delegateMeta = formatMetaCheckpoint(options?.getMetaMessages?.());
+									const childPromptWithInstructions =
+										childCustomSubagent?.instructions && childCustomSubagent.instructions.trim().length > 0
+											? `${childCustomSubagent.instructions.trim()}\n\nUser task:\n${request.prompt}`
+											: request.prompt;
+									const delegateSharedMemoryGuidance = buildSharedMemoryGuidance(
+										sharedMemoryRunId,
+										sharedMemoryTaskId,
+									);
+									const delegatePromptBase = `${childPromptWithInstructions}\n\n${delegateSharedMemoryGuidance}`;
+									const delegatePrompt =
+										delegateMeta.section && delegateMeta.appliedCount > 0
+											? `${delegatePromptBase}\n\n${delegateMeta.section}`
+											: delegatePromptBase;
+									if (delegateMeta.appliedCount > 0) {
+										emitProgress({
+											kind: "subagent_progress",
 										phase: "running",
 										message: `delegate ${index + 1}/${delegateTotal}: applied ${delegateMeta.appliedCount} meta update(s)`,
 										cwd: childCwd,
@@ -981,43 +1470,121 @@ export function createTaskTool(
 										delegateIndex: index + 1,
 										delegateTotal,
 										delegateDescription: request.description,
-										delegateProfile: childProfile,
+										delegateProfile: childProfileLabel,
 										delegateItems,
 									});
 								}
+									const childModelOverride = request.model?.trim() || childCustomSubagent?.model?.trim() || undefined;
+									const childSharedMemoryContext: SharedMemoryContext = {
+										rootCwd: cwd,
+										runId: sharedMemoryRunId,
+										taskId: sharedMemoryTaskId,
+										delegateId: String(index + 1),
+										profile: childProfile,
+									};
 
-								const childResult = await runner({
-									systemPrompt: childSystemPrompt,
-									tools: childTools,
-									prompt: delegatePrompt,
-									cwd: childCwd,
-									modelOverride: request.model,
-									signal: _signal,
-									onProgress: (progress) => {
-										emitProgress({
-											kind: "subagent_progress",
-											phase: "running",
-											message: `delegate ${index + 1}/${delegateTotal}: ${progress.message}`,
-											cwd: progress.cwd ?? childCwd,
-											activeTool: progress.activeTool,
-											delegateIndex: index + 1,
-											delegateTotal,
-											delegateDescription: request.description,
-											delegateProfile: childProfile,
-											delegateItems,
-										});
-									},
-								});
-								throwIfAborted();
-
-								let childOutput: string;
-								let childStats: SubagentRunResult["stats"] | undefined;
-								if (typeof childResult === "string") {
-									childOutput = childResult;
-								} else {
-									childOutput = childResult.output;
-									childStats = childResult.stats;
-								}
+									let childOutput = "";
+									let childStats: SubagentRunResult["stats"] | undefined;
+									let childEmptyAttempt = 0;
+									let childRetrospectiveAttempt = 0;
+									let childPromptForAttempt = delegatePrompt;
+									while (true) {
+										try {
+											const childResult = await runner({
+												systemPrompt: childSystemPrompt,
+												tools: childTools,
+												prompt: childPromptForAttempt,
+												cwd: childCwd,
+												modelOverride: childModelOverride,
+												sharedMemoryContext: childSharedMemoryContext,
+												signal: _signal,
+												onProgress: (progress) => {
+													emitProgress({
+														kind: "subagent_progress",
+														phase: "running",
+														message: `delegate ${index + 1}/${delegateTotal}: ${progress.message}`,
+														cwd: progress.cwd ?? childCwd,
+														activeTool: progress.activeTool,
+														delegateIndex: index + 1,
+														delegateTotal,
+														delegateDescription: request.description,
+														delegateProfile: childProfileLabel,
+														delegateItems,
+													});
+												},
+											});
+											throwIfAborted();
+											let attemptOutput: string;
+											let attemptStats: SubagentRunResult["stats"] | undefined;
+											if (typeof childResult === "string") {
+												attemptOutput = childResult;
+											} else {
+												attemptOutput = childResult.output;
+												attemptStats = childResult.stats;
+											}
+											childStats = mergeRunStats(childStats, attemptStats);
+											if (attemptOutput.trim().length > 0) {
+												childOutput = attemptOutput;
+												if (childRetrospectiveAttempt > 0) {
+													retrospectiveRecovered += 1;
+												}
+												break;
+											}
+											if (childEmptyAttempt >= emptyOutputRetriesFromEnv) {
+												const totalAttempts = childEmptyAttempt + 1;
+												throw new Error(
+													`delegate ${index + 1}/${delegateTotal} returned empty output after ${totalAttempts} attempt${totalAttempts === 1 ? "" : "s"}.`,
+												);
+											}
+											childEmptyAttempt += 1;
+											emitProgress({
+												kind: "subagent_progress",
+												phase: "running",
+												message: `delegate ${index + 1}/${delegateTotal}: empty output, retry ${childEmptyAttempt}/${emptyOutputRetriesFromEnv}`,
+												cwd: childCwd,
+												activeTool: undefined,
+												delegateIndex: index + 1,
+												delegateTotal,
+												delegateDescription: request.description,
+												delegateProfile: childProfileLabel,
+												delegateItems,
+											});
+										} catch (error) {
+											if (_signal?.aborted || isAbortError(error)) {
+												throw new Error("Operation aborted");
+											}
+											const message = error instanceof Error ? error.message : String(error);
+											const cause = classifyFailureCause(message);
+											recordFailureCause(cause);
+											const canRetryRetrospective =
+												childRetrospectiveAttempt < retrospectiveRetriesFromEnv &&
+												isRetrospectiveRetryable(cause);
+											if (!canRetryRetrospective) {
+												throw Object.assign(new Error(message), { failureCause: cause as FailureCause });
+											}
+											childRetrospectiveAttempt += 1;
+											retrospectiveAttempts += 1;
+											const directive = buildRetrospectiveDirective({
+												cause,
+												errorMessage: message,
+												attempt: childRetrospectiveAttempt,
+												target: "delegate",
+											});
+											childPromptForAttempt = `${delegatePrompt}\n\n${directive}`;
+											emitProgress({
+												kind: "subagent_progress",
+												phase: "running",
+												message: `delegate ${index + 1}/${delegateTotal}: retrospective retry ${childRetrospectiveAttempt}/${retrospectiveRetriesFromEnv} (${cause})`,
+												cwd: childCwd,
+												activeTool: undefined,
+												delegateIndex: index + 1,
+												delegateTotal,
+												delegateDescription: request.description,
+												delegateProfile: childProfileLabel,
+												delegateItems,
+											});
+										}
+									}
 
 								const parsedChildDelegation = parseDelegationRequests(childOutput, 0);
 								childOutput = parsedChildDelegation.cleanedOutput;
@@ -1037,7 +1604,7 @@ export function createTaskTool(
 										? `${normalizedChildOutput.slice(0, Math.max(1, maxDelegatedOutputCharsFromEnv - 3))}...`
 										: normalizedChildOutput;
 								delegatedSections[index] =
-									`#### ${index + 1}. ${request.description} (${childProfile})\n${childOutputExcerpt}`;
+									`#### ${index + 1}. ${request.description} (${childProfileLabel})\n${childOutputExcerpt}`;
 								emitProgress({
 									kind: "subagent_progress",
 									phase: "running",
@@ -1047,18 +1614,31 @@ export function createTaskTool(
 									delegateIndex: index + 1,
 									delegateTotal,
 									delegateDescription: request.description,
-									delegateProfile: childProfile,
+									delegateProfile: childProfileLabel,
 									delegateItems,
 								});
-							} catch (error) {
-								const message = error instanceof Error ? error.message : String(error);
-								if (_signal?.aborted || isAbortError(error)) {
-									throw new Error("Operation aborted");
-								}
-								markDelegateFailed(index, `delegate ${index + 1}/${delegateTotal} failed`, message);
-							} finally {
+								} catch (error) {
+									const message = error instanceof Error ? error.message : String(error);
+									if (_signal?.aborted || isAbortError(error)) {
+										throw new Error("Operation aborted");
+									}
+									const classified =
+										error && typeof error === "object" && "failureCause" in error
+											? (error.failureCause as FailureCause)
+											: classifyFailureCause(message);
+									if (!(error && typeof error === "object" && "failureCause" in error)) {
+										recordFailureCause(classified);
+									}
+									markDelegateFailed(
+										index,
+										`delegate ${index + 1}/${delegateTotal} failed`,
+										message,
+										classified,
+									);
+								} finally {
 								childReleaseIsolation?.();
 								childReleaseLock?.();
+								cleanupWriteLock(explicitChildLock);
 							}
 						};
 
@@ -1069,14 +1649,16 @@ export function createTaskTool(
 								if (deps.length === 0) continue;
 								const failedDep = deps.find((dep) => statusOf(dep - 1) === "failed");
 								if (!failedDep) continue;
-								pendingIndices.delete(index);
-								markDelegateFailed(
-									index,
-									`delegate ${index + 1}/${delegateTotal} skipped: dependency ${failedDep} failed`,
-									`Delegated task ${index + 1} skipped because dependency ${failedDep} failed.`,
-								);
-								changed = true;
-							}
+									pendingIndices.delete(index);
+									recordFailureCause("logic_error");
+									markDelegateFailed(
+										index,
+										`delegate ${index + 1}/${delegateTotal} skipped: dependency ${failedDep} failed`,
+										`Delegated task ${index + 1} skipped because dependency ${failedDep} failed.`,
+										"logic_error",
+									);
+									changed = true;
+								}
 							return changed;
 						};
 
@@ -1111,29 +1693,69 @@ export function createTaskTool(
 							const launched = launchReadyDelegates();
 							if (runningDelegates.size === 0) {
 								if (pendingIndices.size > 0 && !changed && !launched) {
-									for (const index of Array.from(pendingIndices)) {
-										pendingIndices.delete(index);
-										const deps = normalizedDependsOn[index] ?? [];
-										markDelegateFailed(
-											index,
-											`delegate ${index + 1}/${delegateTotal} blocked: unresolved depends_on`,
-											`Delegated task ${index + 1} blocked by unresolved dependencies: ${deps.join(", ") || "unknown"}.`,
-										);
-									}
+										for (const index of Array.from(pendingIndices)) {
+											pendingIndices.delete(index);
+											const deps = normalizedDependsOn[index] ?? [];
+											recordFailureCause("logic_error");
+											markDelegateFailed(
+												index,
+												`delegate ${index + 1}/${delegateTotal} blocked: unresolved depends_on`,
+												`Delegated task ${index + 1} blocked by unresolved dependencies: ${deps.join(", ") || "unknown"}.`,
+												"logic_error",
+											);
+										}
 								}
 								break;
 							}
 							await Promise.race(Array.from(runningDelegates.values()));
 						}
-					} catch (error) {
-						const message = error instanceof Error ? error.message : String(error);
-						if (_signal?.aborted || isAbortError(error)) {
-							throw new Error("Operation aborted");
-						}
-						const details: TaskToolDetails = {
-							profile: effectiveProfile,
-							description,
-							outputLength: 0,
+						} catch (error) {
+							const message = error instanceof Error ? error.message : String(error);
+							if (_signal?.aborted || isAbortError(error)) {
+								recordFailureCause("aborted");
+								const hasFailureCauses = Object.keys(failureCauses).length > 0;
+								const details: TaskToolDetails = {
+									profile: effectiveProfile,
+									description,
+									outputLength: 0,
+									cwd: subagentCwd,
+									agent: customSubagent?.name,
+									lockKey: lockKey?.trim() || undefined,
+									runId,
+									taskId: orchestrationTaskId,
+									model: effectiveModelOverride,
+									isolation: useWorktree ? "worktree" : "none",
+									worktreePath,
+									waitMs: Date.now() - queuedAt,
+									background: runInBackground,
+									toolCallsStarted: runStats?.toolCallsStarted ?? latestProgress?.toolCallsStarted,
+									toolCallsCompleted: runStats?.toolCallsCompleted ?? latestProgress?.toolCallsCompleted,
+									assistantMessages: runStats?.assistantMessages ?? latestProgress?.assistantMessages,
+									delegatedTasks: delegatedTasks > 0 ? delegatedTasks : undefined,
+									delegatedSucceeded: delegatedTasks > 0 ? delegatedSucceeded : undefined,
+									delegatedFailed: delegatedTasks > 0 ? delegatedFailed : undefined,
+									retrospectiveAttempts: retrospectiveAttempts > 0 ? retrospectiveAttempts : undefined,
+									retrospectiveRecovered: retrospectiveRecovered > 0 ? retrospectiveRecovered : undefined,
+									failureCauses: hasFailureCauses ? { ...failureCauses } : undefined,
+								};
+								updateTrackedTaskStatus("cancelled");
+								throw Object.assign(new Error("Operation aborted"), {
+									details,
+									failureCause: "aborted" as FailureCause,
+								});
+							}
+							const classified =
+								error && typeof error === "object" && "failureCause" in error
+									? (error.failureCause as FailureCause)
+									: classifyFailureCause(message);
+							if (!(error && typeof error === "object" && "failureCause" in error)) {
+								recordFailureCause(classified);
+							}
+							const hasFailureCauses = Object.keys(failureCauses).length > 0;
+							const details: TaskToolDetails = {
+								profile: effectiveProfile,
+								description,
+								outputLength: 0,
 							cwd: subagentCwd,
 							agent: customSubagent?.name,
 							lockKey: lockKey?.trim() || undefined,
@@ -1146,35 +1768,42 @@ export function createTaskTool(
 							background: runInBackground,
 							toolCallsStarted: runStats?.toolCallsStarted ?? latestProgress?.toolCallsStarted,
 							toolCallsCompleted: runStats?.toolCallsCompleted ?? latestProgress?.toolCallsCompleted,
-							assistantMessages: runStats?.assistantMessages ?? latestProgress?.assistantMessages,
-							delegatedTasks: delegatedTasks > 0 ? delegatedTasks : undefined,
-							delegatedSucceeded: delegatedTasks > 0 ? delegatedSucceeded : undefined,
-							delegatedFailed: delegatedTasks > 0 ? delegatedFailed : undefined,
-						};
-						if (orchestrationRunId && orchestrationTaskId) {
-							updateTeamTaskStatus({
-								cwd,
-								runId: orchestrationRunId,
-								taskId: orchestrationTaskId,
-								status: "error",
-							});
-						}
+								assistantMessages: runStats?.assistantMessages ?? latestProgress?.assistantMessages,
+								delegatedTasks: delegatedTasks > 0 ? delegatedTasks : undefined,
+								delegatedSucceeded: delegatedTasks > 0 ? delegatedSucceeded : undefined,
+								delegatedFailed: delegatedTasks > 0 ? delegatedFailed : undefined,
+								retrospectiveAttempts: retrospectiveAttempts > 0 ? retrospectiveAttempts : undefined,
+								retrospectiveRecovered: retrospectiveRecovered > 0 ? retrospectiveRecovered : undefined,
+								failureCauses: hasFailureCauses ? { ...failureCauses } : undefined,
+							};
+						updateTrackedTaskStatus("error");
 						throw Object.assign(new Error(`Subagent failed: ${message}`), { details });
 					}
 
-					const normalizedOutput = output.trim().length > 0 ? output.trim() : "(Subagent completed with no output)";
-					const finalSections: string[] = [normalizedOutput];
-					if (delegatedTasks > 0) {
-						const header = `### Delegated Subtasks (${delegatedSucceeded}/${delegatedTasks} done)`;
+						const normalizedOutput = output.trim().length > 0 ? output.trim() : "(Subagent completed with no output)";
+						const finalSections: string[] = [normalizedOutput];
+						if (delegatedTasks > 0) {
+							const header = `### Delegated Subtasks (${delegatedSucceeded}/${delegatedTasks} done)`;
 						const delegatedBlocks = delegatedSections.filter(
 							(section): section is string => typeof section === "string" && section.trim().length > 0,
 						);
 						finalSections.push([header, ...delegatedBlocks].join("\n\n"));
-					}
-					if (delegationWarnings.length > 0) {
-						finalSections.push(`### Delegation Notes\n${delegationWarnings.map((w) => `- ${w}`).join("\n")}`);
-					}
-					const text = finalSections.join("\n\n");
+						}
+						if (delegationWarnings.length > 0) {
+							finalSections.push(`### Delegation Notes\n${delegationWarnings.map((w) => `- ${w}`).join("\n")}`);
+						}
+						const failureCauseSummary = formatFailureCauseCounts(failureCauses);
+						if (retrospectiveAttempts > 0 || failureCauseSummary) {
+							finalSections.push(
+								[
+									"### Retrospective",
+									`- attempts: ${retrospectiveAttempts}`,
+									`- recovered: ${retrospectiveRecovered}`,
+									`- failure_causes: ${failureCauseSummary || "none"}`,
+								].join("\n"),
+							);
+						}
+						const text = finalSections.join("\n\n");
 						emitProgress({
 							kind: "subagent_progress",
 							phase: "responding",
@@ -1188,8 +1817,8 @@ export function createTaskTool(
 							delegateItems: undefined,
 						});
 
-					const transcriptPath = persistSubagentTranscript({
-						rootCwd: cwd,
+						const transcriptPath = persistSubagentTranscript({
+							rootCwd: cwd,
 						runId,
 						description,
 						profile: effectiveProfile,
@@ -1200,12 +1829,13 @@ export function createTaskTool(
 						sessionId: subagentSessionId,
 						prompt: promptWithInstructions,
 						output: text,
-						isolation: useWorktree ? "worktree" : "none",
-						worktreePath,
-					});
-					const details: TaskToolDetails = {
-						profile: effectiveProfile,
-						description,
+							isolation: useWorktree ? "worktree" : "none",
+							worktreePath,
+						});
+						const hasFailureCauses = Object.keys(failureCauses).length > 0;
+						const details: TaskToolDetails = {
+							profile: effectiveProfile,
+							description,
 						outputLength: text.length,
 						cwd: subagentCwd,
 						agent: customSubagent?.name,
@@ -1240,24 +1870,24 @@ export function createTaskTool(
 								: delegatedStats.assistantMessages > 0
 									? delegatedStats.assistantMessages
 									: undefined,
-						delegatedTasks: delegatedTasks > 0 ? delegatedTasks : undefined,
-						delegatedSucceeded: delegatedTasks > 0 ? delegatedSucceeded : undefined,
-						delegatedFailed: delegatedTasks > 0 ? delegatedFailed : undefined,
-					};
-					if (orchestrationRunId && orchestrationTaskId) {
-						updateTeamTaskStatus({
-							cwd,
-							runId: orchestrationRunId,
-							taskId: orchestrationTaskId,
-							status: "done",
-						});
-					}
-					return { text, details };
-				} finally {
+							delegatedTasks: delegatedTasks > 0 ? delegatedTasks : undefined,
+							delegatedSucceeded: delegatedTasks > 0 ? delegatedSucceeded : undefined,
+							delegatedFailed: delegatedTasks > 0 ? delegatedFailed : undefined,
+							retrospectiveAttempts: retrospectiveAttempts > 0 ? retrospectiveAttempts : undefined,
+							retrospectiveRecovered: retrospectiveRecovered > 0 ? retrospectiveRecovered : undefined,
+							failureCauses: hasFailureCauses ? { ...failureCauses } : undefined,
+						};
+						updateTrackedTaskStatus("done");
+						return { text, details };
+					} finally {
 					releaseIsolation?.();
 					releaseWriteLock?.();
+					cleanupWriteLock(explicitRootLockKey);
 					releaseSlot?.();
 					releaseRunSlot?.();
+					if (orchestrationRunId) {
+						cleanupOrchestrationSemaphore(cwd, orchestrationRunId);
+					}
 				}
 			};
 
@@ -1299,13 +1929,14 @@ export function createTaskTool(
 							model: effectiveModelOverride,
 							transcriptPath: result.details.transcriptPath,
 						});
-					} catch (error) {
-						writeBackgroundRunStatus(cwd, {
-							runId,
-							status: "error",
-							createdAt: now,
-							finishedAt: new Date().toISOString(),
-							description,
+						} catch (error) {
+							const aborted = isAbortError(error);
+							writeBackgroundRunStatus(cwd, {
+								runId,
+								status: aborted ? "cancelled" : "error",
+								createdAt: now,
+								finishedAt: new Date().toISOString(),
+								description,
 							profile: effectiveProfile,
 							cwd: requestedSubagentCwd,
 							agent: customSubagent?.name,

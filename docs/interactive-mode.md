@@ -56,6 +56,7 @@ iosm --continue
 | `/semantic` | Open semantic search manager (`setup/auto-index/status/index/rebuild/query`) | `/semantic` |
 | `/contract` | Interactive engineering contract editor (field-by-field, auto JSON build) | `/contract` |
 | `/singular` | Feature feasibility analyzer with implementation options and recommendation | `/singular add account dashboard` |
+| `/swarm` | Recommended multi-agent orchestration runtime for complex/risky tasks (`run`, `from-singular`, `watch`, `retry`, `resume`) | `/swarm run refactor auth module --max-parallel 3` |
 | `/memory` | Interactive memory manager (`add/edit/remove/scope/path`) | `/memory` |
 | `/settings` | View/modify settings | `/settings` |
 | `/hotkeys` | View keyboard shortcuts | `/hotkeys` |
@@ -76,7 +77,8 @@ iosm --continue
 
 | Command | Description | Example |
 |---------|-------------|---------|
-| `/orchestrate` | Launch subagent orchestration | See below |
+| `/swarm` | Swarm-first multi-agent orchestration runtime for complex/risky work | `/swarm run refactor auth and token flow` |
+| `/orchestrate` | Manual legacy multi-agent orchestration (explicit agent splitting) | See below |
 | `/agents` | Inspect custom/system agents | `/agents` |
 | `/subagent-runs` | List subagent run history | `/subagent-runs` |
 | `/subagent-resume` | Resume a subagent run | `/subagent-resume run-123` |
@@ -106,7 +108,8 @@ Manager includes `Automatic indexing` toggle (default `on`) to control query-tim
 In `/semantic setup`, the headers step is optional: press `Enter` on empty input to skip.
 `/memory` opens an interactive manager. `/memory <text>` saves a note to `memory.md` and reloads session context. Use `/memory edit <index> <text>` for direct updates.
 `/contract` edits contract fields interactively (`goal`, scope, constraints, quality gates, DoD, risks, etc.), then writes JSON automatically.
-`/singular <request>` runs a two-pass feasibility analysis (baseline scan + standard agent pass), builds concrete implementation options, and asks user to choose one.
+`/singular <request>` runs a two-pass feasibility analysis (baseline scan + standard agent pass), builds concrete implementation options, then prompts `Start with Swarm` / `Continue without Swarm` / `Cancel`.
+`/swarm` enforces `Scopes -> Touches -> Locks -> Gates -> Done`. If effective contract is missing, it blocks execution and opens a bootstrap menu (auto-draft, guided Q&A, or manual `/contract` editor).
 `/blast` and `/shadow` are removed from active interactive workflow.
 
 ### `/contract` Detailed Guide
@@ -219,7 +222,11 @@ After analysis, selector opens with variants:
 - choose Option 1 / Option 2 / Option 3
 - or close without decision
 
-If Option 1 or 2 is selected, execution draft is inserted into editor (ready to run).  
+If Option 1 or 2 is selected, execution mode prompt opens:
+- `Start with Swarm (Recommended)` -> runs `/swarm from-singular <run-id> --option <n>`
+- `Continue without Swarm` -> inserts execution draft into editor (ready to run)
+- `Cancel` -> exits without changes
+
 If Option 3 is selected, run is explicitly marked as postponed.
 
 #### Fallback Behavior
@@ -232,6 +239,38 @@ Use `/model` to enable full agent feasibility pass.
 - `/singular` is the feasibility command to use.
 - `/blast` is deprecated/removed.
 - `/shadow` is removed.
+
+### `/swarm` Detailed Guide
+
+Canonical commands:
+- `/swarm run <task> [--max-parallel N] [--budget-usd X]`
+- `/swarm from-singular <run-id> --option <1|2|3> [--max-parallel N] [--budget-usd X]`
+- `/swarm watch [run-id]`
+- `/swarm retry <run-id> <task-id> [--reset-brief]`
+- `/swarm resume <run-id>`
+
+Execution note:
+- Run-level `--max-parallel` supports `1..20`.
+- A single swarm task can use delegated intra-task subagents in parallel (up to 10) when decomposition is beneficial.
+- Shared memory tools (`shared_memory_write` / `shared_memory_read`) are available to tasks/delegates that share a `run_id`.
+- Standalone `task` calls auto-generate internal `run_id/task_id`, so shared-memory collaboration still works for root + delegates.
+
+Runtime artifacts:
+- `.iosm/orchestrate/<run-id>/run.json`
+- `.iosm/orchestrate/<run-id>/dag.json`
+- `.iosm/orchestrate/<run-id>/state.json`
+- `.iosm/orchestrate/<run-id>/events.jsonl`
+- `.iosm/orchestrate/<run-id>/checkpoints/latest.json`
+- `.iosm/orchestrate/<run-id>/reports/*`
+
+`/swarm watch` includes:
+- current state and task breakdown
+- budget and warning state
+- ETA ticks and throughput
+- critical path and theoretical speedup
+- lock snapshot and bottleneck tasks
+
+`/orchestrate --swarm` was removed. Use `/swarm ...` directly.
 
 ---
 

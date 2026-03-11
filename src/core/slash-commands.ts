@@ -24,7 +24,12 @@ export const BUILTIN_SLASH_COMMANDS: ReadonlyArray<BuiltinSlashCommand> = [
 	{
 		name: "orchestrate",
 		description:
-			"Run orchestrated subagents: /orchestrate (--parallel|--sequential) --agents N [--max-parallel N] [--profile <name>|--profiles p1,p2] [--cwd p1,p2] [--locks l1,l2] [--worktree] [--depends 2>1,3>2] <task>",
+			"Manual legacy multi-agent orchestration: /orchestrate (--parallel|--sequential) --agents N ... <task>",
+	},
+	{
+		name: "swarm",
+		description:
+			"Recommended multi-agent orchestration runtime for complex/risky tasks: /swarm run <task> | /swarm from-singular <run-id> --option <1|2|3> | /swarm watch|retry|resume",
 	},
 	{
 		name: "agents",

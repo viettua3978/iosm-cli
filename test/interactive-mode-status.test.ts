@@ -1272,7 +1272,15 @@ describe("InteractiveMode contract/singular commands", () => {
 			autosave: false,
 			contract: {},
 		});
-		expect(runSingularAgentFeasibilityPass).toHaveBeenCalledWith("add account dashboard", baseline, {});
+		expect(runSingularAgentFeasibilityPass).toHaveBeenCalledWith(
+			"add account dashboard",
+			baseline,
+			{},
+			expect.objectContaining({
+				scaleMode: "small",
+				semanticStatusLine: "optional_for_small_repo",
+			}),
+		);
 		expect(singularService.saveAnalysis).toHaveBeenCalledWith(enriched);
 		expect(showCommandTextBlock).toHaveBeenCalledWith("Singular Analysis", expect.stringContaining("recommendation: implement_now"));
 		expect(promptSingularDecision).toHaveBeenCalledWith(enriched);
@@ -1357,6 +1365,85 @@ describe("InteractiveMode contract/singular commands", () => {
 			expect.stringContaining("No model selected. /singular used heuristic analysis only."),
 		);
 	});
+
+	test("promptSingularDecision allows swarm start when defer recommendation exists but user picks non-defer option", async () => {
+		const result = {
+			runId: "2026-03-11-091500",
+			request: "split session handling from token validation",
+			generatedAt: "2026-03-11T09:15:00.000Z",
+			scannedFiles: 220,
+			sourceFiles: 130,
+			testFiles: 32,
+			matchedFiles: ["src/auth/token.ts"],
+			baselineComplexity: "medium",
+			baselineBlastRadius: "medium",
+			recommendation: "defer",
+			recommendationReason: "Overall risk is high right now.",
+			contractSignals: [],
+			options: [
+				{
+					id: "1",
+					title: "Phased extraction",
+					summary: "Extract in two safe phases",
+					complexity: "medium",
+					blast_radius: "medium",
+					suggested_files: ["src/auth/token.ts", "src/auth/session.ts"],
+					plan: ["extract token module", "move session handling"],
+					pros: ["safe rollout"],
+					cons: ["requires sequencing"],
+				},
+				{
+					id: "2",
+					title: "Full refactor",
+					summary: "Single pass refactor",
+					complexity: "high",
+					blast_radius: "high",
+					suggested_files: ["src/auth/**"],
+					plan: ["big-bang refactor"],
+					pros: ["faster end state"],
+					cons: ["higher risk"],
+				},
+				{
+					id: "3",
+					title: "Defer",
+					summary: "Postpone",
+					complexity: "low",
+					blast_radius: "low",
+					suggested_files: [],
+					plan: ["capture RFC"],
+					pros: ["no immediate risk"],
+					cons: ["delay value"],
+				},
+			],
+		};
+
+		const showExtensionSelector = vi
+			.fn<(...args: unknown[]) => Promise<string | undefined>>()
+			.mockResolvedValueOnce("Option 1: Phased extraction [risk=medium]")
+			.mockResolvedValueOnce("Start with Swarm (Recommended)");
+		const runSwarmFromSingular = vi.fn(async () => {});
+		const showStatus = vi.fn();
+		const editorSetText = vi.fn();
+
+		const fakeThis: any = Object.create((InteractiveMode as any).prototype);
+		fakeThis.showExtensionSelector = showExtensionSelector;
+		fakeThis.showCommandTextBlock = vi.fn();
+		fakeThis.showStatus = showStatus;
+		fakeThis.runSwarmFromSingular = runSwarmFromSingular;
+		fakeThis.editor = { setText: editorSetText };
+		fakeThis.singularLastEffectiveContract = {};
+		fakeThis.buildSingularExecutionDraft = vi.fn(() => "draft");
+		fakeThis.resolveRecommendedSingularOptionId = (InteractiveMode as any).prototype.resolveRecommendedSingularOptionId.bind(fakeThis);
+
+		await (InteractiveMode as any).prototype.promptSingularDecision.call(fakeThis, result);
+
+		expect(runSwarmFromSingular).toHaveBeenCalledWith({
+			runId: "2026-03-11-091500",
+			option: 1,
+		});
+		expect(editorSetText).not.toHaveBeenCalled();
+		expect(showStatus).not.toHaveBeenCalledWith("Singular: defer option selected, implementation postponed.");
+	});
 });
 
 describe("InteractiveMode.promptWithTaskFallback", () => {
@@ -1428,6 +1515,47 @@ describe("InteractiveMode.promptWithTaskFallback", () => {
 			expandPromptTemplates: false,
 			source: "interactive",
 		});
+	});
+
+	test("uses parallel orchestration defaults for @meta_orchestrator requests", async () => {
+		const prompt = vi.fn(async () => { });
+		const fakeThis: any = {
+			sessionManager: { getCwd: () => "/tmp/workspace" },
+			session: { prompt },
+			activeProfileName: "full",
+			resolveMentionedAgent: vi.fn(() => "meta_orchestrator"),
+			isCapabilityQuery: vi.fn(() => false),
+		};
+
+		await (InteractiveMode as any).prototype.promptWithTaskFallback.call(
+			fakeThis,
+			"@meta_orchestrator аудит безопасности backend и auth-модуля",
+		);
+
+		expect(prompt).toHaveBeenCalledTimes(1);
+		const [generatedPrompt] = prompt.mock.calls[0] as [string];
+		expect(generatedPrompt).toContain('<orchestrate mode="parallel" agents="1" max_parallel="20">');
+		expect(generatedPrompt).toContain('agent="meta_orchestrator"');
+		expect(generatedPrompt).toContain("Include delegate_parallel_hint in the task call.");
+		expect(generatedPrompt).toContain("If user explicitly requested an agent count");
+		expect(generatedPrompt).toContain("Prefer existing custom agents for delegated work when suitable");
+		expect(generatedPrompt).toContain("DELEGATION_IMPOSSIBLE: <reason>");
+	});
+
+	test("passes through natural-language parallel request without rewriting user text", async () => {
+		const prompt = vi.fn(async () => { });
+		const fakeThis: any = {
+			session: { prompt },
+			resolveMentionedAgent: vi.fn(() => undefined),
+		};
+
+		await (InteractiveMode as any).prototype.promptWithTaskFallback.call(
+			fakeThis,
+			"используй 5 параллельных агентов для аудита безопасности",
+		);
+
+		expect(prompt).toHaveBeenCalledTimes(1);
+		expect(prompt.mock.calls[0]?.[0]).toBe("используй 5 параллельных агентов для аудита безопасности");
 	});
 
 	test("passes through non-@agent requests without synthetic orchestration fallback", async () => {
@@ -1579,6 +1707,33 @@ describe("InteractiveMode.getUserMessageText", () => {
 
 		const output = (InteractiveMode as any).prototype.getUserMessageText.call(fakeThis, input);
 		expect(output).toBe("please continue\n\n[ORCHESTRATION_DIRECTIVE]\ninternal details");
+	});
+});
+
+describe("InteractiveMode.buildSwarmRecommendationFromOrchestrate", () => {
+	test("recommends /swarm for complex or risky legacy orchestrate tasks", () => {
+		const result = (InteractiveMode as any).prototype.buildSwarmRecommendationFromOrchestrate.call({}, {
+			mode: "parallel",
+			agents: 4,
+			maxParallel: 3,
+			dependencies: [{ agent: 3, dependsOn: [1, 2] }, { agent: 4, dependsOn: [3] }],
+			task: "Refactor auth and migration flow with rollback safety",
+		});
+
+		expect(result.recommend).toBe(true);
+		expect(result.command).toContain('/swarm run "Refactor auth and migration flow with rollback safety"');
+		expect(result.command).toContain("--max-parallel 3");
+		expect(result.reasons.length).toBeGreaterThan(0);
+	});
+
+	test("does not recommend /swarm for simple orchestrate tasks", () => {
+		const result = (InteractiveMode as any).prototype.buildSwarmRecommendationFromOrchestrate.call({}, {
+			mode: "sequential",
+			agents: 2,
+			task: "Update README typo",
+		});
+
+		expect(result.recommend).toBe(false);
 	});
 });
 

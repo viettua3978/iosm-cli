@@ -136,6 +136,57 @@ describe("subagent orchestration", () => {
 		expect(observed[0]?.prompt).toContain("User task:\nscan docs");
 	});
 
+	it("maps custom agent names passed via profile into agent resolution", async () => {
+		const cwd = makeTempDir();
+		const observedPrompts: string[] = [];
+		const tool = createTaskTool(
+			cwd,
+			async (options) => {
+				observedPrompts.push(options.prompt);
+				return { output: "ok", sessionId: "session_alias" };
+			},
+			{
+				resolveCustomSubagent: (name) =>
+					name === "codebase_auditor"
+						? {
+								name: "codebase_auditor",
+								description: "Codebase audit specialist",
+								sourcePath: "fixture",
+								profile: "explore",
+								instructions: "Audit with strict evidence.",
+							}
+						: undefined,
+				availableCustomSubagents: ["codebase_auditor"],
+			},
+		);
+
+		const result = await tool.execute("call_profile_alias", {
+			description: "run audit",
+			prompt: "inspect repository",
+			profile: "codebase_auditor",
+		});
+
+		expect((result.content[0] as { type: "text"; text: string }).text).toBe("ok");
+		expect(result.details?.agent).toBe("codebase_auditor");
+		expect(result.details?.profile).toBe("explore");
+		expect(observedPrompts[0]).toContain("Audit with strict evidence.");
+		expect(observedPrompts[0]).toContain("User task:\ninspect repository");
+	});
+
+	it("falls back unknown profile to full without validation failure", async () => {
+		const cwd = makeTempDir();
+		const tool = createTaskTool(cwd, async () => ({ output: "ok" }));
+
+		const result = await tool.execute("call_unknown_profile", {
+			description: "unknown profile fallback",
+			prompt: "do work",
+			profile: "non_existing_profile",
+		});
+
+		expect((result.content[0] as { type: "text"; text: string }).text).toBe("ok");
+		expect(result.details?.profile).toBe("full");
+	});
+
 	it("honors maxParallel from orchestration run metadata", async () => {
 		const cwd = makeTempDir();
 
@@ -263,19 +314,442 @@ describe("subagent orchestration", () => {
 		expect(maxActive).toBe(2);
 	});
 
+	it("waits for team dependencies before running dependent orchestration task", async () => {
+		const cwd = makeTempDir();
+		const run = createTeamRun({
+			cwd,
+			mode: "parallel",
+			agents: 2,
+			maxParallel: 2,
+			task: "dependency wait",
+			assignments: [
+				{ profile: "explore", cwd, dependsOn: [] },
+				{ profile: "explore", cwd, dependsOn: [1] },
+			],
+		});
+		let firstDone = false;
+		let secondStartedBeforeFirstDone = false;
+		const tool = createTaskTool(cwd, async (options) => {
+			if (options.prompt === "first-task") {
+				await new Promise((resolve) => setTimeout(resolve, 45));
+				firstDone = true;
+				return { output: "first done" };
+			}
+			if (options.prompt === "second-task") {
+				if (!firstDone) secondStartedBeforeFirstDone = true;
+				return { output: "second done" };
+			}
+			return { output: "ok" };
+		});
+
+		const secondPromise = tool.execute("call_dep_task_2", {
+			description: "second",
+			prompt: "second-task",
+			profile: "explore",
+			run_id: run.runId,
+			task_id: "task_2",
+		});
+		await new Promise((resolve) => setTimeout(resolve, 20));
+		const firstPromise = tool.execute("call_dep_task_1", {
+			description: "first",
+			prompt: "first-task",
+			profile: "explore",
+			run_id: run.runId,
+			task_id: "task_1",
+		});
+		await Promise.all([secondPromise, firstPromise]);
+
+		expect(secondStartedBeforeFirstDone).toBe(false);
+		expect(getTeamRun(cwd, run.runId)?.tasks.find((task) => task.id === "task_1")?.status).toBe("done");
+		expect(getTeamRun(cwd, run.runId)?.tasks.find((task) => task.id === "task_2")?.status).toBe("done");
+	});
+
+	it("fails dependent orchestration task when dependency failed", async () => {
+		const cwd = makeTempDir();
+		const run = createTeamRun({
+			cwd,
+			mode: "parallel",
+			agents: 2,
+			maxParallel: 2,
+			task: "dependency fail",
+			assignments: [
+				{ profile: "explore", cwd, dependsOn: [] },
+				{ profile: "explore", cwd, dependsOn: [1] },
+			],
+		});
+		const tool = createTaskTool(cwd, async (options) => {
+			if (options.prompt.includes("first-fail")) {
+				throw new Error("boom");
+			}
+			if (options.prompt === "second-after-fail") {
+				return { output: "should not run" };
+			}
+			return { output: "ok" };
+		});
+
+		await expect(
+			tool.execute("call_dep_fail_task_1", {
+				description: "first fail",
+				prompt: "first-fail",
+				profile: "explore",
+				run_id: run.runId,
+				task_id: "task_1",
+			}),
+		).rejects.toThrow(/Subagent failed/);
+
+		await expect(
+			tool.execute("call_dep_fail_task_2", {
+				description: "second fail",
+				prompt: "second-after-fail",
+				profile: "explore",
+				run_id: run.runId,
+				task_id: "task_2",
+			}),
+		).rejects.toThrow(/failed dependency|blocked by failed dependency/i);
+
+		expect(getTeamRun(cwd, run.runId)?.tasks.find((task) => task.id === "task_1")?.status).toBe("error");
+		expect(getTeamRun(cwd, run.runId)?.tasks.find((task) => task.id === "task_2")?.status).toBe("error");
+	});
+
+	it("retries root subagent when first pass returns empty output", async () => {
+		const cwd = makeTempDir();
+		let callCount = 0;
+		const progressMessages: string[] = [];
+		const tool = createTaskTool(cwd, async () => {
+			callCount += 1;
+			if (callCount === 1) {
+				return {
+					output: "",
+					stats: { toolCallsStarted: 1, toolCallsCompleted: 1, assistantMessages: 1 },
+				};
+			}
+			return {
+				output: "Recovered root output.",
+				stats: { toolCallsStarted: 1, toolCallsCompleted: 1, assistantMessages: 1 },
+			};
+		});
+
+		const result = await tool.execute(
+			"call_root_empty_retry",
+			{
+				description: "root empty retry",
+				prompt: "root-task",
+				profile: "full",
+			},
+			undefined,
+			(update) => {
+				const progress = update.details?.progress as { message?: string } | undefined;
+				if (progress?.message) progressMessages.push(progress.message);
+			},
+		);
+
+		expect(callCount).toBe(2);
+		expect((result.content[0] as { type: "text"; text: string }).text).toBe("Recovered root output.");
+		expect(progressMessages.some((message) => /empty output/i.test(message) && /retry/i.test(message))).toBe(true);
+	});
+
+	it("marks orchestration task cancelled when aborted while waiting for dependencies", async () => {
+		const cwd = makeTempDir();
+		const run = createTeamRun({
+			cwd,
+			mode: "parallel",
+			agents: 2,
+			task: "dependency wait abort",
+			assignments: [
+				{ profile: "explore", cwd, dependsOn: [] },
+				{ profile: "explore", cwd, dependsOn: [1] },
+			],
+		});
+		let runnerCalls = 0;
+		const tool = createTaskTool(cwd, async () => {
+			runnerCalls += 1;
+			return { output: "should-not-run" };
+		});
+		const controller = new AbortController();
+		const execution = tool.execute(
+			"call_abort_waiting",
+			{
+				description: "waiting dependency abort",
+				prompt: "wait",
+				profile: "explore",
+				run_id: run.runId,
+				task_id: "task_2",
+			},
+			controller.signal,
+		);
+		setTimeout(() => controller.abort(), 30);
+
+		await expect(execution).rejects.toThrow(/Operation aborted/i);
+		expect(runnerCalls).toBe(0);
+		expect(getTeamRun(cwd, run.runId)?.tasks.find((task) => task.id === "task_2")?.status).toBe("cancelled");
+	});
+
+	it("marks orchestration task cancelled and records aborted cause when aborted during execution", async () => {
+		const cwd = makeTempDir();
+		const run = createTeamRun({
+			cwd,
+			mode: "sequential",
+			agents: 1,
+			task: "running abort",
+			assignments: [{ profile: "full", cwd, dependsOn: [] }],
+		});
+		const tool = createTaskTool(cwd, async (options) => {
+			return await new Promise((resolve, reject) => {
+				const timer = setTimeout(() => resolve({ output: "unexpected" }), 1_000);
+				options.signal?.addEventListener(
+					"abort",
+					() => {
+						clearTimeout(timer);
+						reject(new Error("Operation aborted"));
+					},
+					{ once: true },
+				);
+			});
+		});
+		const controller = new AbortController();
+		const execution = tool.execute(
+			"call_abort_running",
+			{
+				description: "running abort",
+				prompt: "run",
+				profile: "full",
+				run_id: run.runId,
+				task_id: "task_1",
+			},
+			controller.signal,
+		);
+		setTimeout(() => controller.abort(), 30);
+
+		await expect(execution).rejects.toMatchObject({
+			message: "Operation aborted",
+			details: {
+				failureCauses: {
+					aborted: 1,
+				},
+			},
+		});
+		expect(getTeamRun(cwd, run.runId)?.tasks.find((task) => task.id === "task_1")?.status).toBe("cancelled");
+	});
+
+	it("applies root retrospective retry and records failure causes", async () => {
+		const cwd = makeTempDir();
+		const prompts: string[] = [];
+		let callCount = 0;
+		const tool = createTaskTool(cwd, async (options) => {
+			callCount += 1;
+			prompts.push(options.prompt);
+			if (callCount === 1) {
+				throw new Error("Context window exceeded token limit.");
+			}
+			return {
+				output: "Recovered root output after narrowing scope.",
+				stats: { toolCallsStarted: 1, toolCallsCompleted: 1, assistantMessages: 1 },
+			};
+		});
+
+		const result = await tool.execute("call_root_retro", {
+			description: "root retrospective",
+			prompt: "root-retry-task",
+			profile: "full",
+		});
+
+		expect(callCount).toBe(2);
+		expect(prompts[1]).toContain("[RETROSPECTIVE_RETRY]");
+		expect(prompts[1]).toContain("cause: token_limit");
+		expect(result.details?.retrospectiveAttempts).toBe(1);
+		expect(result.details?.retrospectiveRecovered).toBe(1);
+		expect(result.details?.failureCauses?.token_limit).toBe(1);
+		expect((result.content[0] as { type: "text"; text: string }).text).toContain("### Retrospective");
+	});
+
+	it("forwards shared-memory context and applies delegate retrospective retry", async () => {
+		const cwd = makeTempDir();
+		const calls: Array<{
+			prompt: string;
+			sharedMemoryContext?: {
+				runId?: string;
+				taskId?: string;
+				delegateId?: string;
+			};
+		}> = [];
+		let delegateAttempt = 0;
+		const tool = createTaskTool(cwd, async (options) => {
+			calls.push({
+				prompt: options.prompt,
+				sharedMemoryContext: options.sharedMemoryContext
+					? {
+							runId: options.sharedMemoryContext.runId,
+							taskId: options.sharedMemoryContext.taskId,
+							delegateId: options.sharedMemoryContext.delegateId,
+						}
+					: undefined,
+			});
+			if (options.prompt.includes("root-memory-task")) {
+				return {
+					output:
+						'Root analysis.\n<delegate_task profile="explore" description="Child logic">delegate-logic-task</delegate_task>',
+					stats: { toolCallsStarted: 1, toolCallsCompleted: 1, assistantMessages: 1 },
+				};
+			}
+			if (options.prompt.includes("delegate-logic-task")) {
+				delegateAttempt += 1;
+				if (delegateAttempt === 1) {
+					throw new Error("Invariant violated: logic mismatch.");
+				}
+				return {
+					output: "Delegate recovered with different approach.",
+					stats: { toolCallsStarted: 1, toolCallsCompleted: 1, assistantMessages: 1 },
+				};
+			}
+			return { output: "unexpected" };
+		});
+
+		const result = await tool.execute("call_shared_memory_delegate_retro", {
+			description: "shared memory + delegate retry",
+			prompt: "root-memory-task",
+			profile: "full",
+			run_id: "run_shared_context",
+			task_id: "task_1",
+		});
+
+		expect(calls).toHaveLength(3);
+		expect(calls[0]?.sharedMemoryContext?.runId).toBe("run_shared_context");
+		expect(calls[0]?.sharedMemoryContext?.taskId).toBe("task_1");
+		expect(calls[0]?.sharedMemoryContext?.delegateId).toBeUndefined();
+		expect(calls[0]?.prompt).toContain("[SHARED_MEMORY]");
+		expect(calls[0]?.prompt).toContain("shared_memory_write/shared_memory_read");
+		expect(calls[1]?.sharedMemoryContext?.delegateId).toBe("1");
+		expect(calls[2]?.sharedMemoryContext?.delegateId).toBe("1");
+		expect(calls[2]?.prompt).toContain("[RETROSPECTIVE_RETRY]");
+		expect(calls[2]?.prompt).toContain("cause: logic_error");
+		expect(result.details?.delegatedSucceeded).toBe(1);
+		expect(result.details?.delegatedFailed).toBe(0);
+		expect(result.details?.retrospectiveAttempts).toBe(1);
+		expect(result.details?.retrospectiveRecovered).toBe(1);
+		expect(result.details?.failureCauses?.logic_error).toBe(1);
+	});
+
+	it("enables shared-memory context for standalone task mode (without run_id/task_id)", async () => {
+		const cwd = makeTempDir();
+		const calls: Array<{
+			prompt: string;
+			sharedMemoryContext?: {
+				runId?: string;
+				taskId?: string;
+				delegateId?: string;
+			};
+		}> = [];
+		const tool = createTaskTool(cwd, async (options) => {
+			calls.push({
+				prompt: options.prompt,
+				sharedMemoryContext: options.sharedMemoryContext
+					? {
+							runId: options.sharedMemoryContext.runId,
+							taskId: options.sharedMemoryContext.taskId,
+							delegateId: options.sharedMemoryContext.delegateId,
+						}
+					: undefined,
+			});
+			if (options.prompt.includes("root-standalone-memory")) {
+				return {
+					output:
+						'Root analysis.\n<delegate_task profile="explore" description="Child memory">delegate-standalone-memory</delegate_task>',
+					stats: { toolCallsStarted: 1, toolCallsCompleted: 1, assistantMessages: 1 },
+				};
+			}
+			if (options.prompt.includes("delegate-standalone-memory")) {
+				return {
+					output: "Delegate completed with standalone shared memory context.",
+					stats: { toolCallsStarted: 1, toolCallsCompleted: 1, assistantMessages: 1 },
+				};
+			}
+			return { output: "unexpected" };
+		});
+
+		const result = await tool.execute("call_shared_memory_standalone", {
+			description: "standalone shared memory context",
+			prompt: "root-standalone-memory",
+			profile: "full",
+		});
+
+		expect(calls).toHaveLength(2);
+		const rootContext = calls[0]?.sharedMemoryContext;
+		expect(rootContext?.runId).toMatch(/^subagent_/);
+		expect(rootContext?.taskId).toBe(rootContext?.runId);
+		expect(rootContext?.delegateId).toBeUndefined();
+		expect(calls[0]?.prompt).toContain("[SHARED_MEMORY]");
+		expect(calls[0]?.prompt).toContain(`run_id: ${rootContext?.runId}`);
+		expect(calls[1]?.sharedMemoryContext?.runId).toBe(rootContext?.runId);
+		expect(calls[1]?.sharedMemoryContext?.taskId).toBe(rootContext?.taskId);
+		expect(calls[1]?.sharedMemoryContext?.delegateId).toBe("1");
+		expect(result.details?.delegatedTasks).toBe(1);
+		expect(result.details?.delegatedSucceeded).toBe(1);
+		expect(result.details?.delegatedFailed).toBe(0);
+	});
+
+	it("fails when root subagent keeps returning empty output", async () => {
+		const cwd = makeTempDir();
+		const tool = createTaskTool(cwd, async () => ({
+			output: "",
+			stats: { toolCallsStarted: 1, toolCallsCompleted: 1, assistantMessages: 1 },
+		}));
+
+		await expect(
+			tool.execute("call_root_empty_fail", {
+				description: "root empty fail",
+				prompt: "root-task",
+				profile: "full",
+			}),
+		).rejects.toThrow(/empty output/i);
+	});
+
+	it("marks delegated subtask as failed when delegate output is empty", async () => {
+		const cwd = makeTempDir();
+		const tool = createTaskTool(cwd, async (options) => {
+			if (options.prompt.includes("root-task")) {
+				return {
+					output:
+						'Root analysis complete.\n<delegate_task profile="explore" description="Child">child-empty</delegate_task>',
+					stats: { toolCallsStarted: 1, toolCallsCompleted: 1, assistantMessages: 1 },
+				};
+			}
+			if (options.prompt.includes("child-empty")) {
+				return {
+					output: "",
+					stats: { toolCallsStarted: 1, toolCallsCompleted: 1, assistantMessages: 1 },
+				};
+			}
+			return { output: "unexpected" };
+		});
+
+		const result = await tool.execute("call_delegate_empty_fail", {
+			description: "delegate empty fail",
+			prompt: "root-task",
+			profile: "full",
+		});
+
+			const text = (result.content[0] as { type: "text"; text: string }).text;
+			expect(text).toContain("### Delegated Subtasks");
+			expect(text).toMatch(/ERROR(?: \[cause=empty_output\])?: delegate 1\/1 failed/);
+			expect(result.details?.delegatedTasks).toBe(1);
+			expect(result.details?.delegatedSucceeded).toBe(0);
+			expect(result.details?.delegatedFailed).toBe(1);
+			expect(result.details?.failureCauses?.empty_output).toBe(1);
+		});
+
 	it("executes delegated subtasks emitted by subagent output", async () => {
 		const cwd = makeTempDir();
 		const prompts: string[] = [];
 		const tool = createTaskTool(cwd, async (options) => {
 			prompts.push(options.prompt);
-			if (options.prompt === "root-task") {
+			if (options.prompt.includes("root-task")) {
 				return {
 					output:
 						'Root analysis complete.\n<delegate_task profile="explore" description="Patch vuln">apply fix</delegate_task>',
 					stats: { toolCallsStarted: 1, toolCallsCompleted: 1, assistantMessages: 1 },
 				};
 			}
-			if (options.prompt === "apply fix") {
+			if (options.prompt.includes("apply fix")) {
 				return {
 					output: "Fix applied.",
 					stats: { toolCallsStarted: 2, toolCallsCompleted: 2, assistantMessages: 1 },
@@ -291,7 +765,9 @@ describe("subagent orchestration", () => {
 		});
 
 		const text = (result.content[0] as { type: "text"; text: string }).text;
-		expect(prompts).toEqual(["root-task", "apply fix"]);
+		expect(prompts).toHaveLength(2);
+		expect(prompts[0]).toContain("root-task");
+		expect(prompts[1]).toContain("apply fix");
 		expect(text).toContain("Root analysis complete.");
 		expect(text).toContain("### Delegated Subtasks");
 		expect(text).toContain("Fix applied.");
@@ -302,23 +778,84 @@ describe("subagent orchestration", () => {
 		expect(result.details?.toolCallsCompleted).toBe(3);
 	});
 
+	it("supports delegated custom agents via delegate_task agent attribute", async () => {
+		const cwd = makeTempDir();
+		const calls: Array<{ prompt: string; tools: string[]; systemPrompt: string }> = [];
+		const tool = createTaskTool(
+			cwd,
+			async (options) => {
+				calls.push({
+					prompt: options.prompt,
+					tools: [...options.tools],
+					systemPrompt: options.systemPrompt,
+				});
+				if (options.prompt.includes("root-task")) {
+					return {
+						output:
+							'Root analysis complete.\n<delegate_task profile="explore" agent="security_reviewer" description="Security deep dive">scan module</delegate_task>',
+						stats: { toolCallsStarted: 1, toolCallsCompleted: 1, assistantMessages: 1 },
+					};
+				}
+				if (options.prompt.includes("User task:\nscan module")) {
+					return {
+						output: "Security review complete.",
+						stats: { toolCallsStarted: 1, toolCallsCompleted: 1, assistantMessages: 1 },
+					};
+				}
+				return { output: "unexpected" };
+			},
+			{
+				resolveCustomSubagent: (name) =>
+					name === "security_reviewer"
+						? {
+								name: "security_reviewer",
+								description: "Security reviewer",
+								sourcePath: "fixture",
+								profile: "plan",
+								systemPrompt: "Custom security auditor system prompt.",
+								instructions: "Custom security reviewer instructions.",
+								tools: ["read", "bash", "grep"],
+								disallowedTools: ["bash"],
+							}
+						: undefined,
+				availableCustomSubagents: ["security_reviewer"],
+			},
+		);
+
+		const result = await tool.execute("call_delegate_custom_agent", {
+			description: "delegate custom agent",
+			prompt: "root-task",
+			profile: "full",
+		});
+
+		const text = (result.content[0] as { type: "text"; text: string }).text;
+		expect(calls).toHaveLength(2);
+		expect(calls[1]?.systemPrompt).toContain("Custom security auditor system prompt.");
+		expect(calls[1]?.tools).toEqual(["read", "grep"]);
+		expect(calls[1]?.prompt).toContain("Custom security reviewer instructions.");
+		expect(calls[1]?.prompt).toContain("User task:\nscan module");
+		expect(text).toContain("security_reviewer/plan");
+		expect(result.details?.delegatedTasks).toBe(1);
+		expect(result.details?.delegatedSucceeded).toBe(1);
+	});
+
 	it("emits delegate mini-list progress updates", async () => {
 		const cwd = makeTempDir();
 		const tool = createTaskTool(cwd, async (options) => {
-			if (options.prompt === "root-task") {
+			if (options.prompt.includes("root-task")) {
 				return {
 					output:
 						'Root analysis complete.\n<delegate_task profile="explore" description="Patch vuln">child-one</delegate_task>\n<delegate_task profile="plan" description="Audit UX">child-two</delegate_task>',
 					stats: { toolCallsStarted: 1, toolCallsCompleted: 1, assistantMessages: 1 },
 				};
 			}
-			if (options.prompt === "child-one") {
+			if (options.prompt.includes("child-one")) {
 				return {
 					output: "Child one done.",
 					stats: { toolCallsStarted: 1, toolCallsCompleted: 1, assistantMessages: 1 },
 				};
 			}
-			if (options.prompt === "child-two") {
+			if (options.prompt.includes("child-two")) {
 				return {
 					output: "Child two done.",
 					stats: { toolCallsStarted: 1, toolCallsCompleted: 1, assistantMessages: 1 },
@@ -363,14 +900,14 @@ describe("subagent orchestration", () => {
 		let maxActive = 0;
 
 		const tool = createTaskTool(cwd, async (options) => {
-			if (options.prompt === "root-task") {
+			if (options.prompt.includes("root-task")) {
 				return {
 					output:
 						'Root analysis.\n<delegate_task profile="explore" description="A">child-one</delegate_task>\n<delegate_task profile="plan" description="B">child-two</delegate_task>',
 					stats: { toolCallsStarted: 1, toolCallsCompleted: 1, assistantMessages: 1 },
 				};
 			}
-			if (options.prompt === "child-one" || options.prompt === "child-two") {
+			if (options.prompt.includes("child-one") || options.prompt.includes("child-two")) {
 				active += 1;
 				maxActive = Math.max(maxActive, active);
 				await new Promise((resolve) => setTimeout(resolve, 25));
@@ -392,20 +929,254 @@ describe("subagent orchestration", () => {
 		expect(maxActive).toBe(2);
 	});
 
+	it("honors delegate_parallel_hint for intra-task fan-out", async () => {
+		const cwd = makeTempDir();
+		let active = 0;
+		let maxActive = 0;
+
+		const tool = createTaskTool(cwd, async (options) => {
+			if (options.prompt.includes("root-task")) {
+				return {
+					output:
+						'Root analysis.\n<delegate_task profile="explore" description="A">child-one</delegate_task>\n<delegate_task profile="plan" description="B">child-two</delegate_task>\n<delegate_task profile="explore" description="C">child-three</delegate_task>',
+					stats: { toolCallsStarted: 1, toolCallsCompleted: 1, assistantMessages: 1 },
+				};
+			}
+			if (
+				options.prompt.includes("child-one") ||
+				options.prompt.includes("child-two") ||
+				options.prompt.includes("child-three")
+			) {
+				active += 1;
+				maxActive = Math.max(maxActive, active);
+				await new Promise((resolve) => setTimeout(resolve, 20));
+				active -= 1;
+				return {
+					output: `${options.prompt} done`,
+					stats: { toolCallsStarted: 1, toolCallsCompleted: 1, assistantMessages: 1 },
+				};
+			}
+			return { output: "unexpected" };
+		});
+
+		await tool.execute("call_delegate_hint_serial", {
+			description: "delegate hint serial",
+			prompt: "root-task",
+			profile: "full",
+			delegate_parallel_hint: 1,
+		});
+		expect(maxActive).toBe(1);
+
+		active = 0;
+		maxActive = 0;
+		await tool.execute("call_delegate_hint_parallel", {
+			description: "delegate hint parallel",
+			prompt: "root-task",
+			profile: "full",
+			delegate_parallel_hint: 5,
+		});
+		expect(maxActive).toBe(3);
+	});
+
+	it("enforces delegated split when delegate_parallel_hint requires fan-out", async () => {
+		const cwd = makeTempDir();
+		const rootPrompts: string[] = [];
+		let sawEnforcementPrompt = false;
+
+		const tool = createTaskTool(cwd, async (options) => {
+			if (options.prompt.includes("DELEGATION_ENFORCEMENT")) {
+				sawEnforcementPrompt = true;
+				return {
+					output:
+						'Root refined.\n<delegate_task profile="explore" description="A">child-one</delegate_task>\n<delegate_task profile="plan" description="B">child-two</delegate_task>',
+					stats: { toolCallsStarted: 1, toolCallsCompleted: 1, assistantMessages: 1 },
+				};
+			}
+			if (options.prompt.includes("root-task")) {
+				rootPrompts.push(options.prompt);
+				return {
+					output: "Root analysis without delegation.",
+					stats: { toolCallsStarted: 1, toolCallsCompleted: 1, assistantMessages: 1 },
+				};
+			}
+			if (options.prompt.includes("child-one") || options.prompt.includes("child-two")) {
+				return {
+					output: `${options.prompt} done`,
+					stats: { toolCallsStarted: 1, toolCallsCompleted: 1, assistantMessages: 1 },
+				};
+			}
+			return { output: "unexpected" };
+		});
+
+		const result = await tool.execute("call_delegate_enforced", {
+			description: "delegate enforced",
+			prompt: "root-task",
+			profile: "full",
+			delegate_parallel_hint: 2,
+		});
+
+		const text = (result.content[0] as { type: "text"; text: string }).text;
+		expect(rootPrompts.length).toBe(1);
+		expect(sawEnforcementPrompt).toBe(true);
+		expect(text).toContain("### Delegated Subtasks");
+		expect(result.details?.delegatedTasks).toBe(2);
+	});
+
+	it("falls back to single-agent execution when delegation is not beneficial", async () => {
+		const cwd = makeTempDir();
+		let sawEnforcementPrompt = false;
+
+		const tool = createTaskTool(cwd, async (options) => {
+			if (options.prompt.includes("DELEGATION_ENFORCEMENT")) {
+				sawEnforcementPrompt = true;
+				return {
+					output: "DELEGATION_IMPOSSIBLE: single focused change in one file.",
+					stats: { toolCallsStarted: 1, toolCallsCompleted: 1, assistantMessages: 1 },
+				};
+			}
+			if (options.prompt.includes("root-task")) {
+				return {
+					output: "Root single-agent implementation complete.",
+					stats: { toolCallsStarted: 1, toolCallsCompleted: 1, assistantMessages: 1 },
+				};
+			}
+			return { output: "unexpected" };
+		});
+
+		const result = await tool.execute("call_delegate_optional_fallback", {
+			description: "delegate optional fallback",
+			prompt: "root-task",
+			profile: "full",
+			delegate_parallel_hint: 5,
+		});
+		const text = (result.content[0] as { type: "text"; text: string }).text;
+
+		expect(sawEnforcementPrompt).toBe(true);
+		expect(text).toContain("DELEGATION_IMPOSSIBLE");
+		expect(result.details?.delegatedTasks ?? 0).toBe(0);
+		expect(result.details?.delegatedSucceeded ?? 0).toBe(0);
+		expect(result.details?.delegatedFailed ?? 0).toBe(0);
+	});
+
+	it("auto-enables delegation pressure for complex orchestrator tasks without explicit hint", async () => {
+		const cwd = makeTempDir();
+		let sawEnforcementPrompt = false;
+
+		const tool = createTaskTool(
+			cwd,
+				async (options) => {
+					if (options.prompt.includes("DELEGATION_ENFORCEMENT")) {
+						sawEnforcementPrompt = true;
+						return {
+							output:
+								'Root refined.\n<delegate_task profile="explore" description="A">child-one</delegate_task>\n<delegate_task profile="plan" description="B">child-two</delegate_task>',
+							stats: { toolCallsStarted: 1, toolCallsCompleted: 1, assistantMessages: 1 },
+						};
+					}
+					if (options.prompt.includes("Scope:")) {
+						return {
+							output: "Root analysis without delegation on first pass.",
+							stats: { toolCallsStarted: 1, toolCallsCompleted: 1, assistantMessages: 1 },
+						};
+					}
+				if (options.prompt.includes("child-one") || options.prompt.includes("child-two")) {
+					return {
+						output: `${options.prompt} done`,
+						stats: { toolCallsStarted: 1, toolCallsCompleted: 1, assistantMessages: 1 },
+					};
+				}
+				return { output: "unexpected" };
+			},
+			{
+				resolveCustomSubagent: (name) =>
+					name === "meta_orchestrator"
+						? {
+								name: "meta_orchestrator",
+								description: "Meta orchestrator",
+								sourcePath: "fixture",
+								profile: "full",
+								instructions: "Coordinate complex work.",
+							}
+						: undefined,
+				availableCustomSubagents: ["meta_orchestrator"],
+			},
+		);
+
+			const result = await tool.execute("call_auto_delegate_orchestrator", {
+				description:
+					"Coordinate a multi-part hardening and refactor plan across auth, sessions, API boundary, and regression coverage.",
+				prompt: [
+					"Scope:",
+					"- review src/auth/token.ts and src/auth/session.ts",
+					"- review src/api/middleware/auth.ts and tests/auth/session.spec.ts",
+					"- split implementation, verification, and risk report into independent workstreams",
+					"- produce rollback notes and integration checklist",
+				].join("\n"),
+				profile: "full",
+				agent: "meta_orchestrator",
+			});
+		const text = (result.content[0] as { type: "text"; text: string }).text;
+
+		expect(sawEnforcementPrompt).toBe(true);
+		expect(text).toContain("### Delegated Subtasks");
+		expect(result.details?.delegatedTasks).toBe(2);
+	});
+
+	it("keeps single-agent path for simple orchestrator tasks without explicit hint", async () => {
+		const cwd = makeTempDir();
+		let sawEnforcementPrompt = false;
+
+		const tool = createTaskTool(
+			cwd,
+			async (options) => {
+				if (options.prompt.includes("DELEGATION_ENFORCEMENT")) {
+					sawEnforcementPrompt = true;
+				}
+				return {
+					output: "Single change complete.",
+					stats: { toolCallsStarted: 1, toolCallsCompleted: 1, assistantMessages: 1 },
+				};
+			},
+			{
+				resolveCustomSubagent: (name) =>
+					name === "meta_orchestrator"
+						? {
+								name: "meta_orchestrator",
+								description: "Meta orchestrator",
+								sourcePath: "fixture",
+								profile: "full",
+								instructions: "Coordinate tasks.",
+							}
+						: undefined,
+				availableCustomSubagents: ["meta_orchestrator"],
+			},
+		);
+
+		const result = await tool.execute("call_auto_delegate_orchestrator_simple", {
+			description: "update one README line",
+			prompt: "Fix one typo in README.",
+			profile: "full",
+			agent: "meta_orchestrator",
+		});
+
+		expect(sawEnforcementPrompt).toBe(false);
+		expect((result.details?.delegatedTasks ?? 0)).toBe(0);
+	});
+
 	it("honors depends_on ordering for delegated subtasks", async () => {
 		const cwd = makeTempDir();
 		let firstCompleted = false;
 		let secondStartedBeforeFirstDone = false;
 
 		const tool = createTaskTool(cwd, async (options) => {
-			if (options.prompt === "root-task") {
+			if (options.prompt.includes("root-task")) {
 				return {
 					output:
 						'Root analysis.\n<delegate_task profile="explore" description="First">child-one</delegate_task>\n<delegate_task profile="plan" description="Second" depends_on="1">child-two</delegate_task>',
 					stats: { toolCallsStarted: 1, toolCallsCompleted: 1, assistantMessages: 1 },
 				};
 			}
-			if (options.prompt === "child-one") {
+			if (options.prompt.includes("child-one")) {
 				await new Promise((resolve) => setTimeout(resolve, 20));
 				firstCompleted = true;
 				return {
@@ -413,7 +1184,7 @@ describe("subagent orchestration", () => {
 					stats: { toolCallsStarted: 1, toolCallsCompleted: 1, assistantMessages: 1 },
 				};
 			}
-			if (options.prompt === "child-two") {
+			if (options.prompt.includes("child-two")) {
 				if (!firstCompleted) {
 					secondStartedBeforeFirstDone = true;
 				}

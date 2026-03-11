@@ -21,6 +21,7 @@ describe("SubagentMessageComponent", () => {
 			toolCallsStarted: 2,
 			toolCallsCompleted: 1,
 			assistantMessages: 1,
+			durationMs: 65_000,
 			delegateIndex: 1,
 			delegateTotal: 2,
 			delegateDescription: "Patch vuln",
@@ -40,6 +41,7 @@ describe("SubagentMessageComponent", () => {
 		expect(rendered).toContain("tools 1/2");
 		expect(rendered).toContain("msgs 1");
 		expect(rendered).toContain("agent codebase_auditor");
+		expect(rendered).toContain("elapsed 01:05");
 		expect(rendered).toContain("delegates 0/2 done, 1 running");
 		expect(rendered).toContain("delegate 1/2");
 		expect(rendered).toContain("Patch vuln");

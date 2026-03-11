@@ -105,6 +105,16 @@ import {
 	type EngineeringContract,
 } from "../../core/contract.js";
 import {
+	buildProjectIndex,
+	collectChangedFilesSince,
+	ensureProjectIndex,
+	loadProjectIndex,
+	queryProjectIndex,
+	saveProjectIndex,
+	type ProjectIndex,
+	type RepoScaleMode,
+} from "../../core/project-index/index.js";
+import {
 	SingularService,
 	type SingularAnalysisResult,
 	type SingularBlastRadius,
@@ -139,6 +149,18 @@ import {
 import { DefaultResourceLoader } from "../../core/resource-loader.js";
 import { createAgentSession } from "../../core/sdk.js";
 import { createTeamRun, getTeamRun, listTeamRuns } from "../../core/agent-teams.js";
+import {
+	buildSwarmPlanFromSingular,
+	buildSwarmPlanFromTask,
+	runSwarmScheduler,
+	SwarmStateStore,
+	type SwarmDispatchResult,
+	type SwarmPlan,
+	type SwarmRunMeta,
+	type SwarmRuntimeState,
+	type SwarmTaskPlan,
+	type SwarmTaskRuntimeState,
+} from "../../core/swarm/index.js";
 import {
 	loadCustomSubagents,
 	resolveCustomSubagentReference,
@@ -546,6 +568,38 @@ type ParsedOrchestrateCommand = {
 	task: string;
 };
 
+type ParsedSwarmCommand =
+	| {
+			subcommand: "run";
+			task: string;
+			maxParallel?: number;
+			budgetUsd?: number;
+	  }
+	| {
+			subcommand: "from-singular";
+			runId: string;
+			option: number;
+			maxParallel?: number;
+			budgetUsd?: number;
+	  }
+	| {
+			subcommand: "watch";
+			runId?: string;
+	  }
+	| {
+			subcommand: "resume";
+			runId: string;
+	  }
+	| {
+			subcommand: "retry";
+			runId: string;
+			taskId: string;
+			resetBrief: boolean;
+	  }
+		| {
+				subcommand: "help";
+		  };
+
 function isAbortLikeMessage(message: string): boolean {
 	const normalized = message.trim().toLowerCase();
 	return normalized.includes("aborted") || normalized.includes("cancelled");
@@ -645,6 +699,31 @@ export interface InteractiveModeOptions {
 	mcpRuntime?: McpRuntime;
 }
 
+type RunningSubagentState = {
+	component: SubagentMessageComponent;
+	startTime: number;
+	profile: string;
+	description: string;
+	cwd?: string;
+	agent?: string;
+	lockKey?: string;
+	isolation?: "none" | "worktree";
+	phase?: string;
+	phaseState?: SubagentPhaseState;
+	activeTool?: string;
+	toolCallsStarted: number;
+	toolCallsCompleted: number;
+	assistantMessages: number;
+	delegatedTasks?: number;
+	delegatedSucceeded?: number;
+	delegatedFailed?: number;
+	delegateIndex?: number;
+	delegateTotal?: number;
+	delegateDescription?: string;
+	delegateProfile?: string;
+	delegateItems?: SubagentDelegateItem[];
+};
+
 export class InteractiveMode {
 	private session: AgentSession;
 	private ui: TUI;
@@ -675,6 +754,7 @@ export class InteractiveMode {
 	private contractService: ContractService;
 	private singularService: SingularService;
 	private singularLastEffectiveContract: EngineeringContract = {};
+	private swarmActiveRunId: string | undefined = undefined;
 
 	private lastSigintTime = 0;
 	private lastEscapeTime = 0;
@@ -692,33 +772,8 @@ export class InteractiveMode {
 	private pendingTools = new Map<string, ToolExecutionComponent>();
 
 	// Subagent execution tracking with live progress/metadata for task tool calls.
-	private subagentComponents = new Map<
-		string,
-		{
-			component: SubagentMessageComponent;
-			startTime: number;
-			profile: string;
-			description: string;
-			cwd?: string;
-			agent?: string;
-			lockKey?: string;
-			isolation?: "none" | "worktree";
-			phase?: string;
-			phaseState?: SubagentPhaseState;
-			activeTool?: string;
-			toolCallsStarted: number;
-			toolCallsCompleted: number;
-			assistantMessages: number;
-			delegatedTasks?: number;
-			delegatedSucceeded?: number;
-			delegatedFailed?: number;
-			delegateIndex?: number;
-			delegateTotal?: number;
-			delegateDescription?: string;
-			delegateProfile?: string;
-			delegateItems?: SubagentDelegateItem[];
-		}
-	>();
+	private subagentComponents = new Map<string, RunningSubagentState>();
+	private subagentElapsedTimer: ReturnType<typeof setInterval> | undefined = undefined;
 
 	// Internal UI metadata emitted by runtime for orchestration rendering.
 	private pendingInternalUserDisplayAliases: Array<{ rawPrompt: string; displayText: string }> = [];
@@ -1453,6 +1508,37 @@ export class InteractiveMode {
 		return null;
 	}
 
+	private getSwarmArgumentCompletions(prefix: string): AutocompleteItem[] | null {
+		const subcommands = ["run", "from-singular", "watch", "retry", "resume", "help"];
+		const hasTrailingSpace = /\\s$/.test(prefix);
+		const tokens = this.parseSlashArgs(prefix);
+		const first = tokens[0]?.toLowerCase();
+
+		if (!first || (tokens.length === 1 && !hasTrailingSpace)) {
+			const query = first ?? "";
+			return subcommands.filter((item) => item.includes(query)).map((item) => ({ value: item, label: item }));
+		}
+
+		const active = first;
+		if (active === "run" || active === "from-singular") {
+			const flags = ["--max-parallel", "--budget-usd", ...(active === "from-singular" ? ["--option"] : [])];
+			const query = hasTrailingSpace ? "" : (tokens[tokens.length - 1] ?? "");
+			if (!query || query.startsWith("--")) {
+				return flags.filter((flag) => flag.includes(query)).map((flag) => ({ value: flag, label: flag }));
+			}
+		}
+
+		if (active === "retry") {
+			const flags = ["--reset-brief"];
+			const query = hasTrailingSpace ? "" : (tokens[tokens.length - 1] ?? "");
+			if (!query || query.startsWith("--")) {
+				return flags.filter((flag) => flag.includes(query)).map((flag) => ({ value: flag, label: flag }));
+			}
+		}
+
+		return null;
+	}
+
 	private setupAutocomplete(fdPath: string | undefined): void {
 		// Define commands for autocomplete
 		const builtinCommands = BUILTIN_SLASH_COMMANDS.filter(
@@ -1522,6 +1608,12 @@ export class InteractiveMode {
 		if (singularCommand) {
 			singularCommand.getArgumentCompletions = (prefix: string): AutocompleteItem[] | null =>
 				this.getSingularArgumentCompletions(prefix);
+		}
+
+		const swarmCommand = slashCommands.find((command) => command.name === "swarm");
+		if (swarmCommand) {
+			swarmCommand.getArgumentCompletions = (prefix: string): AutocompleteItem[] | null =>
+				this.getSwarmArgumentCompletions(prefix);
 		}
 
 		// Convert prompt templates to SlashCommand format for autocomplete
@@ -3303,6 +3395,11 @@ export class InteractiveMode {
 				await this.handleOrchestrateSlashCommand(text);
 				return;
 			}
+			if (text === "/swarm" || text.startsWith("/swarm ")) {
+				this.editor.setText("");
+				await this.handleSwarmCommand(text);
+				return;
+			}
 			if (text === "/agents" || text.startsWith("/agents ")) {
 				this.editor.setText("");
 				await this.handleAgentsSlashCommand(text);
@@ -3567,6 +3664,63 @@ export class InteractiveMode {
 		};
 	}
 
+	private updateRunningSubagentDisplay(subagent: RunningSubagentState): void {
+		subagent.component.update({
+			description: subagent.description,
+			profile: subagent.profile,
+			status: "running",
+			phase: subagent.phase ?? "running",
+			phaseState: subagent.phaseState,
+			cwd: subagent.cwd,
+			agent: subagent.agent,
+			lockKey: subagent.lockKey,
+			isolation: subagent.isolation,
+			activeTool: subagent.activeTool,
+			toolCallsStarted: subagent.toolCallsStarted,
+			toolCallsCompleted: subagent.toolCallsCompleted,
+			assistantMessages: subagent.assistantMessages,
+			delegatedTasks: subagent.delegatedTasks,
+			delegatedSucceeded: subagent.delegatedSucceeded,
+			delegatedFailed: subagent.delegatedFailed,
+			delegateIndex: subagent.delegateIndex,
+			delegateTotal: subagent.delegateTotal,
+			delegateDescription: subagent.delegateDescription,
+			delegateProfile: subagent.delegateProfile,
+			delegateItems: subagent.delegateItems,
+			durationMs: Date.now() - subagent.startTime,
+		});
+	}
+
+	private ensureSubagentElapsedTimer(): void {
+		if (this.subagentElapsedTimer || this.subagentComponents.size === 0) {
+			return;
+		}
+		this.subagentElapsedTimer = setInterval(() => {
+			if (this.subagentComponents.size === 0) {
+				this.clearSubagentElapsedTimer();
+				return;
+			}
+			for (const subagent of this.subagentComponents.values()) {
+				this.updateRunningSubagentDisplay(subagent);
+			}
+			this.ui.requestRender();
+		}, 1000);
+	}
+
+	private clearSubagentElapsedTimer(): void {
+		if (!this.subagentElapsedTimer) {
+			return;
+		}
+		clearInterval(this.subagentElapsedTimer);
+		this.subagentElapsedTimer = undefined;
+	}
+
+	private stopSubagentElapsedTimerIfIdle(): void {
+		if (this.subagentComponents.size === 0) {
+			this.clearSubagentElapsedTimer();
+		}
+	}
+
 	private subscribeToAgent(): void {
 		this.unsubscribe = this.session.subscribe(async (event) => {
 			await this.handleEvent(event);
@@ -3775,6 +3929,7 @@ export class InteractiveMode {
 						delegateProfile: info.delegateProfile,
 						delegateItems: info.delegateItems,
 					});
+					this.ensureSubagentElapsedTimer();
 					this.ui.requestRender();
 				} else if (event.toolName !== "task" && !this.pendingTools.has(event.toolCallId)) {
 					const component = new ToolExecutionComponent(
@@ -3872,29 +4027,7 @@ export class InteractiveMode {
 						}
 					}
 
-					subagent.component.update({
-						description: subagent.description,
-						profile: subagent.profile,
-						status: "running",
-						phase: subagent.phase ?? "running",
-						phaseState: subagent.phaseState,
-						cwd: subagent.cwd,
-						agent: subagent.agent,
-						lockKey: subagent.lockKey,
-						isolation: subagent.isolation,
-						activeTool: subagent.activeTool,
-						toolCallsStarted: subagent.toolCallsStarted,
-						toolCallsCompleted: subagent.toolCallsCompleted,
-						assistantMessages: subagent.assistantMessages,
-						delegatedTasks: subagent.delegatedTasks,
-						delegatedSucceeded: subagent.delegatedSucceeded,
-						delegatedFailed: subagent.delegatedFailed,
-						delegateIndex: subagent.delegateIndex,
-						delegateTotal: subagent.delegateTotal,
-						delegateDescription: subagent.delegateDescription,
-						delegateProfile: subagent.delegateProfile,
-						delegateItems: subagent.delegateItems,
-					});
+					this.updateRunningSubagentDisplay(subagent);
 					this.ui.requestRender();
 					break;
 				}
@@ -3966,6 +4099,7 @@ export class InteractiveMode {
 						this.pendingTools.delete(event.toolCallId);
 					}
 					this.subagentComponents.delete(event.toolCallId);
+					this.stopSubagentElapsedTimerIfIdle();
 					this.ui.requestRender();
 					break;
 				}
@@ -3991,6 +4125,7 @@ export class InteractiveMode {
 				}
 				this.pendingTools.clear();
 				this.subagentComponents.clear();
+				this.clearSubagentElapsedTimer();
 
 				await this.checkShutdownRequested();
 
@@ -8163,10 +8298,129 @@ export class InteractiveMode {
 		return lines.length > 0 ? lines.join("\n") : "- none";
 	}
 
+	private resolveSingularRepoScaleMode(
+		baseline: SingularAnalysisResult,
+	): { mode: "small" | "medium" | "large"; reason: string } {
+		if (baseline.scannedFiles >= 8000 || baseline.sourceFiles >= 4000) {
+			return {
+				mode: "large",
+				reason: `scanned=${baseline.scannedFiles}, source=${baseline.sourceFiles}`,
+			};
+		}
+		if (baseline.scannedFiles >= 2500 || baseline.sourceFiles >= 1200) {
+			return {
+				mode: "medium",
+				reason: `scanned=${baseline.scannedFiles}, source=${baseline.sourceFiles}`,
+			};
+		}
+		return {
+			mode: "small",
+			reason: `scanned=${baseline.scannedFiles}, source=${baseline.sourceFiles}`,
+		};
+	}
+
+	private buildSingularSemanticGuidanceFromStatus(status: SemanticStatusResult): {
+		statusLine: string;
+		promptGuidance: string[];
+		operatorHint?: string;
+	} {
+		if (!status.configured) {
+			return {
+				statusLine: "not_configured",
+				promptGuidance: [
+					"Semantic index is unavailable; use narrow path-based discovery and avoid wide repo scans.",
+					"If confidence is low, explicitly ask user to run /semantic setup and /semantic index, then rerun /singular.",
+				],
+				operatorHint: "Large/medium repo mode: semantic index is not configured. Run /semantic setup, then /semantic index.",
+			};
+		}
+		if (!status.enabled) {
+			return {
+				statusLine: "configured_but_disabled",
+				promptGuidance: [
+					"Semantic index is configured but disabled; proceed with targeted rg/read steps only.",
+					"If discovery quality is insufficient, ask user to enable semantic search in /semantic setup.",
+				],
+				operatorHint: "Large/medium repo mode: semantic index is disabled. Enable it in /semantic setup for faster planning.",
+			};
+		}
+		if (!status.indexed) {
+			return {
+				statusLine: "configured_not_indexed",
+				promptGuidance: [
+					"Semantic index is configured but missing; do focused discovery and avoid broad scans.",
+					"If context coverage is insufficient, ask user to run /semantic index before final recommendation.",
+				],
+				operatorHint: "Large/medium repo mode: semantic index is missing. Run /semantic index.",
+			};
+		}
+		if (status.stale) {
+			const requiresRebuild =
+				status.staleReason === "provider_changed" ||
+				status.staleReason === "chunking_changed" ||
+				status.staleReason === "index_filters_changed" ||
+				status.staleReason === "dimension_mismatch";
+			return {
+				statusLine: `stale${status.staleReason ? ` (${status.staleReason})` : ""}`,
+				promptGuidance: [
+					"Semantic index is stale; treat semantic hits as hints and verify with direct file reads.",
+					"If index staleness blocks confidence, ask user to run /semantic rebuild or /semantic index.",
+				],
+				operatorHint: requiresRebuild
+					? "Large/medium repo mode: semantic index is stale and requires /semantic rebuild."
+					: "Large/medium repo mode: semantic index is stale. Run /semantic index.",
+			};
+		}
+		return {
+			statusLine: `ready (${status.provider}/${status.model}, files=${status.files}, chunks=${status.chunks}, auto_index=${status.autoIndex ? "on" : "off"})`,
+			promptGuidance: [
+				"Use semantic_search for first-pass discovery, then confirm with targeted reads and grep.",
+				"Avoid full-tree scans unless evidence is still insufficient.",
+			],
+		};
+	}
+
+	private async buildSingularSemanticGuidance(
+		scaleMode: "small" | "medium" | "large",
+	): Promise<{
+		statusLine: string;
+		promptGuidance: string[];
+		operatorHint?: string;
+	}> {
+		if (scaleMode === "small") {
+			return {
+				statusLine: "optional_for_small_repo",
+				promptGuidance: [
+					"Prefer direct targeted reads/grep; semantic index is optional for this repository size.",
+				],
+			};
+		}
+		try {
+			const status = await this.createSemanticRuntime().status();
+			return this.buildSingularSemanticGuidanceFromStatus(status);
+		} catch (error) {
+			const message = error instanceof Error ? error.message : String(error);
+			return {
+				statusLine: `status_unavailable (${message})`,
+				promptGuidance: [
+					"Semantic status is unavailable; proceed with conservative targeted discovery.",
+					"If discovery quality is insufficient, ask user to configure /semantic setup and rerun /singular.",
+				],
+				operatorHint: `Large/medium repo mode: cannot read semantic status (${message}). Run /semantic status.`,
+			};
+		}
+	}
+
 	private buildSingularAgentPrompt(
 		request: string,
 		baseline: SingularAnalysisResult,
 		contract: EngineeringContract,
+		runtimeGuidance: {
+			scaleMode: "small" | "medium" | "large";
+			scaleReason: string;
+			semanticStatusLine: string;
+			semanticGuidance: string[];
+		},
 	): string {
 		const filesHint =
 			baseline.matchedFiles.length > 0
@@ -8225,10 +8479,16 @@ export class InteractiveMode {
 			`- baseline_complexity: ${baseline.baselineComplexity}`,
 			`- baseline_blast_radius: ${baseline.baselineBlastRadius}`,
 			`- baseline_recommendation: ${baseline.recommendation}`,
-			"",
-			"Matched file hints from baseline (verify, do not assume blindly):",
-			filesHint,
-			"",
+				"",
+				"Repository runtime guidance:",
+				`- scale_mode: ${runtimeGuidance.scaleMode}`,
+				`- scale_reason: ${runtimeGuidance.scaleReason}`,
+				`- semantic_status: ${runtimeGuidance.semanticStatusLine}`,
+				...runtimeGuidance.semanticGuidance.map((line) => `- ${line}`),
+				"",
+				"Matched file hints from baseline (verify, do not assume blindly):",
+				filesHint,
+				"",
 			"Active engineering contract:",
 			this.buildSingularContractPromptSection(contract),
 		].join("\n");
@@ -8387,6 +8647,12 @@ export class InteractiveMode {
 		request: string,
 		baseline: SingularAnalysisResult,
 		contract: EngineeringContract,
+		runtimeGuidance: {
+			scaleMode: "small" | "medium" | "large";
+			scaleReason: string;
+			semanticStatusLine: string;
+			semanticGuidance: string[];
+		},
 	): Promise<SingularAnalysisResult | undefined> {
 		const model = this.session.model;
 		if (!model) {
@@ -8442,7 +8708,7 @@ export class InteractiveMode {
 
 		this.singularAnalysisSession = session;
 		try {
-			const primaryPrompt = this.buildSingularAgentPrompt(request, baseline, contract);
+			const primaryPrompt = this.buildSingularAgentPrompt(request, baseline, contract, runtimeGuidance);
 			const strictRetryPrompt = [
 				"Retry strict mode:",
 				"- Inspect repository files using tools first.",
@@ -8549,7 +8815,7 @@ export class InteractiveMode {
 		}
 		lines.push("");
 		lines.push("next_action:");
-		lines.push("  choose option 1/2/3 to generate a detailed execution draft in editor");
+		lines.push("  choose option 1/2/3, then pick Start with Swarm or Continue without Swarm");
 		return lines.join("\n");
 	}
 
@@ -8687,8 +8953,25 @@ export class InteractiveMode {
 			].join("\n"),
 		);
 
-		if (picked.id === "3" || result.recommendation === "defer") {
+		if (picked.id === "3") {
 			this.showStatus("Singular: defer option selected, implementation postponed.");
+			return;
+		}
+
+		const executionChoice = await this.showExtensionSelector(
+			"/singular: execution mode",
+			["Start with Swarm (Recommended)", "Continue without Swarm", "Cancel"],
+		);
+		if (!executionChoice || executionChoice === "Cancel") {
+			this.showStatus("Singular: execution cancelled.");
+			return;
+		}
+
+		if (executionChoice.startsWith("Start with Swarm")) {
+			await this.runSwarmFromSingular({
+				runId: result.runId,
+				option: Number.parseInt(picked.id, 10),
+			});
 			return;
 		}
 
@@ -8732,13 +9015,32 @@ export class InteractiveMode {
 				autosave: false,
 				contract: effectiveContract,
 			});
+			const scale = this.resolveSingularRepoScaleMode(baseline);
+			const semanticGuidance = await this.buildSingularSemanticGuidance(scale.mode);
+			if (scale.mode !== "small") {
+				this.showStatus(`Singular scale mode: ${scale.mode} (${scale.reason})`);
+			}
+			if (semanticGuidance.operatorHint) {
+				this.showWarning(semanticGuidance.operatorHint);
+			}
+			const runtimeGuidance = {
+				scaleMode: scale.mode,
+				scaleReason: scale.reason,
+				semanticStatusLine: semanticGuidance.statusLine,
+				semanticGuidance: semanticGuidance.promptGuidance,
+			};
 
 			let result = baseline;
 			if (!this.session.model) {
 				this.showWarning("No model selected. /singular used heuristic analysis only. Use /model to enable agent feasibility pass.");
 			} else {
 				try {
-					const enriched = await this.runSingularAgentFeasibilityPass(request, baseline, effectiveContract);
+					const enriched = await this.runSingularAgentFeasibilityPass(
+						request,
+						baseline,
+						effectiveContract,
+						runtimeGuidance,
+					);
 					if (enriched) {
 						result = enriched;
 					} else {
@@ -8776,6 +9078,9 @@ export class InteractiveMode {
 					"  /singular <feature request>",
 					"  /singular last",
 					"  /singular help",
+					"",
+					"Flow:",
+					"  /singular -> choose option -> Start with Swarm or Continue without Swarm",
 					"",
 					"Examples:",
 					"  /singular add account dashboard",
@@ -9742,13 +10047,28 @@ export class InteractiveMode {
 					return;
 				}
 			}
+			const mentionTask = cleaned.length > 0 ? cleaned : userInput;
+			const orchestrationAwareAgent = /orchestrator/i.test(mentionedAgent);
+			const mentionMode: OrchestrationMode = orchestrationAwareAgent ? "parallel" : "sequential";
+			const mentionMaxParallel = orchestrationAwareAgent ? 20 : undefined;
 			const mentionPrompt = [
-				"<orchestrate mode=\"sequential\" agents=\"1\">",
+				`<orchestrate mode="${mentionMode}" agents="1"${mentionMaxParallel ? ` max_parallel="${mentionMaxParallel}"` : ""}>`,
 				`- agent 1: profile=${this.activeProfileName} cwd=${this.sessionManager.getCwd()} agent=${mentionedAgent}`,
-				`task: ${cleaned.length > 0 ? cleaned : userInput}`,
+				`task: ${mentionTask}`,
 				"constraints:",
 				"- user selected a concrete custom agent via @mention",
 				`- MUST call task tool with agent="${mentionedAgent}"`,
+				...(orchestrationAwareAgent
+					? [
+							"- Include delegate_parallel_hint in the task call.",
+							"- If user explicitly requested an agent count, set delegate_parallel_hint to that count (clamp 1..10).",
+							"- Otherwise set delegate_parallel_hint based on complexity: simple=1, medium=3-6, complex/risky=7-10.",
+							"- For non-trivial tasks, prefer delegate_parallel_hint >= 2 and split into independent <delegate_task> workstreams.",
+							'- Prefer existing custom agents for delegated work when suitable (use <delegate_task agent="name" ...>).',
+							"- If no existing custom agent fits, create focused delegate streams via profile-based <delegate_task> blocks.",
+							"- If single-agent execution is still chosen, include one line: DELEGATION_IMPOSSIBLE: <reason>.",
+						]
+					: []),
 				"</orchestrate>",
 			].join("\n");
 			await this.session.prompt(mentionPrompt, {
@@ -9980,6 +10300,1204 @@ export class InteractiveMode {
 		return { targetIndex, maxIterations, forceInit };
 	}
 
+	private getSwarmHelpText(): string {
+		return [
+			"Usage:",
+			"  /swarm run <task> [--max-parallel N] [--budget-usd X]",
+			"  /swarm from-singular <run-id> --option <1|2|3> [--max-parallel N] [--budget-usd X]",
+			"  /swarm watch [run-id]",
+			"  /swarm retry <run-id> <task-id> [--reset-brief]",
+			"  /swarm resume <run-id>",
+			"  /swarm help",
+			"",
+			"Consistency model:",
+			"  Scopes -> Touches -> Locks -> Gates -> Done",
+		].join("\n");
+	}
+
+	private buildSwarmRecommendationFromOrchestrate(parsed: ParsedOrchestrateCommand): {
+		recommend: boolean;
+		reasons: string[];
+		command: string;
+	} {
+		const reasons: string[] = [];
+		let score = 0;
+		const task = parsed.task.replace(/\s+/g, " ").trim();
+		const normalizedTask = task.toLowerCase();
+		const dependencyEdges = parsed.dependencies?.reduce((sum, entry) => sum + entry.dependsOn.length, 0) ?? 0;
+		const effectiveParallel = parsed.mode === "parallel" ? parsed.maxParallel ?? parsed.agents : 1;
+
+		const highRiskPattern =
+			/\b(refactor|rewrite|migration|migrate|breaking|rollback|security|auth|authentication|authorization|permission|payment|billing|schema|database|critical)\b/i;
+		const mediumRiskPattern = /\b(cross[-\s]?module|architecture|infra|platform|multi[-\s]?file|integration)\b/i;
+
+		if (highRiskPattern.test(normalizedTask)) {
+			score += 2;
+			reasons.push("task has high-risk keywords");
+		} else if (mediumRiskPattern.test(normalizedTask)) {
+			score += 1;
+			reasons.push("task has architecture/cross-module scope");
+		}
+		if (parsed.agents >= 4) {
+			score += 2;
+			reasons.push(`high agent count (${parsed.agents})`);
+		} else if (parsed.agents >= 3) {
+			score += 1;
+			reasons.push(`multi-agent run (${parsed.agents})`);
+		}
+		if (dependencyEdges >= 3) {
+			score += 2;
+			reasons.push(`complex dependency graph (${dependencyEdges} edges)`);
+		} else if (dependencyEdges > 0) {
+			score += 1;
+			reasons.push(`dependency graph present (${dependencyEdges} edges)`);
+		}
+		if (effectiveParallel >= 3) {
+			score += 1;
+			reasons.push(`high parallelism (${effectiveParallel})`);
+		}
+		if ((parsed.locks?.length ?? 0) > 0) {
+			score += 1;
+			reasons.push("explicit lock coordination requested");
+		}
+		if (task.length >= 180) {
+			score += 1;
+			reasons.push("long task brief");
+		}
+
+		const safeTask = task.replace(/"/g, "'");
+		const commandParts = [`/swarm run "${safeTask}"`];
+		if (parsed.maxParallel !== undefined && parsed.maxParallel > 0) {
+			commandParts.push(`--max-parallel ${parsed.maxParallel}`);
+		}
+
+		return {
+			recommend: score >= 3,
+			reasons,
+			command: commandParts.join(" "),
+		};
+	}
+
+	private isEffectiveContractReady(contract: EngineeringContract): boolean {
+		const hasText = (value: string | undefined): boolean => typeof value === "string" && value.trim().length > 0;
+		const hasList = (value: string[] | undefined): boolean => Array.isArray(value) && value.some((item) => item.trim().length > 0);
+		return (
+			hasText(contract.goal) ||
+			hasList(contract.scope_include) ||
+			hasList(contract.constraints) ||
+			hasList(contract.quality_gates) ||
+			hasList(contract.definition_of_done)
+		);
+	}
+
+	private parseContractListInput(raw: string | undefined): string[] {
+		if (!raw) return [];
+		return raw
+			.split(/[\n;,]+/)
+			.map((item) => item.trim())
+			.filter((item) => item.length > 0);
+	}
+
+	private buildAutoDraftContractFromTask(task: string): EngineeringContract {
+		const normalizedTask = task.replace(/\s+/g, " ").trim();
+		const hints = loadProjectIndex(this.sessionManager.getCwd());
+		const matchedFiles = hints ? queryProjectIndex(hints, task, 8).matches.map((entry) => entry.path) : [];
+		const scopeInclude = matchedFiles.length > 0 ? matchedFiles.map((filePath) => filePath.split("/").slice(0, 2).join("/")).slice(0, 6) : [];
+		return normalizeEngineeringContract({
+			goal: normalizedTask.length > 0 ? normalizedTask : "Deliver requested change safely with bounded blast radius.",
+			scope_include: scopeInclude.length > 0 ? [...new Set(scopeInclude)].map((scope) => `${scope}/**`) : ["src/**", "test/**"],
+			scope_exclude: ["node_modules/**", "dist/**", ".iosm/**"],
+			constraints: [
+				"Preserve backward compatibility unless explicitly approved.",
+				"Keep changes scoped to declared touch zones.",
+			],
+			quality_gates: [
+				"Targeted tests for touched modules pass.",
+				"Lint/type checks pass for changed files.",
+			],
+			definition_of_done: [
+				"Implementation merged with verification evidence.",
+				"Risk notes and rollback path documented.",
+			],
+		});
+	}
+
+	private async runSwarmContractGuidedInterview(task: string): Promise<EngineeringContract | undefined> {
+		const goal = await this.showExtensionInput(
+			"Swarm contract: goal (required)",
+			task.trim() || "Deliver requested change safely.",
+		);
+		if (goal === undefined) return undefined;
+		const scopeInclude = await this.showExtensionInput(
+			"Swarm contract: scope_include (comma/newline separated)",
+			"src/**, test/**",
+		);
+		if (scopeInclude === undefined) return undefined;
+		const scopeExclude = await this.showExtensionInput(
+			"Swarm contract: scope_exclude (comma/newline separated)",
+			"node_modules/**, dist/**, .iosm/**",
+		);
+		if (scopeExclude === undefined) return undefined;
+		const constraints = await this.showExtensionInput(
+			"Swarm contract: constraints (comma/newline separated)",
+			"no breaking API changes; no unrelated refactors",
+		);
+		if (constraints === undefined) return undefined;
+		const gates = await this.showExtensionInput(
+			"Swarm contract: quality_gates (comma/newline separated)",
+			"targeted tests pass; lint/type checks pass",
+		);
+		if (gates === undefined) return undefined;
+		const done = await this.showExtensionInput(
+			"Swarm contract: definition_of_done (comma/newline separated)",
+			"implementation complete; validation evidence attached",
+		);
+		if (done === undefined) return undefined;
+
+		return normalizeEngineeringContract({
+			goal: goal.trim(),
+			scope_include: this.parseContractListInput(scopeInclude),
+			scope_exclude: this.parseContractListInput(scopeExclude),
+			constraints: this.parseContractListInput(constraints),
+			quality_gates: this.parseContractListInput(gates),
+			definition_of_done: this.parseContractListInput(done),
+		});
+	}
+
+	private async ensureSwarmEffectiveContract(task: string): Promise<EngineeringContract | undefined> {
+		const initialState = this.getContractStateSafe();
+		if (!initialState) return undefined;
+		if (this.isEffectiveContractReady(initialState.effective)) {
+			return initialState.effective;
+		}
+
+		while (true) {
+			const selected = await this.showExtensionSelector(
+				[
+					"/swarm requires an effective /contract before execution can start.",
+					"Choose how to bootstrap contract policy:",
+				].join("\n"),
+				[
+					"Auto-draft from task (Recommended)",
+					"Guided Q&A",
+					"Open manual /contract editor",
+					"Cancel",
+				],
+			);
+			if (!selected || selected === "Cancel") {
+				this.showStatus("Swarm cancelled: contract bootstrap not completed.");
+				return undefined;
+			}
+
+			if (selected.startsWith("Auto-draft")) {
+				try {
+					const draft = this.buildAutoDraftContractFromTask(task);
+					this.contractService.save("session", draft);
+					this.syncRuntimePromptSuffix();
+					this.showStatus("Swarm contract bootstrap: auto-draft saved to session overlay.");
+				} catch (error) {
+					this.showWarning(error instanceof Error ? error.message : String(error));
+				}
+			} else if (selected === "Guided Q&A") {
+				const drafted = await this.runSwarmContractGuidedInterview(task);
+				if (!drafted) {
+					this.showStatus("Swarm contract interview cancelled.");
+				} else {
+					try {
+						this.contractService.save("session", drafted);
+						this.syncRuntimePromptSuffix();
+						this.showStatus("Swarm contract bootstrap: guided contract saved to session overlay.");
+					} catch (error) {
+						this.showWarning(error instanceof Error ? error.message : String(error));
+					}
+				}
+			} else if (selected === "Open manual /contract editor") {
+				await this.runContractInteractiveMenu();
+			}
+
+			const state = this.getContractStateSafe();
+			if (!state) return undefined;
+			if (this.isEffectiveContractReady(state.effective)) {
+				return state.effective;
+			}
+			this.showWarning("Effective contract is still empty. Swarm execution remains blocked.");
+		}
+	}
+
+	private async maybeWarnSwarmSemantic(scaleMode: RepoScaleMode): Promise<string> {
+		if (scaleMode === "small") {
+			return "optional_for_small_repo";
+		}
+		try {
+			const status = await this.createSemanticRuntime().status();
+			if (!status.configured) {
+				this.showWarning("Swarm recommendation: configure semantic index via /semantic setup and /semantic index.");
+				return "not_configured";
+			}
+			if (!status.enabled) {
+				this.showWarning("Swarm recommendation: enable semantic index in /semantic setup for medium/large repositories.");
+				return "configured_but_disabled";
+			}
+			if (!status.indexed) {
+				this.showWarning("Swarm recommendation: run /semantic index before long swarm runs.");
+				return "configured_not_indexed";
+			}
+			if (status.stale) {
+				const action = status.staleReason === "provider_changed" || status.staleReason === "dimension_mismatch" ? "/semantic rebuild" : "/semantic index";
+				this.showWarning(`Swarm recommendation: semantic index is stale (${status.staleReason ?? "unknown"}). Run ${action}.`);
+				return `stale:${status.staleReason ?? "unknown"}`;
+			}
+			return `ready:${status.provider}/${status.model}`;
+		} catch (error) {
+			const message = error instanceof Error ? error.message : String(error);
+			this.showWarning(`Swarm recommendation: semantic status unavailable (${message}). Use /semantic status.`);
+			return `status_unavailable:${message}`;
+		}
+	}
+
+	private ensureSwarmProjectIndex(task: string): { index: ProjectIndex; scaleMode: RepoScaleMode; rebuilt: boolean } {
+		const cwd = this.sessionManager.getCwd();
+		const existing = loadProjectIndex(cwd);
+		if (existing) {
+			if (existing.meta.repoScaleMode === "small") {
+				return { index: existing, scaleMode: "small", rebuilt: false };
+			}
+			const ensured = ensureProjectIndex(cwd, existing.meta.repoScaleMode);
+			return { index: ensured.index, scaleMode: ensured.index.meta.repoScaleMode, rebuilt: ensured.rebuilt };
+		}
+
+		const quick = buildProjectIndex(cwd, { maxFiles: 6_000 });
+		const scaleMode = quick.meta.repoScaleMode;
+		if (scaleMode === "small") {
+			return { index: quick, scaleMode, rebuilt: true };
+		}
+		saveProjectIndex(cwd, quick);
+		return { index: quick, scaleMode, rebuilt: true };
+	}
+
+	private parseSwarmCommand(text: string): ParsedSwarmCommand | undefined {
+		const args = this.parseSlashArgs(text).slice(1);
+		if (args.length === 0) {
+			return { subcommand: "help" };
+		}
+
+		const subcommand = (args[0] ?? "").toLowerCase();
+		const rest = args.slice(1);
+		if (subcommand === "help" || subcommand === "-h" || subcommand === "--help") {
+			return { subcommand: "help" };
+		}
+
+		if (subcommand === "watch") {
+			return {
+				subcommand: "watch",
+				runId: rest[0],
+			};
+		}
+
+		if (subcommand === "resume") {
+			const runId = rest[0];
+			if (!runId) {
+				this.showWarning("Usage: /swarm resume <run-id>");
+				return undefined;
+			}
+			return { subcommand: "resume", runId };
+		}
+
+		if (subcommand === "retry") {
+			const runId = rest[0];
+			const taskId = rest[1];
+			if (!runId || !taskId) {
+				this.showWarning("Usage: /swarm retry <run-id> <task-id> [--reset-brief]");
+				return undefined;
+			}
+			const resetBrief = rest.slice(2).some((token) => token === "--reset-brief");
+			return { subcommand: "retry", runId, taskId, resetBrief };
+		}
+
+		let maxParallel: number | undefined;
+		let budgetUsd: number | undefined;
+		const taskParts: string[] = [];
+		let fromSingularOption: number | undefined;
+		let fromSingularRunId: string | undefined;
+
+		for (let index = 0; index < rest.length; index += 1) {
+			const token = rest[index] ?? "";
+			if (token === "--max-parallel") {
+				const next = rest[index + 1];
+				const parsed = next ? Number.parseInt(next, 10) : Number.NaN;
+				if (!Number.isInteger(parsed) || parsed < 1 || parsed > 20) {
+					this.showWarning("Invalid --max-parallel value (expected 1..20).");
+					return undefined;
+				}
+				maxParallel = parsed;
+				index += 1;
+				continue;
+			}
+			if (token === "--budget-usd") {
+				const next = rest[index + 1];
+				const parsed = next ? Number.parseFloat(next) : Number.NaN;
+				if (!Number.isFinite(parsed) || parsed <= 0) {
+					this.showWarning("Invalid --budget-usd value (expected > 0).");
+					return undefined;
+				}
+				budgetUsd = parsed;
+				index += 1;
+				continue;
+			}
+			if (token === "--option") {
+				const next = rest[index + 1];
+				const parsed = next ? Number.parseInt(next, 10) : Number.NaN;
+				if (!Number.isInteger(parsed) || parsed < 1 || parsed > 3) {
+					this.showWarning("Invalid --option value (expected 1|2|3).");
+					return undefined;
+				}
+				fromSingularOption = parsed;
+				index += 1;
+				continue;
+			}
+			if (token.startsWith("-")) {
+				this.showWarning(`Unknown option for /swarm ${subcommand}: ${token}`);
+				return undefined;
+			}
+			if (subcommand === "from-singular" && !fromSingularRunId) {
+				fromSingularRunId = token;
+				continue;
+			}
+			taskParts.push(token);
+		}
+
+		if (subcommand === "run") {
+			const task = taskParts.join(" ").trim();
+			if (!task) {
+				this.showWarning("Usage: /swarm run <task> [--max-parallel N] [--budget-usd X]");
+				return undefined;
+			}
+			return { subcommand, task, maxParallel, budgetUsd };
+		}
+
+		if (subcommand === "from-singular") {
+			if (!fromSingularRunId || !fromSingularOption) {
+				this.showWarning("Usage: /swarm from-singular <run-id> --option <1|2|3> [--max-parallel N] [--budget-usd X]");
+				return undefined;
+			}
+			return {
+				subcommand,
+				runId: fromSingularRunId,
+				option: fromSingularOption,
+				maxParallel,
+				budgetUsd,
+			};
+		}
+
+		this.showWarning(`Unknown /swarm subcommand "${subcommand}". Use /swarm help.`);
+		return undefined;
+	}
+
+	private buildSwarmBootstrapState(runId: string, plan: SwarmPlan, budgetUsd?: number): SwarmRuntimeState {
+		const tasks: SwarmRuntimeState["tasks"] = {};
+		for (const task of plan.tasks) {
+			tasks[task.id] = {
+				id: task.id,
+				status: task.depends_on.length === 0 ? "ready" : "pending",
+				attempts: 0,
+				depends_on: [...task.depends_on],
+				touches: [...task.touches],
+				scopes: [...task.scopes],
+			};
+		}
+		return {
+			runId,
+			status: "running",
+			createdAt: new Date().toISOString(),
+			updatedAt: new Date().toISOString(),
+			tick: 0,
+			noProgressTicks: 0,
+			readyQueue: Object.values(tasks)
+				.filter((task) => task.status === "ready")
+				.map((task) => task.id),
+			blockedTasks: [],
+			tasks,
+			locks: {},
+			retries: {},
+			budget: {
+				limitUsd: budgetUsd,
+				spentUsd: 0,
+				warned80: false,
+				hardStopped: false,
+			},
+		};
+	}
+
+	private buildSwarmRunMeta(input: {
+		runId: string;
+		source: "plain" | "singular";
+		request: string;
+		contract: EngineeringContract;
+		repoScaleMode: RepoScaleMode;
+		semanticStatus: string;
+		maxParallel: number;
+		budgetUsd?: number;
+		linkedSingularRunId?: string;
+		linkedSingularOption?: string;
+	}): SwarmRunMeta {
+		return {
+			runId: input.runId,
+			createdAt: new Date().toISOString(),
+			source: input.source,
+			request: input.request,
+			contract: input.contract,
+			contractHash: crypto.createHash("sha256").update(JSON.stringify(input.contract)).digest("hex").slice(0, 16),
+			repoScaleMode: input.repoScaleMode,
+			semanticStatus: input.semanticStatus,
+			maxParallel: input.maxParallel,
+			budgetUsd: input.budgetUsd,
+			linkedSingularRunId: input.linkedSingularRunId,
+			linkedSingularOption: input.linkedSingularOption,
+		};
+	}
+
+	private resolveSwarmTaskProfile(task: SwarmTaskPlan): AgentProfileName {
+		if (task.concurrency_class === "analysis") return "explore";
+		if (task.concurrency_class === "verification" || task.concurrency_class === "tests") return "iosm_verifier";
+		if (task.concurrency_class === "docs") return "plan";
+		return "full";
+	}
+
+	private estimateSwarmTaskCostUsd(task: SwarmTaskPlan): number {
+		if (task.severity === "high") return 0.35;
+		if (task.severity === "medium") return 0.2;
+		return 0.12;
+	}
+
+	private deriveSwarmTaskDelegateParallelHint(task: SwarmTaskPlan): number {
+		const brief = task.brief.toLowerCase();
+		const hasComplexKeyword = /(refactor|migration|rewrite|split|cross[-\s]?module|architecture|platform|integration|security|auth)/i.test(
+			brief,
+		);
+		const hasVeryComplexSignal =
+			/(overhaul|major|system-wide|cross-cutting|multi-service|facet|registry)/i.test(brief) ||
+			task.touches.length >= 5 ||
+			task.scopes.length >= 4;
+		if (task.severity === "low" && task.touches.length <= 2 && task.scopes.length <= 2 && !hasComplexKeyword) {
+			return 1;
+		}
+		if (task.severity === "high" && (hasVeryComplexSignal || hasComplexKeyword || task.touches.length >= 3)) {
+			return 10;
+		}
+		if (task.severity === "high") return 8;
+		if (task.severity === "medium" && (hasVeryComplexSignal || task.touches.length >= 4 || hasComplexKeyword)) return 7;
+		if (task.severity === "medium") return 5;
+		return hasComplexKeyword ? 3 : 1;
+	}
+
+	private parseSwarmSpawnCandidates(output: string, parentTaskId: string): SwarmDispatchResult["spawnCandidates"] {
+		const lines = output.split(/\r?\n/);
+		const results: NonNullable<SwarmDispatchResult["spawnCandidates"]> = [];
+		for (const rawLine of lines) {
+			const line = rawLine.trim();
+			const match = line.match(/^[*-]\s+(.+?)\s*\|\s*(.+?)\s*\|\s*(.+?)\s*\|\s*(low|medium|high)\s*$/i);
+			if (!match) continue;
+			results.push({
+				description: match[1]!.trim(),
+				path: match[2]!.trim(),
+				changeType: match[3]!.trim(),
+				severity: match[4]!.trim().toLowerCase() as "low" | "medium" | "high",
+				parentTaskId,
+			});
+			if (results.length >= 10) break;
+		}
+		return results;
+	}
+
+	private loadSingularAnalysisByRunId(runId: string): SingularAnalysisResult | undefined {
+		const analysisPath = path.join(this.singularService.getAnalysesRoot(), runId, "analysis.json");
+		if (!fs.existsSync(analysisPath)) return undefined;
+		try {
+			return JSON.parse(fs.readFileSync(analysisPath, "utf8")) as SingularAnalysisResult;
+		} catch {
+			return undefined;
+		}
+	}
+
+	private async dispatchSwarmTaskWithAgent(input: {
+		meta: SwarmRunMeta;
+		task: SwarmTaskPlan;
+		runtime: SwarmTaskRuntimeState;
+		contract: EngineeringContract;
+	}): Promise<SwarmDispatchResult> {
+		const model = this.session.model;
+		if (!model) {
+			return {
+				taskId: input.task.id,
+				status: "error",
+				error: "No active model configured for swarm task dispatch.",
+				costUsd: this.estimateSwarmTaskCostUsd(input.task),
+			};
+		}
+
+		const profile = this.resolveSwarmTaskProfile(input.task);
+		const delegateParallelHint = this.deriveSwarmTaskDelegateParallelHint(input.task);
+		const safeDescription = input.task.brief.replace(/\s+/g, " ").trim().slice(0, 120).replace(/"/g, "'");
+		const prompt = [
+			`<swarm_task run_id="${input.meta.runId}" task_id="${input.task.id}" profile_hint="${profile}">`,
+			`request: ${input.meta.request}`,
+			`task_brief: ${input.task.brief}`,
+			`touches: ${input.runtime.touches.join(", ") || "(none)"}`,
+			`scopes: ${input.runtime.scopes.join(", ") || "(none)"}`,
+			`constraints: ${(input.contract.constraints ?? []).join("; ") || "(none)"}`,
+			`quality_gates: ${(input.contract.quality_gates ?? []).join("; ") || "(none)"}`,
+			"",
+			"Execution requirements:",
+			`- Use the task tool exactly once with description="${safeDescription || input.task.id}", profile="${profile}", delegate_parallel_hint=${delegateParallelHint}, run_id="${input.meta.runId}", task_id="${input.task.id}".`,
+			`- Inside this single task call, prefer decomposition into <delegate_task> subtasks when delegate_parallel_hint >= 2 (target parallel fan-out up to ${delegateParallelHint}).`,
+			"- If decomposition is not beneficial, continue with single-agent execution (optional note: DELEGATION_IMPOSSIBLE: <reason>).",
+			"- Keep edits inside declared scopes/touches. If scope expansion is required, explain and stop.",
+			"- If blocked, respond with line: BLOCKED: <reason>",
+			"- Optional spawn candidates format: '- <description> | <path> | <change_type> | <low|medium|high>'",
+			"</swarm_task>",
+		].join("\n");
+
+		const cwd = this.sessionManager.getCwd();
+		const agentDir = getAgentDir();
+		const settingsManager = SettingsManager.create(cwd, agentDir);
+		const authStorage = this.session.modelRegistry.authStorage;
+		const resourceLoader = new DefaultResourceLoader({
+			cwd,
+			agentDir,
+			settingsManager,
+			noExtensions: true,
+			noSkills: true,
+			noPromptTemplates: true,
+		});
+		try {
+			await resourceLoader.reload();
+		} catch (error) {
+			return {
+				taskId: input.task.id,
+				status: "error",
+				error: `Failed to initialize swarm task runtime: ${error instanceof Error ? error.message : String(error)}`,
+				costUsd: this.estimateSwarmTaskCostUsd(input.task),
+			};
+		}
+
+		let swarmSession: AgentSession | undefined;
+		try {
+			const created = await createAgentSession({
+				cwd,
+				sessionManager: SessionManager.inMemory(),
+				settingsManager,
+				authStorage,
+				modelRegistry: this.session.modelRegistry,
+				resourceLoader,
+				model,
+				thinkingLevel: this.session.thinkingLevel,
+				profile: "full",
+				enableTaskTool: true,
+			});
+			swarmSession = created.session;
+		} catch (error) {
+			return {
+				taskId: input.task.id,
+				status: "error",
+				error: `Failed to create isolated swarm session: ${error instanceof Error ? error.message : String(error)}`,
+				costUsd: this.estimateSwarmTaskCostUsd(input.task),
+			};
+		}
+
+		let taskToolCalls = 0;
+		const taskErrors: string[] = [];
+		let delegatedFailed = 0;
+		let delegatedTasks = 0;
+		const delegatedFailureCauses = new Map<string, number>();
+		const accumulateFailureCauses = (raw: unknown): void => {
+			if (!raw || typeof raw !== "object") return;
+			for (const [cause, count] of Object.entries(raw as Record<string, unknown>)) {
+				if (typeof cause !== "string" || !cause.trim()) continue;
+				const numeric = typeof count === "number" ? count : Number.parseInt(String(count ?? 0), 10);
+				if (!Number.isFinite(numeric) || numeric <= 0) continue;
+				delegatedFailureCauses.set(cause, (delegatedFailureCauses.get(cause) ?? 0) + numeric);
+			}
+		};
+		const chunks: string[] = [];
+		const unsubscribe = swarmSession.subscribe((event) => {
+			if (event.type === "tool_execution_start" && event.toolName === "task") {
+				taskToolCalls += 1;
+				return;
+			}
+			if (event.type === "tool_execution_end" && event.toolName === "task") {
+				const result = event.result as { output?: string; error?: string; details?: Record<string, unknown> } | undefined;
+				const details = result?.details;
+				if (typeof details?.delegatedFailed === "number" && Number.isFinite(details.delegatedFailed)) {
+					delegatedFailed += Math.max(0, details.delegatedFailed);
+				}
+				if (typeof details?.delegatedTasks === "number" && Number.isFinite(details.delegatedTasks)) {
+					delegatedTasks += Math.max(0, details.delegatedTasks);
+				}
+				accumulateFailureCauses(details?.failureCauses);
+				if (event.isError) {
+					taskErrors.push(result?.error ?? result?.output ?? "task tool failed");
+				}
+				return;
+			}
+			if (event.type === "message_end" && event.message.role === "assistant") {
+				for (const part of event.message.content) {
+					if (part.type === "text" && part.text.trim()) {
+						chunks.push(part.text.trim());
+					}
+				}
+			}
+		});
+
+		try {
+			await swarmSession.prompt(prompt, {
+				expandPromptTemplates: false,
+				skipIosmAutopilot: true,
+				skipOrchestrationDirective: true,
+				source: "interactive",
+			});
+		} catch (error) {
+			return {
+				taskId: input.task.id,
+				status: "error",
+				error: error instanceof Error ? error.message : String(error),
+				costUsd: this.estimateSwarmTaskCostUsd(input.task),
+			};
+		} finally {
+			unsubscribe();
+			if (swarmSession.isStreaming) {
+				await swarmSession.abort().catch(() => {
+					// best effort
+				});
+			}
+			swarmSession.dispose();
+		}
+
+		const output = chunks.join("\n\n").trim();
+		if (/^\s*BLOCKED\s*:/im.test(output)) {
+			const reason = output.match(/^\s*BLOCKED\s*:\s*(.+)$/im)?.[1]?.trim() ?? "Blocked by execution policy.";
+			return {
+				taskId: input.task.id,
+				status: "blocked",
+				error: reason,
+				costUsd: this.estimateSwarmTaskCostUsd(input.task),
+			};
+		}
+		if (taskToolCalls === 0) {
+			return {
+				taskId: input.task.id,
+				status: "error",
+				error: "No task tool call executed by assistant.",
+				costUsd: this.estimateSwarmTaskCostUsd(input.task),
+			};
+		}
+		if (taskErrors.length > 0) {
+			return {
+				taskId: input.task.id,
+				status: "error",
+				error: taskErrors.join(" | "),
+				failureCause: "task_tool_error",
+				costUsd: this.estimateSwarmTaskCostUsd(input.task),
+			};
+		}
+		if (delegatedFailed > 0) {
+			const failureSummary = [...delegatedFailureCauses.entries()]
+				.sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
+				.map(([cause, count]) => `${cause}=${count}`)
+				.join(", ");
+			const totalDelegates = delegatedTasks > 0 ? delegatedTasks : delegatedFailed;
+			const error = `delegates_failed ${delegatedFailed}/${totalDelegates}${failureSummary ? ` (${failureSummary})` : ""}`;
+			return {
+				taskId: input.task.id,
+				status: "error",
+				error,
+				failureCause: failureSummary || "delegates_failed",
+				costUsd: this.estimateSwarmTaskCostUsd(input.task),
+			};
+		}
+		return {
+			taskId: input.task.id,
+			status: "done",
+			costUsd: this.estimateSwarmTaskCostUsd(input.task),
+			spawnCandidates: this.parseSwarmSpawnCandidates(output, input.task.id),
+		};
+	}
+
+	private async executeSwarmRun(input: {
+		runId: string;
+		plan: SwarmPlan;
+		meta: SwarmRunMeta;
+		contract: EngineeringContract;
+		budgetUsd?: number;
+		resumeState?: SwarmRuntimeState;
+		projectIndex?: ProjectIndex;
+		enableIncrementalIndex?: boolean;
+	}): Promise<void> {
+		const cwd = this.sessionManager.getCwd();
+		const store = new SwarmStateStore(cwd, input.runId);
+		const initialState = input.resumeState ?? this.buildSwarmBootstrapState(input.runId, input.plan, input.budgetUsd);
+		if (!input.resumeState) {
+			store.init(input.meta, input.plan, initialState);
+		}
+		let rollingIndex = input.projectIndex;
+		let localStopRequested = false;
+		const refreshIncrementalIndex = (): void => {
+			if (!input.enableIncrementalIndex || !rollingIndex) return;
+			const changed = collectChangedFilesSince(rollingIndex, cwd);
+			if (changed.length === 0) return;
+			const rebuilt = buildProjectIndex(cwd, {
+				incrementalFrom: rollingIndex,
+				changedFiles: changed,
+				maxFiles: Math.max(2_000, rollingIndex.meta.totalFiles + 1_000),
+			});
+			saveProjectIndex(cwd, rebuilt);
+			rollingIndex = rebuilt;
+		};
+
+		this.swarmActiveRunId = input.runId;
+		this.showStatus(`Swarm run started: ${input.runId}`);
+		const schedulerResult = await runSwarmScheduler({
+			runId: input.runId,
+			plan: input.plan,
+			contract: input.contract,
+			maxParallel: input.meta.maxParallel,
+			budgetUsd: input.budgetUsd,
+			existingState: initialState,
+			dispatchTask: async ({ task, runtime }) =>
+				this.dispatchSwarmTaskWithAgent({
+					meta: input.meta,
+					task,
+					runtime,
+					contract: input.contract,
+				}),
+			confirmSpawn: async ({ candidate, parentTask }) => {
+				const requiresConfirmation = candidate.severity === "high" || parentTask.spawn_policy === "manual_high_risk";
+				if (!requiresConfirmation) return true;
+				const choice = await this.showExtensionSelector(
+					[
+						`/swarm spawn candidate requires confirmation`,
+						`severity=${candidate.severity} task=${parentTask.id}`,
+						`description=${candidate.description}`,
+						`path=${candidate.path}`,
+					].join("\n"),
+					["Approve spawn", "Reject spawn (Recommended)", "Abort run"],
+				);
+				if (!choice || choice.startsWith("Reject")) {
+					this.showStatus(`Swarm spawn rejected: ${candidate.description}`);
+					return false;
+				}
+				if (choice === "Abort run") {
+					localStopRequested = true;
+					this.showWarning("Swarm run marked to stop after current scheduling step.");
+					return false;
+				}
+				return true;
+			},
+			onEvent: (event) => {
+				store.appendEvent(event);
+			},
+			onStateChanged: (state) => {
+				store.saveState(state);
+				store.saveCheckpoint(state);
+				refreshIncrementalIndex();
+			},
+			shouldStop: () => this.shutdownRequested || localStopRequested,
+		});
+		this.swarmActiveRunId = undefined;
+
+		const taskStates = Object.values(schedulerResult.state.tasks);
+		const doneCount = taskStates.filter((task) => task.status === "done").length;
+		const errorCount = taskStates.filter((task) => task.status === "error").length;
+		const blockedCount = taskStates.filter((task) => task.status === "blocked").length;
+		const total = taskStates.length;
+
+		const reportLines = [
+			"# Swarm Integration Report",
+			"",
+			`- run_id: ${input.runId}`,
+			`- source: ${input.meta.source}`,
+			`- request: ${input.meta.request}`,
+			`- status: ${schedulerResult.state.status}`,
+			`- tasks: ${doneCount}/${total} done, ${errorCount} error, ${blockedCount} blocked`,
+			`- budget: ${schedulerResult.state.budget.spentUsd.toFixed(2)}${input.meta.budgetUsd ? ` / ${input.meta.budgetUsd.toFixed(2)}` : ""} USD`,
+			"",
+			"## Consistency Model",
+			"Scopes -> Touches -> Locks -> Gates -> Done",
+			"",
+			"## Task Gates",
+			...schedulerResult.taskGates.map(
+				(gate) => `- ${gate.taskId}: ${gate.pass ? "pass" : "fail"}${gate.failures.length > 0 ? ` (${gate.failures.join("; ")})` : ""}`,
+			),
+			"",
+			"## Run Gates",
+			`- pass: ${schedulerResult.runGate.pass}`,
+			...schedulerResult.runGate.failures.map((item) => `- fail: ${item}`),
+			...schedulerResult.runGate.warnings.map((item) => `- warn: ${item}`),
+			"",
+			"## Spawn Backlog",
+			...(schedulerResult.spawnBacklog.length > 0
+				? schedulerResult.spawnBacklog.map((item) => `- ${item.description} | ${item.path} | ${item.changeType} | fp=${item.fingerprint}`)
+				: ["- none"]),
+		];
+
+		store.writeReports({
+			integrationReport: reportLines.join("\n"),
+			gates: {
+				task_gates: schedulerResult.taskGates,
+				run_gate: schedulerResult.runGate,
+				status: schedulerResult.state.status,
+			},
+			sharedContext: [
+				"# Shared Context",
+				"",
+				`Run ${input.runId} finished with status: ${schedulerResult.state.status}.`,
+				`Recommendation: ${schedulerResult.runGate.pass ? "proceed to /iosm for measurable optimization" : "resolve failed gates before /iosm"}.`,
+			].join("\n"),
+		});
+
+		this.showCommandTextBlock(
+			"Swarm Run",
+			[
+				`run_id: ${input.runId}`,
+				`status: ${schedulerResult.state.status}`,
+				`tasks: ${doneCount}/${total} done · ${errorCount} error · ${blockedCount} blocked`,
+				`budget_usd: ${schedulerResult.state.budget.spentUsd.toFixed(2)}${input.meta.budgetUsd ? `/${input.meta.budgetUsd.toFixed(2)}` : ""}`,
+				`watch: /swarm watch ${input.runId}`,
+				`resume: /swarm resume ${input.runId}`,
+			].join("\n"),
+		);
+	}
+
+	private async runSwarmFromTask(task: string, options: { maxParallel?: number; budgetUsd?: number }): Promise<void> {
+		const contract = await this.ensureSwarmEffectiveContract(task);
+		if (!contract) return;
+
+		const indexInfo = this.ensureSwarmProjectIndex(task);
+		if (indexInfo.rebuilt) {
+			this.showStatus(`Swarm project index ready (${indexInfo.scaleMode}).`);
+		}
+		const semanticStatus = await this.maybeWarnSwarmSemantic(indexInfo.scaleMode);
+		const plan = buildSwarmPlanFromTask({
+			request: task,
+			contract,
+			index: indexInfo.index,
+		});
+
+		const runId = `swarm_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+		const maxParallel = Math.max(1, Math.min(20, options.maxParallel ?? 3));
+		const meta = this.buildSwarmRunMeta({
+			runId,
+			source: "plain",
+			request: task,
+			contract,
+			repoScaleMode: indexInfo.scaleMode,
+			semanticStatus,
+			maxParallel,
+			budgetUsd: options.budgetUsd,
+		});
+
+		await this.executeSwarmRun({
+			runId,
+			plan,
+			meta,
+			contract,
+			budgetUsd: options.budgetUsd,
+			projectIndex: indexInfo.index,
+			enableIncrementalIndex: indexInfo.scaleMode !== "small",
+		});
+	}
+
+	private async runSwarmFromSingular(input: {
+		runId: string;
+		option: number;
+		maxParallel?: number;
+		budgetUsd?: number;
+	}): Promise<void> {
+		const analysis = this.loadSingularAnalysisByRunId(input.runId);
+		if (!analysis) {
+			this.showWarning(`Singular run not found: ${input.runId}`);
+			return;
+		}
+		const option = analysis.options.find((item) => item.id === String(input.option));
+		if (!option) {
+			this.showWarning(`Option ${input.option} not found in singular run ${input.runId}.`);
+			return;
+		}
+
+		const contract = await this.ensureSwarmEffectiveContract(analysis.request);
+		if (!contract) return;
+
+		const indexInfo = this.ensureSwarmProjectIndex(`${analysis.request} ${option.title}`);
+		const semanticStatus = await this.maybeWarnSwarmSemantic(indexInfo.scaleMode);
+		const plan = buildSwarmPlanFromSingular({
+			analysis,
+			option,
+			contract,
+			index: indexInfo.index,
+		});
+
+		const runId = `swarm_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+		const maxParallel = Math.max(1, Math.min(20, input.maxParallel ?? 3));
+		const meta = this.buildSwarmRunMeta({
+			runId,
+			source: "singular",
+			request: analysis.request,
+			contract,
+			repoScaleMode: indexInfo.scaleMode,
+			semanticStatus,
+			maxParallel,
+			budgetUsd: input.budgetUsd,
+			linkedSingularRunId: analysis.runId,
+			linkedSingularOption: option.id,
+		});
+
+		await this.executeSwarmRun({
+			runId,
+			plan,
+			meta,
+			contract,
+			budgetUsd: input.budgetUsd,
+			projectIndex: indexInfo.index,
+			enableIncrementalIndex: indexInfo.scaleMode !== "small",
+		});
+	}
+
+	private loadSwarmRunBundle(runId: string): { meta: SwarmRunMeta; plan: SwarmPlan; state: SwarmRuntimeState } | undefined {
+		const store = new SwarmStateStore(this.sessionManager.getCwd(), runId);
+		const meta = store.loadMeta();
+		const plan = store.loadPlan();
+		const state = store.loadState();
+		if (!meta || !plan || !state) return undefined;
+		return { meta, plan, state };
+	}
+
+	private computeSwarmCriticalPathLength(plan: SwarmPlan): number {
+		const byId = new Map(plan.tasks.map((task) => [task.id, task]));
+		const memo = new Map<string, number>();
+		const visiting = new Set<string>();
+		const visit = (taskId: string): number => {
+			if (memo.has(taskId)) return memo.get(taskId)!;
+			if (visiting.has(taskId)) return 1;
+			visiting.add(taskId);
+			const task = byId.get(taskId);
+			if (!task) return 1;
+			const depMax = task.depends_on.reduce((maxValue, depId) => Math.max(maxValue, visit(depId)), 0);
+			const value = depMax + 1;
+			memo.set(taskId, value);
+			visiting.delete(taskId);
+			return value;
+		};
+
+		let best = 0;
+		for (const task of plan.tasks) {
+			best = Math.max(best, visit(task.id));
+		}
+		return best;
+	}
+
+	private computeSwarmDependentCounts(plan: SwarmPlan): Map<string, number> {
+		const counts = new Map<string, number>();
+		for (const task of plan.tasks) {
+			for (const dep of task.depends_on) {
+				counts.set(dep, (counts.get(dep) ?? 0) + 1);
+			}
+		}
+		return counts;
+	}
+
+	private formatSwarmWatch(meta: SwarmRunMeta, plan: SwarmPlan, state: SwarmRuntimeState): string {
+		const tasks = Object.values(state.tasks);
+		const done = tasks.filter((task) => task.status === "done").length;
+		const running = tasks.filter((task) => task.status === "running").length;
+		const blocked = tasks.filter((task) => task.status === "blocked").length;
+		const errors = tasks.filter((task) => task.status === "error").length;
+		const pending = tasks.filter((task) => task.status === "pending" || task.status === "ready").length;
+		const total = tasks.length;
+		const remaining = Math.max(0, total - done);
+		const throughputPerTick = done > 0 && state.tick > 0 ? done / state.tick : 0;
+		const etaTicks = throughputPerTick > 0 ? Math.ceil(remaining / throughputPerTick) : undefined;
+		const criticalPath = this.computeSwarmCriticalPathLength(plan);
+		const speedupPotential = criticalPath > 0 ? total / criticalPath : 1;
+		const dependentCounts = this.computeSwarmDependentCounts(plan);
+		const bottlenecks = [...dependentCounts.entries()]
+			.sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
+			.slice(0, 3);
+		const lines = [
+			`run_id: ${meta.runId}`,
+			`status: ${state.status}`,
+			`source: ${meta.source}`,
+			`request: ${meta.request}`,
+			"consistency_model: Scopes -> Touches -> Locks -> Gates -> Done",
+			`progress: done=${done}/${tasks.length} running=${running} pending=${pending} blocked=${blocked} error=${errors}`,
+			`budget_usd: ${state.budget.spentUsd.toFixed(2)}${meta.budgetUsd ? `/${meta.budgetUsd.toFixed(2)}` : ""} warned80=${state.budget.warned80 ? "yes" : "no"}`,
+			`tick: ${state.tick} no_progress_ticks: ${state.noProgressTicks}`,
+			`eta_ticks: ${etaTicks ?? "unknown"} throughput_per_tick=${throughputPerTick > 0 ? throughputPerTick.toFixed(2) : "0.00"}`,
+			`critical_path: ${criticalPath} theoretical_speedup=${speedupPotential.toFixed(2)}x`,
+			`repo_scale: ${meta.repoScaleMode} semantic: ${meta.semanticStatus ?? "unknown"}`,
+			"",
+			...(bottlenecks.length > 0
+				? ["bottlenecks:", ...bottlenecks.map(([taskId, dependents]) => `- ${taskId}: unlocks ${dependents} downstream task(s)`), ""]
+				: []),
+			"tasks:",
+			...plan.tasks.map((task) => {
+				const runtime = state.tasks[task.id];
+				if (!runtime) return `- ${task.id}: missing runtime state`;
+				return `- ${task.id}: ${runtime.status} attempts=${runtime.attempts} touches=${runtime.touches.slice(0, 3).join(",") || "-"}`;
+			}),
+		];
+		if (Object.keys(state.locks).length > 0) {
+			lines.push("", "locks:");
+			for (const [taskId, touches] of Object.entries(state.locks)) {
+				lines.push(`- ${taskId}: ${touches.join(", ")}`);
+			}
+		}
+		return lines.join("\n");
+	}
+
+	private async runSwarmResume(runId: string): Promise<void> {
+		const bundle = this.loadSwarmRunBundle(runId);
+		if (!bundle) {
+			this.showWarning(`Swarm run not found or incomplete: ${runId}`);
+			return;
+		}
+		if (bundle.state.status === "completed") {
+			this.showStatus(`Swarm run ${runId} is already completed.`);
+			return;
+		}
+		bundle.state.status = "running";
+		bundle.state.updatedAt = new Date().toISOString();
+		await this.executeSwarmRun({
+			runId,
+			plan: bundle.plan,
+			meta: bundle.meta,
+			contract: bundle.meta.contract,
+			budgetUsd: bundle.meta.budgetUsd,
+			resumeState: bundle.state,
+			projectIndex: bundle.meta.repoScaleMode === "small" ? undefined : loadProjectIndex(this.sessionManager.getCwd()),
+			enableIncrementalIndex: bundle.meta.repoScaleMode !== "small",
+		});
+	}
+
+	private async runSwarmRetry(runId: string, taskId: string, resetBrief: boolean): Promise<void> {
+		const bundle = this.loadSwarmRunBundle(runId);
+		if (!bundle) {
+			this.showWarning(`Swarm run not found or incomplete: ${runId}`);
+			return;
+		}
+		const target = bundle.state.tasks[taskId];
+		if (!target) {
+			this.showWarning(`Task ${taskId} not found in run ${runId}.`);
+			return;
+		}
+		if (resetBrief) {
+			const existingPlan = bundle.plan.tasks.find((task) => task.id === taskId);
+			const edited = await this.showExtensionInput(
+				`/swarm retry: update brief for ${taskId}`,
+				existingPlan?.brief ?? target.id,
+			);
+			if (edited === undefined) {
+				this.showStatus("Swarm retry cancelled.");
+				return;
+			}
+			if (existingPlan) {
+				existingPlan.brief = edited.trim() || existingPlan.brief;
+			}
+		}
+
+		target.status = "ready";
+		target.lastError = undefined;
+		target.completedAt = undefined;
+		bundle.state.retries[taskId] = 0;
+		bundle.state.status = "running";
+		bundle.state.updatedAt = new Date().toISOString();
+
+		const store = new SwarmStateStore(this.sessionManager.getCwd(), runId);
+		store.savePlan(bundle.plan);
+		store.saveState(bundle.state);
+		store.appendEvent({
+			type: "task_retry",
+			timestamp: new Date().toISOString(),
+			runId,
+			taskId,
+			message: resetBrief ? "manual retry with reset brief" : "manual retry",
+		});
+
+		await this.executeSwarmRun({
+			runId,
+			plan: bundle.plan,
+			meta: bundle.meta,
+			contract: bundle.meta.contract,
+			budgetUsd: bundle.meta.budgetUsd,
+			resumeState: bundle.state,
+			projectIndex: bundle.meta.repoScaleMode === "small" ? undefined : loadProjectIndex(this.sessionManager.getCwd()),
+			enableIncrementalIndex: bundle.meta.repoScaleMode !== "small",
+		});
+	}
+
+	private async handleSwarmCommand(text: string): Promise<void> {
+		if (this.session.isStreaming) {
+			this.showWarning("Cannot run /swarm while the agent is processing another request.");
+			return;
+		}
+		if (this.session.isCompacting) {
+			this.showWarning("Cannot run /swarm while compaction is running.");
+			return;
+		}
+
+		const parsed = this.parseSwarmCommand(text);
+		if (!parsed) return;
+
+		if (parsed.subcommand === "help") {
+			this.showCommandTextBlock("Swarm Help", this.getSwarmHelpText());
+			return;
+		}
+
+		if (parsed.subcommand === "watch") {
+			let runId = parsed.runId;
+			if (!runId) {
+				const runs = SwarmStateStore.listRuns(this.sessionManager.getCwd(), 20);
+				if (runs.length === 0) {
+					this.showStatus("No swarm runs found.");
+					return;
+				}
+				runId = runs[0]!.runId;
+			}
+			const bundle = this.loadSwarmRunBundle(runId);
+			if (!bundle) {
+				this.showWarning(`Swarm run not found or incomplete: ${runId}`);
+				return;
+			}
+			this.showCommandTextBlock("Swarm Watch", this.formatSwarmWatch(bundle.meta, bundle.plan, bundle.state));
+			return;
+		}
+
+		if (parsed.subcommand === "resume") {
+			await this.runSwarmResume(parsed.runId);
+			return;
+		}
+
+		if (parsed.subcommand === "retry") {
+			await this.runSwarmRetry(parsed.runId, parsed.taskId, parsed.resetBrief);
+			return;
+		}
+
+		if (parsed.subcommand === "run") {
+			await this.runSwarmFromTask(parsed.task, {
+				maxParallel: parsed.maxParallel,
+				budgetUsd: parsed.budgetUsd,
+			});
+			return;
+		}
+
+		if (parsed.subcommand === "from-singular") {
+			await this.runSwarmFromSingular({
+				runId: parsed.runId,
+				option: parsed.option,
+				maxParallel: parsed.maxParallel,
+				budgetUsd: parsed.budgetUsd,
+			});
+		}
+	}
+
 	private parseOrchestrateSlashCommand(text: string): ParsedOrchestrateCommand | undefined {
 		const args = this.parseSlashArgs(text).slice(1);
 		let mode: OrchestrationMode | undefined;
@@ -10193,9 +11711,24 @@ export class InteractiveMode {
 			return;
 		}
 
+		const rawArgs = this.parseSlashArgs(text).slice(1);
+		if (rawArgs.includes("--swarm")) {
+			this.showWarning("`/orchestrate --swarm` was removed to avoid ambiguity. Use `/swarm` commands directly.");
+			this.showCommandTextBlock("Swarm Usage", this.getSwarmHelpText());
+			return;
+		}
+
 		const parsed = this.parseOrchestrateSlashCommand(text);
 		if (!parsed) {
 			return;
+		}
+		const swarmRecommendation = this.buildSwarmRecommendationFromOrchestrate(parsed);
+		if (swarmRecommendation.recommend) {
+			this.showWarning(
+				`This task looks complex/risky for legacy /orchestrate (${swarmRecommendation.reasons.join(
+					"; ",
+				)}). Consider ${swarmRecommendation.command}.`,
+			);
 		}
 
 		const currentCwd = this.sessionManager.getCwd();
@@ -10255,10 +11788,11 @@ export class InteractiveMode {
 			...taskCallHints,
 			`task: ${parsed.task}`,
 			"constraints:",
-			"- use task tool for every agent assignment",
-			"- for parallel mode, emit all independent task calls in one assistant response",
-			"- in parallel mode, use parallel tool-call style (<use_parallel_tool_calls>)",
-			"- keep required orchestration task calls in foreground; do not set background=true unless user explicitly requested detached async runs",
+				"- use task tool for every agent assignment",
+				"- for parallel mode, emit all independent task calls in one assistant response",
+				"- in parallel mode, use parallel tool-call style (<use_parallel_tool_calls>)",
+				"- when assignment lines include depends_on, still emit one task call per assignment; runtime enforces dependency gating",
+				"- keep required orchestration task calls in foreground; do not set background=true unless user explicitly requested detached async runs",
 			"- do not poll .iosm/subagents/background via bash/read during orchestration; wait for task results and then synthesize",
 			"- include run_id and task_id from each assignment in the task tool arguments",
 			"- keep each agent in its assigned cwd",
@@ -12720,6 +14254,7 @@ The agent will automatically receive IOSM context on every turn.`;
 	}
 
 	stop(): void {
+		this.clearSubagentElapsedTimer();
 		if (this.loadingAnimation) {
 			this.loadingAnimation.stop();
 			this.loadingAnimation = undefined;

@@ -129,6 +129,14 @@ describe("AgentSession meta orchestration directive", () => {
 				}),
 			]),
 		);
+		expect(capturedMessages[0]?.content).toEqual(
+			expect.arrayContaining([
+				expect.objectContaining({
+					type: "text",
+					text: expect.stringContaining("main emphasis of meta mode is parallelism"),
+				}),
+			]),
+		);
 	});
 
 	it("does not inject meta directive for full profile", async () => {

@@ -220,14 +220,16 @@ function buildMetaProfileOrchestrationDirective(text: string): string | undefine
 		"Session profile is meta. The main/root agent remains the orchestrator for this request.",
 		"If this prompt is not actionable repository work, you may ignore this directive.",
 		"For actionable repository work, keep recon bounded and read-only, just enough to identify the workstreams.",
-		"For medium or complex work, the main/root agent MUST orchestrate with multiple top-level `task` calls in the parent turn when independent streams exist.",
+		"The main emphasis of meta mode is parallelism through top-level agents and nested delegates.",
+		"For any non-trivial work, the main/root agent MUST orchestrate with multiple top-level `task` calls in the parent turn when independent streams exist.",
+		"For any child workstream that still contains multiple independent slices, require nested delegation rather than letting one child do everything alone.",
 		"Do NOT collapse the whole task into one root implementation subagent.",
 		"Do NOT hand the entire job to a single write-capable specialist such as iosm_change_executor when the work can be partitioned.",
 		"Use specialist/custom agents as focused workstreams within a broader execution graph, not as the sole executor for the entire non-trivial task.",
 		"If you need clarification first, ask it concisely; once clarified, continue with orchestration.",
 		"If the user specified agent/delegate counts or parallelism constraints, treat them as hard execution requirements.",
-		"For non-trivial work where implementation, tests, verification, docs, or risk analysis can be separated, prefer 3 or more focused task calls rather than 1.",
-		"If you truly cannot split the work into multiple top-level tasks, include one line: DELEGATION_IMPOSSIBLE: <precise reason>.",
+		"For non-trivial work where implementation, tests, verification, docs, or risk analysis can be separated, prefer 3 or more focused task calls rather than 1, and prefer additional delegate fan-out inside those tasks when it shortens the critical path safely.",
+		"If you truly cannot split the work into multiple top-level tasks or nested delegates, include one line: DELEGATION_IMPOSSIBLE: <precise reason>.",
 	].join("\n");
 }
 

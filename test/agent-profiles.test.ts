@@ -19,8 +19,12 @@ describe("agent profiles", () => {
 		expect(AGENT_PROFILES.meta.mainMode).toBe(true);
 		expect(AGENT_PROFILES.meta.systemPromptAppend).toContain("bounded read-only recon");
 		expect(AGENT_PROFILES.meta.systemPromptAppend).toContain("do not make direct write/edit changes in the main agent before launching the first task call");
-		expect(AGENT_PROFILES.meta.systemPromptAppend).toContain("if the user requested a specific number of parallel agents");
+		expect(AGENT_PROFILES.meta.systemPromptAppend).toContain(
+			"If the user requested a specific number of parallel agents or delegates",
+		);
 		expect(AGENT_PROFILES.meta.systemPromptAppend).toContain("multiple top-level task calls");
+		expect(AGENT_PROFILES.meta.systemPromptAppend).toContain("primary optimization target is safe parallel execution");
+		expect(AGENT_PROFILES.meta.systemPromptAppend).toContain("single-agent execution is the exception");
 	});
 
 	it("includes meta in main profile cycling order", () => {

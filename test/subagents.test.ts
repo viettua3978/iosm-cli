@@ -102,6 +102,9 @@ describe("loadCustomSubagents", () => {
 			"Recon is only preparation; once you can name the workstreams, stop exploring and delegate.",
 		);
 		expect(loaded.agents.find((agent) => agent.name === "meta_orchestrator")?.instructions).toContain(
+			"Main emphasis in META orchestration is parallelism",
+		);
+		expect(loaded.agents.find((agent) => agent.name === "meta_orchestrator")?.instructions).toContain(
 			"Do not collapse the whole implementation into one specialist delegate",
 		);
 	});

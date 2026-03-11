@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 _No unreleased changes._
 
+## [0.2.3] - 2026-03-11
+
+### Fixed
+
+- **Startup model restore after restart** — `createAgentSession()` now hydrates missing saved provider/model definitions from `models.dev` before resolving default model, so previously selected providers such as coding-plan providers are restored automatically on relaunch
+- **Stale startup warning suppression** — interactive startup no longer shows stale `No models available...` warning when model restore succeeds during session initialization
+- **Restart UX consistency** — startup header and active session state now align with restored saved `provider/model` selection without requiring manual `/model` re-selection
+
 ## [0.2.2] - 2026-03-11
 
 ### Added

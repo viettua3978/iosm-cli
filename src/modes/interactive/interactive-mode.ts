@@ -1779,6 +1779,9 @@ export class InteractiveMode {
 		const [fdPath] = await Promise.all([ensureTool("fd"), ensureTool("rg")]);
 		this.fdPath = fdPath;
 
+		// Restore saved default model early so startup header/session are consistent after restart.
+		await this.restoreSavedModelSelectionOnStartup();
+
 		// Add header container as first child
 		this.ui.addChild(this.headerContainer);
 
@@ -2049,7 +2052,10 @@ export class InteractiveMode {
 		}
 
 		if (modelFallbackMessage) {
-			this.showWarning(modelFallbackMessage);
+			const staleNoModelsWarning = this.session.model && modelFallbackMessage.startsWith("No models available.");
+			if (!staleNoModelsWarning) {
+				this.showWarning(modelFallbackMessage);
+			}
 		}
 		if (!this.session.model) {
 			this.showWarning("No model selected. Choose a model to start.");
@@ -6669,6 +6675,30 @@ export class InteractiveMode {
 			if (this.hasRegisteredProviderModels(providerId)) continue;
 			await this.hydrateProviderModelsFromModelsDev(providerId);
 		}
+	}
+
+	private async restoreSavedModelSelectionOnStartup(): Promise<void> {
+		if (this.session.model) return;
+
+		const defaultProvider = this.settingsManager.getDefaultProvider();
+		const defaultModelId = this.settingsManager.getDefaultModel();
+		if (!defaultProvider || !defaultModelId) return;
+
+		if (!this.hasRegisteredProviderModels(defaultProvider)) {
+			await this.hydrateProviderModelsFromModelsDev(defaultProvider);
+		}
+
+		const model = this.session.modelRegistry.find(defaultProvider, defaultModelId);
+		if (!model) return;
+
+		try {
+			const apiKey = await this.session.modelRegistry.getApiKey(model);
+			if (!apiKey) return;
+		} catch {
+			return;
+		}
+
+		this.session.agent.setModel(model);
 	}
 
 	private getApiKeyLoginProviders(modelsDevProviders: readonly ModelsDevProviderInfo[]): LoginProviderOption[] {

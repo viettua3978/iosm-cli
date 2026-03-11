@@ -907,6 +907,97 @@ describe("InteractiveMode models.dev API-key provider hydration", () => {
 	});
 });
 
+describe("InteractiveMode startup model restoration", () => {
+	test("restores saved default model after provider hydration", async () => {
+		const restoredModel = { provider: "zai-coding-plan", id: "glm-5" };
+		const setModel = vi.fn();
+		const hydrateProviderModelsFromModelsDev = vi.fn(async () => true);
+		const hasRegisteredProviderModels = vi.fn(() => false);
+		const find = vi.fn(() => restoredModel);
+		const getApiKey = vi.fn(async () => "z-key-123");
+
+		const fakeThis: any = Object.create((InteractiveMode as any).prototype);
+		fakeThis.session = {
+			model: undefined,
+			agent: { setModel },
+			settingsManager: {
+				getDefaultProvider: () => "zai-coding-plan",
+				getDefaultModel: () => "glm-5",
+			},
+			modelRegistry: {
+				find,
+				getApiKey,
+			},
+		};
+		fakeThis.hydrateProviderModelsFromModelsDev = hydrateProviderModelsFromModelsDev;
+		fakeThis.hasRegisteredProviderModels = hasRegisteredProviderModels;
+
+		await (InteractiveMode as any).prototype.restoreSavedModelSelectionOnStartup.call(fakeThis);
+
+		expect(hasRegisteredProviderModels).toHaveBeenCalledWith("zai-coding-plan");
+		expect(hydrateProviderModelsFromModelsDev).toHaveBeenCalledWith("zai-coding-plan");
+		expect(find).toHaveBeenCalledWith("zai-coding-plan", "glm-5");
+		expect(getApiKey).toHaveBeenCalledWith(restoredModel);
+		expect(setModel).toHaveBeenCalledWith(restoredModel);
+	});
+
+	test("does not override model when session already has active model", async () => {
+		const setModel = vi.fn();
+		const hydrateProviderModelsFromModelsDev = vi.fn(async () => true);
+		const hasRegisteredProviderModels = vi.fn(() => false);
+
+		const fakeThis: any = Object.create((InteractiveMode as any).prototype);
+		fakeThis.session = {
+			model: { provider: "openai", id: "gpt-5" },
+			agent: { setModel },
+			settingsManager: {
+				getDefaultProvider: () => "zai-coding-plan",
+				getDefaultModel: () => "glm-5",
+			},
+			modelRegistry: {
+				find: vi.fn(),
+				getApiKey: vi.fn(),
+			},
+		};
+		fakeThis.hydrateProviderModelsFromModelsDev = hydrateProviderModelsFromModelsDev;
+		fakeThis.hasRegisteredProviderModels = hasRegisteredProviderModels;
+
+		await (InteractiveMode as any).prototype.restoreSavedModelSelectionOnStartup.call(fakeThis);
+
+		expect(hydrateProviderModelsFromModelsDev).not.toHaveBeenCalled();
+		expect(setModel).not.toHaveBeenCalled();
+	});
+
+	test("skips restore when saved model has no API key", async () => {
+		const restoredModel = { provider: "zai-coding-plan", id: "glm-5" };
+		const setModel = vi.fn();
+		const find = vi.fn(() => restoredModel);
+		const getApiKey = vi.fn(async () => undefined);
+
+		const fakeThis: any = Object.create((InteractiveMode as any).prototype);
+		fakeThis.session = {
+			model: undefined,
+			agent: { setModel },
+			settingsManager: {
+				getDefaultProvider: () => "zai-coding-plan",
+				getDefaultModel: () => "glm-5",
+			},
+			modelRegistry: {
+				find,
+				getApiKey,
+			},
+		};
+		fakeThis.hydrateProviderModelsFromModelsDev = vi.fn(async () => true);
+		fakeThis.hasRegisteredProviderModels = vi.fn(() => true);
+
+		await (InteractiveMode as any).prototype.restoreSavedModelSelectionOnStartup.call(fakeThis);
+
+		expect(find).toHaveBeenCalledWith("zai-coding-plan", "glm-5");
+		expect(getApiKey).toHaveBeenCalledWith(restoredModel);
+		expect(setModel).not.toHaveBeenCalled();
+	});
+});
+
 describe("InteractiveMode doctor command", () => {
 	test("includes external CLI tool status block in JSON report", async () => {
 		const showCommandJsonBlock = vi.fn();

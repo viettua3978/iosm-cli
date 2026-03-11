@@ -1,6 +1,6 @@
 import { join } from "node:path";
 import { Agent, type AgentMessage, type ThinkingLevel } from "@mariozechner/pi-agent-core";
-import type { Message, Model } from "@mariozechner/pi-ai";
+import type { Api, Message, Model } from "@mariozechner/pi-ai";
 import { getAgentDir, getDocsPath } from "../config.js";
 import { createAskUserTool } from "./ask-user-tool.js";
 import { AgentSession } from "./agent-session.js";
@@ -8,7 +8,8 @@ import { AuthStorage } from "./auth-storage.js";
 import { DEFAULT_THINKING_LEVEL } from "./defaults.js";
 import type { ExtensionRunner, LoadExtensionsResult, ToolDefinition } from "./extensions/index.js";
 import { convertToLlm } from "./messages.js";
-import { ModelRegistry } from "./model-registry.js";
+import { loadModelsDevProviderCatalog, type ModelsDevProviderCatalogInfo } from "./models-dev-provider-catalog.js";
+import { ModelRegistry, type ProviderConfigInput } from "./model-registry.js";
 import { findInitialModel } from "./model-resolver.js";
 import type { ResourceLoader } from "./resource-loader.js";
 import { DefaultResourceLoader } from "./resource-loader.js";
@@ -215,6 +216,60 @@ function resolveModelBySpecifier(
 	return all[0];
 }
 
+function resolveModelsDevApi(modelNpm?: string): Api {
+	const npm = modelNpm?.toLowerCase() ?? "";
+	if (npm.includes("anthropic")) return "anthropic-messages";
+	if (npm.includes("google-vertex")) return "google-vertex";
+	if (npm.includes("google")) return "google-generative-ai";
+	if (npm.includes("amazon-bedrock")) return "bedrock-converse-stream";
+	if (npm.includes("mistral")) return "mistral-conversations";
+	if (npm.includes("@ai-sdk/openai") && !npm.includes("compatible")) return "openai-responses";
+	return "openai-completions";
+}
+
+function buildModelsDevProviderConfig(providerInfo: ModelsDevProviderCatalogInfo): ProviderConfigInput | undefined {
+	const baseUrl = providerInfo.api ?? providerInfo.models.find((model) => !!model.api)?.api;
+	if (!baseUrl) return undefined;
+	if (providerInfo.models.length === 0) return undefined;
+
+	const models: NonNullable<ProviderConfigInput["models"]> = providerInfo.models.map((model) => ({
+		id: model.id,
+		name: model.name,
+		api: resolveModelsDevApi(model.npm ?? providerInfo.npm),
+		reasoning: model.reasoning,
+		input: [...model.input],
+		cost: model.cost,
+		contextWindow: model.contextWindow,
+		maxTokens: model.maxTokens,
+		headers: Object.keys(model.headers).length > 0 ? model.headers : undefined,
+	}));
+
+	return {
+		baseUrl,
+		models,
+	};
+}
+
+async function hydrateProviderModelFromModelsDev(
+	modelRegistry: ModelRegistry,
+	providerId: string,
+	modelId: string,
+): Promise<void> {
+	if (modelRegistry.find(providerId, modelId)) return;
+	try {
+		const catalog = await loadModelsDevProviderCatalog();
+		const providerInfo = catalog.get(providerId);
+		if (!providerInfo) return;
+
+		const config = buildModelsDevProviderConfig(providerInfo);
+		if (!config) return;
+
+		modelRegistry.registerProvider(providerId, config);
+	} catch {
+		// Best-effort hydration only; keep startup resilient when catalog/network is unavailable.
+	}
+}
+
 /**
  * Create an AgentSession with the specified options.
  *
@@ -282,6 +337,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 
 	// If session has data, try to restore model from it
 	if (!model && hasExistingSession && existingSession.model) {
+		await hydrateProviderModelFromModelsDev(modelRegistry, existingSession.model.provider, existingSession.model.modelId);
 		const restoredModel = modelRegistry.find(existingSession.model.provider, existingSession.model.modelId);
 		if (restoredModel && (await modelRegistry.getApiKey(restoredModel))) {
 			model = restoredModel;
@@ -293,6 +349,15 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 
 	// If still no model, use findInitialModel unless explicit selection is required.
 	if (!model && !requireExplicitModelSelection) {
+		const defaultProvider = settingsManager.getDefaultProvider();
+		const defaultModelId = settingsManager.getDefaultModel();
+		if (defaultProvider && defaultModelId) {
+			await hydrateProviderModelFromModelsDev(
+				modelRegistry,
+				defaultProvider,
+				defaultModelId,
+			);
+		}
 		const result = await findInitialModel({
 			scopedModels: options.scopedModels ?? [],
 			isContinuing: hasExistingSession,

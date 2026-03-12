@@ -604,6 +604,160 @@ function buildDelegationProtocolPrompt(
 	].join("\n");
 }
 
+function truncateForDelegationContext(text: string, maxChars = 2200): string {
+	const normalized = normalizeSpacing(text);
+	if (normalized.length <= maxChars) return normalized;
+	return `${normalized.slice(0, Math.max(100, maxChars - 3)).trimEnd()}...`;
+}
+
+function extractDelegationWorkstreams(text: string, maxItems: number): string[] {
+	if (maxItems <= 0) return [];
+	const seen = new Set<string>();
+	const pushUnique = (raw: string): void => {
+		const cleaned = raw
+			.replace(/^[-*]\s+/, "")
+			.replace(/^\d+[.)]\s+/, "")
+			.replace(/\s+/g, " ")
+			.trim();
+		if (cleaned.length < 5) return;
+		const key = cleaned.toLowerCase();
+		if (seen.has(key)) return;
+		seen.add(key);
+	};
+
+	for (const line of text.split("\n")) {
+		if (!/^\s*(?:[-*]|\d+[.)])\s+/.test(line)) continue;
+		pushUnique(line);
+		if (seen.size >= maxItems) break;
+	}
+
+	if (seen.size < maxItems) {
+		const fragments = text
+			.split(/[\n.;:]+/g)
+			.map((fragment) => fragment.trim())
+			.filter((fragment) => fragment.length >= 10)
+			.slice(0, maxItems * 3);
+		for (const fragment of fragments) {
+			pushUnique(fragment);
+			if (seen.size >= maxItems) break;
+		}
+	}
+
+	return Array.from(seen).slice(0, maxItems);
+}
+
+function deriveAutoDelegateProfile(baseProfile: AgentProfileName, description: string, prompt: string): AgentProfileName {
+	const signal = `${description}\n${prompt}`.toLowerCase();
+	const writeIntent = /\b(?:implement|fix|patch|refactor|rewrite|edit|update|migrate|change|write|apply)\b/.test(signal);
+
+	if (baseProfile === "full") return "full";
+	if (baseProfile === "meta") return writeIntent ? "full" : "explore";
+	if (baseProfile === "iosm") return writeIntent ? "full" : "explore";
+	if (baseProfile === "iosm_verifier") return "iosm_verifier";
+	if (baseProfile === "cycle_planner") return "cycle_planner";
+	if (baseProfile === "plan" || baseProfile === "iosm_analyst") return "explore";
+	return "explore";
+}
+
+function pickAutoDelegateAgent(workstream: string, availableCustomNames: readonly string[]): string | undefined {
+	if (availableCustomNames.length === 0) return undefined;
+	const normalizedWorkstream = workstream.toLowerCase();
+	const names = availableCustomNames.map((name) => ({ raw: name, normalized: name.toLowerCase() }));
+	const findByHint = (hints: readonly string[]): string | undefined => {
+		for (const hint of hints) {
+			const exact = names.find((item) => item.normalized === hint);
+			if (exact) return exact.raw;
+			const contains = names.find((item) => item.normalized.includes(hint));
+			if (contains) return contains.raw;
+		}
+		return undefined;
+	};
+
+	if (/\b(?:test|qa|coverage|verification|regression)\b/.test(normalizedWorkstream)) {
+		return findByHint(["qa_test_engineer", "qa", "tester", "verification"]);
+	}
+	if (/\b(?:ui|ux|design|layout|accessibility)\b/.test(normalizedWorkstream)) {
+		return findByHint(["uiux_top_senior", "uiux", "ui", "ux", "design"]);
+	}
+	if (/\b(?:architecture|codebase|refactor|security|rbac|auth|database|api)\b/.test(normalizedWorkstream)) {
+		return findByHint(["codebase_auditor", "architect", "security", "backend"]);
+	}
+
+	return undefined;
+}
+
+function buildAutoDelegationPrompt(input: {
+	streamTitle: string;
+	rootDescription: string;
+	rootPrompt: string;
+	ordinal: number;
+	total: number;
+}): string {
+	const objective = truncateForDelegationContext(`${input.rootDescription}\n\n${input.rootPrompt}`);
+	return normalizeSpacing([
+		`Workstream ${input.ordinal}/${input.total}: ${input.streamTitle}`,
+		"Scope:",
+		`- Own this stream end-to-end and avoid duplicating sibling streams.`,
+		`- Produce concrete findings/changes for this stream only.`,
+		"Coordinator objective:",
+		objective,
+	].join("\n"));
+}
+
+function synthesizeDelegationRequests(input: {
+	description: string;
+	prompt: string;
+	baseProfile: AgentProfileName;
+	currentDelegates: number;
+	minDelegationsPreferred: number;
+	maxDelegations: number;
+	availableCustomNames: readonly string[];
+}): DelegationRequest[] {
+	const desiredTotal = Math.max(0, Math.min(input.maxDelegations, input.minDelegationsPreferred));
+	const missing = Math.max(0, desiredTotal - input.currentDelegates);
+	if (missing <= 0) return [];
+
+	const combined = `${input.description}\n${input.prompt}`.trim();
+	const extracted = extractDelegationWorkstreams(combined, Math.max(missing, desiredTotal));
+	const fallbackByIndex = [
+		"Architecture and structure analysis",
+		"Behavioral verification and tests",
+		"Risk, regressions, and remediation",
+		"Integration and dependency checks",
+		"Delivery summary and rollout constraints",
+	];
+	const titles: string[] = [];
+	for (const stream of extracted) {
+		titles.push(stream);
+		if (titles.length >= missing) break;
+	}
+	for (let index = 0; titles.length < missing && index < fallbackByIndex.length; index += 1) {
+		titles.push(fallbackByIndex[index]!);
+	}
+	while (titles.length < missing) {
+		titles.push(`Independent workstream ${titles.length + 1}`);
+	}
+
+	const defaultProfile = deriveAutoDelegateProfile(input.baseProfile, input.description, input.prompt);
+	return titles.map((streamTitle, index) => ({
+		description: `Auto: ${streamTitle}`,
+		profile: defaultProfile,
+		agent: pickAutoDelegateAgent(streamTitle, input.availableCustomNames),
+		prompt: buildAutoDelegationPrompt({
+			streamTitle,
+			rootDescription: input.description,
+			rootPrompt: input.prompt,
+			ordinal: input.currentDelegates + index + 1,
+			total: input.currentDelegates + titles.length,
+		}),
+		cwd: undefined,
+		lockKey: undefined,
+		model: undefined,
+		isolation: undefined,
+		dependsOn: undefined,
+	}));
+}
+
 function withDelegationPrompt(
 	basePrompt: string,
 	depthRemaining: number,
@@ -1553,6 +1707,31 @@ export function createTaskTool(
 								);
 						}
 
+						if (
+							minDelegationsPreferred > 0 &&
+							parsedDelegation.requests.length === 0 &&
+							strictDelegationContract
+						) {
+							const impossibleMatch = output.match(/^\s*DELEGATION_IMPOSSIBLE\s*:\s*(.+)$/im);
+							if (!impossibleMatch) {
+								const synthesizedRequests = synthesizeDelegationRequests({
+									description,
+									prompt,
+									baseProfile: effectiveProfile,
+									currentDelegates: parsedDelegation.requests.length,
+									minDelegationsPreferred,
+									maxDelegations: effectiveMaxDelegations,
+									availableCustomNames,
+								});
+								if (synthesizedRequests.length > 0) {
+									parsedDelegation.requests.push(...synthesizedRequests);
+									delegationWarnings.push(
+										`Delegation auto-fanout: synthesized ${synthesizedRequests.length} delegate(s) to satisfy parallelism contract.`,
+									);
+								}
+							}
+						}
+
 						if (minDelegationsPreferred > 0 && parsedDelegation.requests.length < minDelegationsPreferred) {
 							const impossibleMatch = output.match(/^\s*DELEGATION_IMPOSSIBLE\s*:\s*(.+)$/im);
 							const impossibleReason = impossibleMatch?.[1]?.trim() ?? "not provided";
@@ -2252,6 +2431,31 @@ export function createTaskTool(
 											effectiveDelegationDepth > 1 ? effectiveMaxDelegations : 0,
 										);
 									}
+									if (
+										childMinDelegationsPreferred > 0 &&
+										parsedChildDelegation.requests.length === 0 &&
+										strictDelegationContract
+									) {
+										const impossibleMatch = childOutput.match(/^\s*DELEGATION_IMPOSSIBLE\s*:\s*(.+)$/im);
+										if (!impossibleMatch) {
+											const synthesizedChildRequests = synthesizeDelegationRequests({
+												description: request.description,
+												prompt: request.prompt,
+												baseProfile: childProfile,
+												currentDelegates: parsedChildDelegation.requests.length,
+												minDelegationsPreferred: childMinDelegationsPreferred,
+												maxDelegations: effectiveMaxDelegations,
+												availableCustomNames,
+											});
+											if (synthesizedChildRequests.length > 0) {
+												parsedChildDelegation.requests.push(...synthesizedChildRequests);
+												delegationWarnings.push(
+													`Child ${index + 1}: delegation auto-fanout synthesized ${synthesizedChildRequests.length} nested delegate(s).`,
+												);
+											}
+										}
+									}
+
 										if (
 											childMinDelegationsPreferred > 0 &&
 											parsedChildDelegation.requests.length < childMinDelegationsPreferred

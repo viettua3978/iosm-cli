@@ -1435,11 +1435,19 @@ describe("subagent orchestration", () => {
 		expect(result.details?.delegatedFailed ?? 0).toBe(0);
 	});
 
-	it("fails strict meta delegation contract when non-trivial work omits delegates without DELEGATION_IMPOSSIBLE", async () => {
+	it("auto-synthesizes strict meta delegates when non-trivial work omits delegate blocks", async () => {
 		const cwd = makeTempDir();
 		let sawEnforcementPrompt = false;
+		let synthesizedDelegatesObserved = 0;
 
 		const tool = createTaskTool(cwd, async (options) => {
+			if (options.prompt.includes("Workstream ")) {
+				synthesizedDelegatesObserved += 1;
+				return {
+					output: `${options.prompt.split("\n")[0]} complete.`,
+					stats: { toolCallsStarted: 1, toolCallsCompleted: 1, assistantMessages: 1 },
+				};
+			}
 			if (options.prompt.includes("DELEGATION_ENFORCEMENT")) {
 				sawEnforcementPrompt = true;
 				return {
@@ -1456,17 +1464,60 @@ describe("subagent orchestration", () => {
 			return { output: "unexpected" };
 		});
 
-		await expect(
-			tool.execute("call_delegate_strict_meta_violation", {
-				description:
-					"Coordinate security hardening, auth validation, and regression verification across independent workstreams.",
-				prompt: "root-task",
-				profile: "meta",
-				delegate_parallel_hint: 3,
-			}),
-		).rejects.toThrow(/Delegation contract violated/);
+		const result = await tool.execute("call_delegate_strict_meta_violation", {
+			description:
+				"Coordinate security hardening, auth validation, and regression verification across independent workstreams.",
+			prompt: "root-task",
+			profile: "meta",
+			delegate_parallel_hint: 3,
+		});
+		const text = (result.content[0] as { type: "text"; text: string }).text;
 
 		expect(sawEnforcementPrompt).toBe(true);
+		expect(synthesizedDelegatesObserved).toBeGreaterThanOrEqual(3);
+		expect(text).toContain("### Delegated Subtasks");
+		expect(result.details?.delegatedTasks ?? 0).toBeGreaterThanOrEqual(3);
+	});
+
+	it("auto-fans out specialist full-profile tasks under meta host when delegates are missing", async () => {
+		const cwd = makeTempDir();
+		let synthesizedDelegatesObserved = 0;
+		const tool = createTaskTool(
+			cwd,
+			async (options) => {
+				if (options.prompt.includes("Workstream ")) {
+					synthesizedDelegatesObserved += 1;
+					return {
+						output: "Delegated specialist stream complete.",
+						stats: { toolCallsStarted: 1, toolCallsCompleted: 1, assistantMessages: 1 },
+					};
+				}
+				if (options.prompt.includes("DELEGATION_ENFORCEMENT")) {
+					return {
+						output: "Monolithic specialist output without delegate tags.",
+						stats: { toolCallsStarted: 1, toolCallsCompleted: 1, assistantMessages: 1 },
+					};
+				}
+				if (options.prompt.includes("Codebase architecture audit")) {
+					return {
+						output: "Architecture findings generated in one pass.",
+						stats: { toolCallsStarted: 1, toolCallsCompleted: 1, assistantMessages: 1 },
+					};
+				}
+				return { output: "unexpected" };
+			},
+			{ hostProfileName: "meta" },
+		);
+
+		const result = await tool.execute("call_meta_host_full_specialist", {
+			description: "Codebase architecture audit",
+			prompt: "Codebase architecture audit",
+			profile: "full",
+			delegate_parallel_hint: 3,
+		});
+
+		expect(synthesizedDelegatesObserved).toBeGreaterThanOrEqual(3);
+		expect(result.details?.delegatedTasks ?? 0).toBeGreaterThanOrEqual(3);
 	});
 
 	it("supports delegated fan-out up to the 10-child ceiling", async () => {

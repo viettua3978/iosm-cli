@@ -204,22 +204,14 @@ Artifacts + Memory (.iosm/cycles/*, checkpoints, /memory state)
 
 ## Operating Profiles
 
-`IOSM CLI` has a layered operating model:
+`IOSM CLI` supports four practical profiles/modes:
 
-| Profile | Best For | What `/init` Does | Advanced Command |
-|------|----------|-------------------|------------------|
-| **full** (default) | Daily coding for any level | Generates/updates `AGENTS.md` from real repo scan and prepares `.iosm/agents/` | Use `/swarm` (canonical) and built-in tools directly |
-| **meta** (orchestration-first) | Adaptive agent/delegate execution with verification gates | Same initialization behavior as full profile | `iosm --profile meta` |
-| **iosm** (advanced) | High-risk refactors and system-level engineering loops | Bootstraps full IOSM workspace (`iosm.yaml`, `IOSM.md`, `.iosm/cycles/...`) with optional agent verification | `/iosm [target-index] [--max-iterations N] [--force-init]` |
-
-### Modes At A Glance
-
-| Mode/Profile | Use It When | Avoid It When |
-|------|-------------|----------------|
-| **full** | You want direct coding help and implementation speed | You need strict multi-workstream orchestration contracts |
-| **meta** | You need orchestration-first execution (parallel task/delegate graph + synthesis + verification closure) | You only need casual chat or lightweight Q&A |
-| **iosm** | You run IOSM cycles with metrics, artifacts, and governance | You only need quick one-off coding support |
-| **plan** | You need read-only architecture/planning/review | You are ready to edit and execute changes |
+| Profile | Use It When | Avoid It When | What `/init` Does | Switch/Command |
+|------|-------------|----------------|-------------------|----------------|
+| **full** (default) | You want direct coding help and implementation speed | You need strict multi-workstream orchestration contracts | Generates/updates `AGENTS.md` from real repo scan and prepares `.iosm/agents/` | `Shift+Tab` in TUI or `iosm --profile full` |
+| **meta** (orchestration-first) | You need orchestration-first execution (parallel task/delegate graph + synthesis + verification closure) | You only need casual chat or lightweight Q&A | Same initialization behavior as full profile | `Shift+Tab` in TUI or `iosm --profile meta` |
+| **iosm** (advanced) | You run IOSM cycles with metrics, artifacts, and governance | You only need quick one-off coding support | Bootstraps full IOSM workspace (`iosm.yaml`, `IOSM.md`, `.iosm/cycles/...`) with optional agent verification | `Shift+Tab` in TUI, `iosm --profile iosm`, `/iosm [target-index] [--max-iterations N] [--force-init]` |
+| **plan** | You need read-only architecture/planning/review | You are ready to edit and execute changes | Not intended for initialization-heavy workflows | `Shift+Tab` in TUI or `iosm --profile plan` |
 
 ### META Model Requirements (Important)
 

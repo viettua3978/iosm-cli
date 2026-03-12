@@ -44,6 +44,7 @@ const READ_EXPLORATION_TOOLS = [
 ] as const;
 
 const WRITE_ENGINEERING_TOOLS = ["read", "bash", "edit", "write", ...READ_EXPLORATION_TOOLS.slice(1)] as const;
+const READ_ONLY_PROFILE_SET = new Set<AgentProfileName>(["explore", "plan", "iosm_analyst"]);
 
 export const AGENT_PROFILES: Record<AgentProfileName, AgentProfile> = {
 	explore: {
@@ -61,10 +62,10 @@ export const AGENT_PROFILES: Record<AgentProfileName, AgentProfile> = {
 		label: "Plan",
 		description:
 			"Technical architect. Explores codebase and produces implementation plan without executing.",
-		tools: ["read", "bash", ...READ_EXPLORATION_TOOLS.slice(1)],
+		tools: [...READ_EXPLORATION_TOOLS],
 		thinkingLevel: "medium",
 		systemPromptAppend:
-			"You are in PLAN mode. Explore the codebase thoroughly, then produce a detailed implementation plan. Do NOT write or edit any files. Output a structured plan with steps, risks, and trade-offs. Pause and ask the user to confirm before implementing.",
+			"You are in PLAN mode. Explore the codebase thoroughly, then produce a detailed implementation plan. Do NOT write or edit any files. Do not execute shell commands. Output a structured plan with steps, risks, and trade-offs. Pause and ask the user to confirm before implementing.",
 		mainMode: true,
 	},
 	iosm: {
@@ -80,11 +81,11 @@ export const AGENT_PROFILES: Record<AgentProfileName, AgentProfile> = {
 	iosm_analyst: {
 		name: "iosm_analyst",
 		label: "IOSM Analyst",
-		description: "Analyzes IOSM artifacts and metrics. Read + bash only.",
-		tools: ["read", "bash", ...READ_EXPLORATION_TOOLS.slice(1)],
+		description: "Analyzes IOSM artifacts and metrics. Read-only analysis tools.",
+		tools: [...READ_EXPLORATION_TOOLS],
 		thinkingLevel: "low",
 		systemPromptAppend:
-			"You are an IOSM Analyst. Your job is to analyze .iosm/ artifacts, cycle reports, metrics history, and codebase evidence. Be precise and evidence-based. Report metric values, confidence levels, and risks with concrete evidence from the repository. Do not modify product source code.",
+			"You are an IOSM Analyst. Your job is to analyze .iosm/ artifacts, cycle reports, metrics history, and codebase evidence. Be precise and evidence-based. Report metric values, confidence levels, and risks with concrete evidence from the repository. Do not modify product source code. Do not execute shell commands.",
 		mainMode: false,
 	},
 	iosm_verifier: {
@@ -152,4 +153,8 @@ export function getProfileNames(): AgentProfileName[] {
 /** Profiles visible in main operator UX (Shift+Tab / mode switching). */
 export function getMainProfileNames(): AgentProfileName[] {
 	return getProfileNames().filter((name) => AGENT_PROFILES[name].mainMode === true);
+}
+
+export function isReadOnlyProfileName(name: string | undefined): boolean {
+	return !!name && READ_ONLY_PROFILE_SET.has(name as AgentProfileName);
 }

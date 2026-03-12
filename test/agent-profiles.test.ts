@@ -3,6 +3,7 @@ import {
 	AGENT_PROFILES,
 	getAgentProfile,
 	getMainProfileNames,
+	isReadOnlyProfileName,
 	isValidProfileName,
 } from "../src/core/agent-profiles.js";
 
@@ -33,5 +34,12 @@ describe("agent profiles", () => {
 
 	it("includes meta in main profile cycling order", () => {
 		expect(getMainProfileNames()).toEqual(["plan", "iosm", "meta", "full"]);
+	});
+
+	it("marks read-only profiles correctly", () => {
+		expect(isReadOnlyProfileName("explore")).toBe(true);
+		expect(isReadOnlyProfileName("plan")).toBe(true);
+		expect(isReadOnlyProfileName("iosm_analyst")).toBe(true);
+		expect(isReadOnlyProfileName("meta")).toBe(false);
 	});
 });

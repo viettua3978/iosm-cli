@@ -18,7 +18,12 @@ import {
 	MAX_SUBAGENT_DELEGATION_DEPTH,
 	MAX_SUBAGENT_DELEGATIONS_PER_TASK,
 } from "../orchestration-limits.js";
-import { AGENT_PROFILES, isValidProfileName, type AgentProfileName } from "../agent-profiles.js";
+import {
+	AGENT_PROFILES,
+	isReadOnlyProfileName,
+	isValidProfileName,
+	type AgentProfileName,
+} from "../agent-profiles.js";
 import type { SharedMemoryContext } from "../shared-memory.js";
 import type { CustomSubagentDefinition } from "../subagents.js";
 
@@ -231,11 +236,11 @@ const systemPromptByProfile: Record<string, string> = {
 	full: "You are a software engineering agent. Execute the task end-to-end.",
 };
 
-const writeMutationTools = new Set(["edit", "write"]);
-const backgroundUnsafeTools = new Set(["bash", "edit", "write"]);
+const writeCapableTools = new Set(["bash", "edit", "write"]);
+const backgroundUnsafeTools = new Set(writeCapableTools);
 const writeCapableProfiles = new Set(
 	(Object.keys(toolsByProfile) as AgentProfileName[]).filter((profileName) =>
-		toolsByProfile[profileName].some((tool) => writeMutationTools.has(tool)),
+		toolsByProfile[profileName].some((tool) => writeCapableTools.has(tool)),
 	),
 );
 const backgroundSafeProfiles = (Object.keys(toolsByProfile) as AgentProfileName[]).filter((profileName) =>
@@ -407,6 +412,12 @@ function deriveAutoDelegateParallelHint(
 	const fileLikeMatches = normalized.match(/\b[A-Za-z0-9_.-]+\.[A-Za-z0-9]{1,8}\b/g) ?? [];
 	const listMarkers = text.match(/(?:^|\n)\s*(?:[-*]|\d+[.)])\s+/g)?.length ?? 0;
 	const hasCodeBlock = text.includes("```");
+	const actionTokenMatches =
+		normalized.match(
+			/\b(?:audit|security|auth|rbac|sqli|sql|injection|fix|implement|refactor|migrat|harden|verify|test|scan|orchestrate|parallel|delegate|bug|vulnerab)\w*/gi,
+		) ?? [];
+	const strongActionSignal = new Set(actionTokenMatches.map((token) => token.toLowerCase())).size >= 2;
+	const metaOrchestratorContext = isMetaProfile || isMetaHost;
 
 	let score = 0;
 	if (words >= 40) {
@@ -423,15 +434,31 @@ function deriveAutoDelegateParallelHint(
 		score += 1;
 	}
 	const referenceCount = pathLikeMatches.length + fileLikeMatches.length;
+	const metaNonTrivialSignal =
+		words >= 12 ||
+		clauses >= 3 ||
+		listMarkers >= 1 ||
+		referenceCount >= 1 ||
+		hasCodeBlock ||
+		(strongActionSignal && words >= 4);
 	if (referenceCount >= 3 || (referenceCount >= 1 && words >= 20)) {
 		score += 1;
 	}
 	if (hasCodeBlock) {
 		score += 1;
 	}
-	if ((isMetaProfile || isMetaHost) && score > 0) {
-		// Meta profile is intentionally parallel-biased for non-trivial work.
-		score += 1;
+	if (metaOrchestratorContext) {
+		// In meta orchestration, require delegation pressure for non-trivial prompts
+		// even when lexical scoring is still low.
+		if (score === 0) {
+			if (strongActionSignal && words >= 4) {
+				score = 1;
+			} else if (metaNonTrivialSignal) {
+				score = 2;
+			}
+		} else if (score > 0) {
+			score += 1;
+		}
 	}
 
 	if (score >= 6) return 10;
@@ -1048,12 +1075,17 @@ export function createTaskTool(
 					return undefined;
 				};
 
-				let normalizedAgentName = agentName?.trim() || undefined;
-				let customSubagent = resolveCustom(normalizedAgentName);
-				const requestedProfileRaw = profile?.trim() || undefined;
-				let normalizedProfile = requestedProfileRaw?.toLowerCase() || customSubagent?.profile?.trim().toLowerCase() || "full";
-				const normalizedHostProfile =
-					options?.getHostProfileName?.()?.trim().toLowerCase() ?? options?.hostProfileName?.trim().toLowerCase();
+					let normalizedAgentName = agentName?.trim() || undefined;
+					let customSubagent = resolveCustom(normalizedAgentName);
+					const requestedProfileRaw = profile?.trim() || undefined;
+					const normalizedHostProfile =
+						options?.getHostProfileName?.()?.trim().toLowerCase() ?? options?.hostProfileName?.trim().toLowerCase();
+					const hostProfileFallback =
+						normalizedHostProfile && isValidProfileName(normalizedHostProfile) ? normalizedHostProfile : "full";
+					let normalizedProfile =
+						requestedProfileRaw?.toLowerCase() ||
+						customSubagent?.profile?.trim().toLowerCase() ||
+						hostProfileFallback;
 
 				if (normalizedAgentName && !customSubagent) {
 					const available =
@@ -1087,14 +1119,19 @@ export function createTaskTool(
 						).join(", ")}.`,
 					);
 				}
-				const effectiveProfile = effectiveProfileCandidate as AgentProfileName;
-			let tools = customSubagent?.tools
-				? [...customSubagent.tools]
-				: [...toolsByProfile[effectiveProfile]];
-			if (customSubagent?.disallowedTools?.length) {
-				const blocked = new Set(customSubagent.disallowedTools);
-				tools = tools.filter((tool) => !blocked.has(tool));
-			}
+					const effectiveProfile = effectiveProfileCandidate as AgentProfileName;
+				let tools = customSubagent?.tools
+					? [...customSubagent.tools]
+					: [...toolsByProfile[effectiveProfile]];
+				if (customSubagent?.disallowedTools?.length) {
+					const blocked = new Set(customSubagent.disallowedTools);
+					tools = tools.filter((tool) => !blocked.has(tool));
+				}
+					if (isReadOnlyProfileName(normalizedHostProfile) && tools.some((tool) => writeCapableTools.has(tool))) {
+						throw new Error(
+							`Host profile "${normalizedHostProfile}" is read-only. Switch to full/meta/iosm to launch write-capable subtasks.`,
+						);
+					}
 				const delegationDepth = maxDelegationDepthFromEnv;
 					const requestedDelegateParallelHint =
 						typeof delegateParallelHint === "number" && Number.isInteger(delegateParallelHint)
@@ -1115,6 +1152,10 @@ export function createTaskTool(
 					effectiveProfile === "meta" || normalizedHostProfile === "meta" || normalizedAgentName?.toLowerCase().includes("orchestrator")
 						? Math.max(delegationDepth, 2)
 						: delegationDepth;
+				const strictDelegationContract =
+					effectiveProfile === "meta" ||
+					normalizedHostProfile === "meta" ||
+					normalizedAgentName?.toLowerCase().includes("orchestrator");
 				let effectiveMaxDelegations = Math.max(
 					0,
 					Math.min(maxDelegationsPerTaskFromEnv, effectiveDelegateParallelHint ?? maxDelegationsPerTaskFromEnv),
@@ -1223,16 +1264,49 @@ export function createTaskTool(
 				assistantMessages: 0,
 			});
 
-			const executeSubagent = async (): Promise<{ text: string; details: TaskToolDetails }> => {
-				let releaseRunSlot: (() => void) | undefined;
-				let releaseSlot: (() => void) | undefined;
-				let releaseWriteLock: (() => void) | undefined;
-				let releaseIsolation: (() => void) | undefined;
-				const explicitRootLockKey = lockKey?.trim();
-				let subagentCwd = requestedSubagentCwd;
-				let worktreePath: string | undefined;
-				let runStats: SubagentRunResult["stats"] | undefined;
-				try {
+				const executeSubagent = async (): Promise<{ text: string; details: TaskToolDetails }> => {
+					let releaseRunSlot: (() => void) | undefined;
+					let releaseSlot: (() => void) | undefined;
+					let releaseWriteLock: (() => void) | undefined;
+					let releaseIsolation: (() => void) | undefined;
+					const explicitRootLockKey = lockKey?.trim();
+					let subagentCwd = requestedSubagentCwd;
+					let worktreePath: string | undefined;
+					let runStats: SubagentRunResult["stats"] | undefined;
+					const heldWriteLocks = new Map<string, { count: number; release: () => void }>();
+					const acquireLocalWriteLock = async (rawLockKey: string | undefined): Promise<(() => void) | undefined> => {
+						const trimmed = rawLockKey?.trim();
+						if (!trimmed) return undefined;
+						const normalizedKey = getCwdLockKey(trimmed);
+						const existing = heldWriteLocks.get(normalizedKey);
+						if (existing) {
+							existing.count += 1;
+							return () => {
+								const current = heldWriteLocks.get(normalizedKey);
+								if (!current) return;
+								current.count -= 1;
+								if (current.count <= 0) {
+									heldWriteLocks.delete(normalizedKey);
+									current.release();
+									cleanupWriteLock(trimmed);
+								}
+							};
+						}
+						const lock = getOrCreateWriteLock(trimmed);
+						const release = await lock.acquire();
+						heldWriteLocks.set(normalizedKey, { count: 1, release });
+						return () => {
+							const current = heldWriteLocks.get(normalizedKey);
+							if (!current) return;
+							current.count -= 1;
+							if (current.count <= 0) {
+								heldWriteLocks.delete(normalizedKey);
+								current.release();
+								cleanupWriteLock(trimmed);
+							}
+						};
+					};
+					try {
 					throwIfAborted();
 					if (orchestrationRunId && orchestrationTaskId) {
 						try {
@@ -1289,14 +1363,13 @@ export function createTaskTool(
 					releaseSlot = await subagentSemaphore.acquire();
 					throwIfAborted();
 					updateTrackedTaskStatus("running");
-					if (writeCapableProfiles.has(effectiveProfile)) {
-						// Parallel orchestration should remain truly parallel by default.
-						// Serialize write-capable agents only when an explicit lock_key is provided.
-						if (explicitRootLockKey) {
-							const lock = getOrCreateWriteLock(explicitRootLockKey);
-							releaseWriteLock = await lock.acquire();
+						if (writeCapableProfiles.has(effectiveProfile)) {
+							// Parallel orchestration should remain truly parallel by default.
+							// Serialize write-capable agents only when an explicit lock_key is provided.
+							if (explicitRootLockKey) {
+								releaseWriteLock = await acquireLocalWriteLock(explicitRootLockKey);
+							}
 						}
-					}
 					if (useWorktree) {
 						const isolated = provisionWorktree(cwd, requestedSubagentCwd, runId);
 						subagentCwd = isolated.runCwd;
@@ -1481,8 +1554,14 @@ export function createTaskTool(
 						}
 
 						if (minDelegationsPreferred > 0 && parsedDelegation.requests.length < minDelegationsPreferred) {
-							const impossibleReason =
-								output.match(/^\s*DELEGATION_IMPOSSIBLE\s*:\s*(.+)$/im)?.[1]?.trim() ?? "not provided";
+							const impossibleMatch = output.match(/^\s*DELEGATION_IMPOSSIBLE\s*:\s*(.+)$/im);
+							const impossibleReason = impossibleMatch?.[1]?.trim() ?? "not provided";
+							if (strictDelegationContract && parsedDelegation.requests.length === 0 && !impossibleMatch) {
+								throw new Error(
+									`Delegation contract violated: expected >=${minDelegationsPreferred} delegates, got ${parsedDelegation.requests.length}. ` +
+										`Provide nested <delegate_task> fan-out or an explicit "DELEGATION_IMPOSSIBLE: <reason>" line.`,
+								);
+							}
 							delegationWarnings.push(
 								`Delegation fallback: kept single-agent execution (preferred >=${minDelegationsPreferred} delegates, got ${parsedDelegation.requests.length}). Reason: ${impossibleReason}.`,
 							);
@@ -1688,14 +1767,13 @@ export function createTaskTool(
 										return;
 									}
 
-									let nestedReleaseLock: (() => void) | undefined;
-									let nestedReleaseIsolation: (() => void) | undefined;
-									let nestedCwd = requestedNestedCwd;
-									try {
-										if (writeCapableProfiles.has(nestedProfile) && nestedRequest.lockKey?.trim()) {
-											const lock = getOrCreateWriteLock(nestedRequest.lockKey.trim());
-											nestedReleaseLock = await lock.acquire();
-										}
+										let nestedReleaseLock: (() => void) | undefined;
+										let nestedReleaseIsolation: (() => void) | undefined;
+										let nestedCwd = requestedNestedCwd;
+										try {
+											if (writeCapableProfiles.has(nestedProfile) && nestedRequest.lockKey?.trim()) {
+												nestedReleaseLock = await acquireLocalWriteLock(nestedRequest.lockKey.trim());
+											}
 										if (nestedRequest.isolation === "worktree") {
 											const isolated = provisionWorktree(
 												cwd,
@@ -1792,12 +1870,11 @@ export function createTaskTool(
 											message,
 											cause,
 										);
-									} finally {
-										nestedReleaseIsolation?.();
-										nestedReleaseLock?.();
-										cleanupWriteLock(nestedRequest.lockKey?.trim());
-									}
-								};
+										} finally {
+											nestedReleaseIsolation?.();
+											nestedReleaseLock?.();
+										}
+									};
 
 								const pendingIndices = new Set<number>(Array.from({ length: totalNested }, (_v, i) => i));
 								const runningNested = new Map<number, Promise<void>>();
@@ -1982,17 +2059,16 @@ export function createTaskTool(
 									return;
 								}
 
-							let childReleaseLock: (() => void) | undefined;
-							let childReleaseIsolation: (() => void) | undefined;
-							const explicitChildLock = request.lockKey?.trim();
-							let childCwd = requestedChildCwd;
-							try {
-								throwIfAborted();
-								if (writeCapableProfiles.has(childProfile) && explicitChildLock) {
-									const lock = getOrCreateWriteLock(explicitChildLock);
-									childReleaseLock = await lock.acquire();
+								let childReleaseLock: (() => void) | undefined;
+								let childReleaseIsolation: (() => void) | undefined;
+								const explicitChildLock = request.lockKey?.trim();
+								let childCwd = requestedChildCwd;
+								try {
 									throwIfAborted();
-								}
+									if (writeCapableProfiles.has(childProfile) && explicitChildLock) {
+										childReleaseLock = await acquireLocalWriteLock(explicitChildLock);
+										throwIfAborted();
+									}
 								if (request.isolation === "worktree") {
 									const isolated = provisionWorktree(cwd, requestedChildCwd, `${runId}_delegate_${index + 1}`);
 									childCwd = isolated.runCwd;
@@ -2176,17 +2252,26 @@ export function createTaskTool(
 											effectiveDelegationDepth > 1 ? effectiveMaxDelegations : 0,
 										);
 									}
-									if (
-										childMinDelegationsPreferred > 0 &&
-										parsedChildDelegation.requests.length < childMinDelegationsPreferred
-									) {
-										const impossibleReason =
-											childOutput.match(/^\s*DELEGATION_IMPOSSIBLE\s*:\s*(.+)$/im)?.[1]?.trim() ??
-											"not provided";
-										delegationWarnings.push(
-											`Child ${index + 1}: delegation fallback (preferred >=${childMinDelegationsPreferred}, got ${parsedChildDelegation.requests.length}). Reason: ${impossibleReason}.`,
-										);
-									}
+										if (
+											childMinDelegationsPreferred > 0 &&
+											parsedChildDelegation.requests.length < childMinDelegationsPreferred
+										) {
+											const impossibleMatch = childOutput.match(/^\s*DELEGATION_IMPOSSIBLE\s*:\s*(.+)$/im);
+											const impossibleReason = impossibleMatch?.[1]?.trim() ?? "not provided";
+											if (
+												strictDelegationContract &&
+												parsedChildDelegation.requests.length === 0 &&
+												!impossibleMatch
+											) {
+												throw new Error(
+													`Delegation contract violated for child ${index + 1}: expected >=${childMinDelegationsPreferred} nested delegates, got ${parsedChildDelegation.requests.length}. ` +
+														`Provide nested <delegate_task> fan-out or "DELEGATION_IMPOSSIBLE: <reason>".`,
+												);
+											}
+											delegationWarnings.push(
+												`Child ${index + 1}: delegation fallback (preferred >=${childMinDelegationsPreferred}, got ${parsedChildDelegation.requests.length}). Reason: ${impossibleReason}.`,
+											);
+										}
 								childOutput = parsedChildDelegation.cleanedOutput;
 								delegationWarnings.push(
 									...parsedChildDelegation.warnings.map((warning) => `Child ${index + 1}: ${warning}`),
@@ -2248,12 +2333,11 @@ export function createTaskTool(
 										message,
 										classified,
 									);
-								} finally {
-								childReleaseIsolation?.();
-								childReleaseLock?.();
-								cleanupWriteLock(explicitChildLock);
-							}
-						};
+									} finally {
+									childReleaseIsolation?.();
+									childReleaseLock?.();
+								}
+							};
 
 						const resolveBlockedByFailedDependencies = (): boolean => {
 							let changed = false;
@@ -2493,12 +2577,11 @@ export function createTaskTool(
 						updateTrackedTaskStatus("done");
 						return { text, details };
 					} finally {
-					releaseIsolation?.();
-					releaseWriteLock?.();
-					cleanupWriteLock(explicitRootLockKey);
-					releaseSlot?.();
-					releaseRunSlot?.();
-					if (orchestrationRunId) {
+						releaseIsolation?.();
+						releaseWriteLock?.();
+						releaseSlot?.();
+						releaseRunSlot?.();
+						if (orchestrationRunId) {
 						cleanupOrchestrationSemaphore(cwd, orchestrationRunId);
 					}
 				}

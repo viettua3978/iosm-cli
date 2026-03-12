@@ -60,6 +60,7 @@ import {
 	getAgentProfile,
 	getMainProfileNames,
 	getProfileNames,
+	isReadOnlyProfileName,
 	isValidProfileName,
 	type AgentProfileName,
 } from "../../core/agent-profiles.js";
@@ -300,8 +301,8 @@ function parseRequestedParallelAgentCount(text: string): number | undefined {
 	const patterns = [
 		/(\d+)\s+(?:parallel|concurrent)\s+agents?/i,
 		/(\d+)\s+agents?/i,
-		/(\d+)\s+паралл\w*\s+агент\w*/i,
-		/(\d+)\s+агент\w*/i,
+		/(\d+)\s+паралл[\p{L}\p{N}_-]*\s+агент[\p{L}\p{N}_-]*/iu,
+		/(\d+)\s+агент[\p{L}\p{N}_-]*/iu,
 	];
 	for (const pattern of patterns) {
 		const match = text.match(pattern);
@@ -337,6 +338,8 @@ function buildMetaParallelismCorrection(input: {
 	taskPlanSnapshot?: TaskPlanSnapshot;
 	taskToolError?: string;
 	rawRootDelegateBlocks?: number;
+	workerDiversityMissing?: boolean;
+	distinctWorkers?: number;
 }): string {
 	const validationFailure =
 		input.taskToolError && /Validation failed for tool "task"/i.test(input.taskToolError)
@@ -344,10 +347,13 @@ function buildMetaParallelismCorrection(input: {
 			: undefined;
 	return [
 		"[META_PARALLELISM_CORRECTION]",
-		`Meta runtime correction: this run currently has ${input.launchedTopLevelTasks} top-level task call(s), but it should have at least ${input.requiredTopLevelTasks}.`,
-		"Stop manual sequential execution in the main agent and convert the execution graph into parallel task calls now.",
-		"Emit the missing top-level task calls in the same assistant response when branches are independent.",
-		"Each task tool call MUST include description and prompt.",
+			`Meta runtime correction: this run currently has ${input.launchedTopLevelTasks} top-level task call(s), but it should have at least ${input.requiredTopLevelTasks}.`,
+			"Stop manual sequential execution in the main agent and convert the execution graph into parallel task calls now.",
+			"Emit the missing top-level task calls in the same assistant response when branches are independent.",
+			input.workerDiversityMissing
+				? `Top-level task fan-out currently targets only ${input.distinctWorkers ?? 1} worker identity. Use at least 2 focused worker identities (profile/agent) or force nested delegation inside each stream.`
+				: undefined,
+			"Each task tool call MUST include description and prompt.",
 		'If you want a custom subagent, pass it via agent="name"; keep profile set to the capability profile, not the custom subagent name.',
 		input.rawRootDelegateBlocks && input.rawRootDelegateBlocks > 0
 			? `You emitted ${input.rawRootDelegateBlocks} raw root-level <delegate_task> block(s). Those are not executed automatically in the parent session. Convert each one into an actual top-level task tool call now.`
@@ -367,6 +373,14 @@ function buildMetaParallelismCorrection(input: {
 async function promptMetaWithParallelismGuard(input: {
 	session: Pick<AgentSession, "prompt" | "subscribe">;
 	userInput: string;
+	onPersistentNonCompliance?: (details: {
+		requiredTopLevelTasks: number;
+		launchedTopLevelTasks: number;
+		distinctWorkers: number;
+		workerDiversityMissing: boolean;
+		taskPlanSnapshot?: TaskPlanSnapshot;
+		taskToolError?: string;
+	}) => Promise<void>;
 }): Promise<void> {
 	let taskToolCalls = 0;
 	let nonTaskToolCalls = 0;
@@ -375,20 +389,31 @@ async function promptMetaWithParallelismGuard(input: {
 	let rawRootDelegateBlocks = 0;
 	let delegationImpossibleDeclared = false;
 	let correctionText: string | undefined;
+	let distinctTaskWorkers = new Set<string>();
+	let delegatedChildTasksSeen = 0;
 
-	const maybeScheduleCorrection = () => {
+	const maybeScheduleCorrection = (options?: { finalize?: boolean }) => {
 		const requiredTopLevelTasks = deriveMetaRequiredTopLevelTaskCalls(input.userInput, taskPlanSnapshot);
-		if (!requiredTopLevelTasks || taskToolCalls >= requiredTopLevelTasks || delegationImpossibleDeclared) {
+		if (!requiredTopLevelTasks || delegationImpossibleDeclared) {
+			return;
+		}
+		const needsMoreTopLevelTasks = taskToolCalls < requiredTopLevelTasks;
+		const workerDiversityMissing =
+			!needsMoreTopLevelTasks &&
+			requiredTopLevelTasks >= 2 &&
+			distinctTaskWorkers.size === 1 &&
+			delegatedChildTasksSeen === 0;
+		if (!needsMoreTopLevelTasks && !workerDiversityMissing) {
 			return;
 		}
 		const hasComplexPlan = !!taskPlanSnapshot;
 		const hasTaskFailure = !!taskToolError;
 		const hasRawRootDelegates = rawRootDelegateBlocks > 0;
-		if (!hasTaskFailure && !hasRawRootDelegates && nonTaskToolCalls < 1) {
-			return;
-		}
-		if (!hasComplexPlan && !hasTaskFailure && !hasRawRootDelegates && nonTaskToolCalls < 2) {
-			return;
+		if (needsMoreTopLevelTasks && !hasTaskFailure && !hasRawRootDelegates) {
+			const minimumNonTaskCalls = hasComplexPlan ? 0 : 2;
+			if (!options?.finalize && nonTaskToolCalls < minimumNonTaskCalls) {
+				return;
+			}
 		}
 		correctionText = buildMetaParallelismCorrection({
 			requiredTopLevelTasks,
@@ -396,6 +421,8 @@ async function promptMetaWithParallelismGuard(input: {
 			taskPlanSnapshot,
 			taskToolError,
 			rawRootDelegateBlocks,
+			workerDiversityMissing,
+			distinctWorkers: distinctTaskWorkers.size,
 		});
 	};
 
@@ -418,6 +445,17 @@ async function promptMetaWithParallelismGuard(input: {
 		if (event.type === "tool_execution_start") {
 			if (event.toolName === "task") {
 				taskToolCalls += 1;
+				const args = event.args && typeof event.args === "object" ? (event.args as Record<string, unknown>) : undefined;
+				const workerIdentityRaw =
+					(typeof args?.agent === "string" && args.agent.trim()) ||
+					(typeof args?.profile === "string" && args.profile.trim()) ||
+					undefined;
+				if (workerIdentityRaw) {
+					distinctTaskWorkers.add(workerIdentityRaw.toLowerCase());
+				} else if (args) {
+					// Distinguish "explicit task call with omitted identity" from missing event payload.
+					distinctTaskWorkers.add("__default_profile__");
+				}
 			} else {
 				nonTaskToolCalls += 1;
 			}
@@ -427,24 +465,61 @@ async function promptMetaWithParallelismGuard(input: {
 		if (event.type === "tool_execution_end" && event.toolName === "task" && event.isError) {
 			taskToolError = extractTaskToolErrorText(event.result) ?? taskToolError;
 			maybeScheduleCorrection();
+			return;
+		}
+		if (event.type === "tool_execution_end" && event.toolName === "task" && !event.isError) {
+			const result = event.result as { details?: Record<string, unknown> } | undefined;
+			const delegatedTasks = result?.details?.delegatedTasks;
+			if (typeof delegatedTasks === "number" && Number.isFinite(delegatedTasks) && delegatedTasks > 0) {
+				delegatedChildTasksSeen += delegatedTasks;
+			}
+			maybeScheduleCorrection();
 		}
 	});
 
-	try {
-		await input.session.prompt(input.userInput);
-		const requiredTopLevelTasks = deriveMetaRequiredTopLevelTaskCalls(input.userInput, taskPlanSnapshot);
-		if (
-			correctionText &&
-			requiredTopLevelTasks &&
-			taskToolCalls < requiredTopLevelTasks &&
-			!delegationImpossibleDeclared
-		) {
-			await input.session.prompt(correctionText, {
-				expandPromptTemplates: false,
-				skipOrchestrationDirective: true,
-				source: "interactive",
-			});
-		}
+		try {
+			await input.session.prompt(input.userInput);
+			maybeScheduleCorrection({ finalize: true });
+			let requiredTopLevelTasks = deriveMetaRequiredTopLevelTaskCalls(input.userInput, taskPlanSnapshot);
+			let workerDiversityMissingAfterRun =
+				!!requiredTopLevelTasks &&
+				requiredTopLevelTasks >= 2 &&
+				distinctTaskWorkers.size === 1 &&
+				delegatedChildTasksSeen === 0;
+			if (
+				correctionText &&
+				requiredTopLevelTasks &&
+				(taskToolCalls < requiredTopLevelTasks || workerDiversityMissingAfterRun) &&
+				!delegationImpossibleDeclared
+			) {
+				await input.session.prompt(correctionText, {
+					expandPromptTemplates: false,
+					skipOrchestrationDirective: true,
+					source: "interactive",
+				});
+				maybeScheduleCorrection({ finalize: true });
+				requiredTopLevelTasks = deriveMetaRequiredTopLevelTaskCalls(input.userInput, taskPlanSnapshot);
+				workerDiversityMissingAfterRun =
+					!!requiredTopLevelTasks &&
+					requiredTopLevelTasks >= 2 &&
+					distinctTaskWorkers.size === 1 &&
+					delegatedChildTasksSeen === 0;
+			}
+			if (
+				requiredTopLevelTasks &&
+				(taskToolCalls < requiredTopLevelTasks || workerDiversityMissingAfterRun) &&
+				!delegationImpossibleDeclared &&
+				input.onPersistentNonCompliance
+			) {
+				await input.onPersistentNonCompliance({
+					requiredTopLevelTasks,
+					launchedTopLevelTasks: taskToolCalls,
+					distinctWorkers: distinctTaskWorkers.size,
+					workerDiversityMissing: workerDiversityMissingAfterRun,
+					taskPlanSnapshot,
+					taskToolError,
+				});
+			}
 	} finally {
 		unsubscribe();
 	}
@@ -976,6 +1051,7 @@ export class InteractiveMode {
 	private streamingComponent: AssistantMessageComponent | undefined = undefined;
 	private streamingMessage: AssistantMessage | undefined = undefined;
 	private currentTurnSawAssistantMessage = false;
+	private currentTurnSawTaskToolCall = false;
 
 	// Tool execution tracking: toolCallId -> component
 	private pendingTools = new Map<string, ToolExecutionComponent>();
@@ -1201,6 +1277,27 @@ export class InteractiveMode {
 	}
 
 	private async requestToolPermission(request: ToolPermissionRequest): Promise<boolean> {
+		if (
+			this.activeProfileName === "meta" &&
+			!this.currentTurnSawTaskToolCall &&
+			(request.toolName === "bash" || request.toolName === "edit" || request.toolName === "write")
+		) {
+			this.showWarning(
+				`META mode orchestration guard: direct ${request.toolName} is blocked before the first task call in a turn. Launch subagents via task or switch profile to full.`,
+			);
+			return false;
+		}
+
+		if (
+			isReadOnlyProfileName(this.activeProfileName) &&
+			(request.toolName === "bash" || request.toolName === "edit" || request.toolName === "write")
+		) {
+			this.showWarning(
+				`Tool ${request.toolName} is disabled in ${this.activeProfileName} profile. Switch to full/meta/iosm for mutating operations.`,
+			);
+			return false;
+		}
+
 		for (const rule of this.permissionDenyRules) {
 			if (this.matchesPermissionRule(rule, request)) {
 				this.showWarning(`Denied by rule: ${rule}`);
@@ -3978,6 +4075,7 @@ export class InteractiveMode {
 		switch (event.type) {
 			case "agent_start":
 				this.currentTurnSawAssistantMessage = false;
+				this.currentTurnSawTaskToolCall = false;
 				// Restore main escape handler if retry handler is still active
 				// (retry success event fires later, but we need main handler now)
 				if (this.retryEscapeHandler) {
@@ -4124,6 +4222,9 @@ export class InteractiveMode {
 				break;
 
 			case "tool_execution_start": {
+				if (event.toolName === "task") {
+					this.currentTurnSawTaskToolCall = true;
+				}
 				if (event.toolName === "task" && !this.subagentComponents.has(event.toolCallId)) {
 					const staleTaskComponent = this.pendingTools.get(event.toolCallId);
 					if (staleTaskComponent) {
@@ -10563,6 +10664,18 @@ export class InteractiveMode {
 			await promptMetaWithParallelismGuard({
 				session: this.session,
 				userInput,
+				onPersistentNonCompliance: async (details) => {
+					if (typeof this.runSwarmFromTask !== "function") return;
+					if (this.session.isStreaming || this.iosmAutomationRun || this.iosmVerificationSession) return;
+					const fallbackParallel = Math.max(
+						1,
+						Math.min(MAX_ORCHESTRATION_PARALLEL, details.requiredTopLevelTasks),
+					);
+					this.showWarning(
+						`META enforcement fallback: orchestration contract not satisfied (${details.launchedTopLevelTasks}/${details.requiredTopLevelTasks} task calls). Launching /swarm run.`,
+					);
+					await this.runSwarmFromTask(userInput, { maxParallel: fallbackParallel });
+				},
 			});
 			return;
 		}
@@ -14586,6 +14699,13 @@ The agent will automatically receive IOSM context on every turn.`;
 	}
 
 	private async handleBashCommand(command: string, excludeFromContext = false): Promise<void> {
+		if (isReadOnlyProfileName(this.activeProfileName)) {
+			this.showWarning(
+				`Bash is disabled in ${this.activeProfileName} profile. Switch to full/meta/iosm (Shift+Tab).`,
+			);
+			return;
+		}
+
 		const extensionRunner = this.session.extensionRunner;
 
 		// Emit user_bash event to let extensions intercept

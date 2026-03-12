@@ -11,6 +11,8 @@ export function createYqTool(cwd: string): AgentTool<typeof externalCliSchema> {
 		description: "Run yq for YAML/JSON/TOML querying/transformation. Pass CLI arguments directly, optionally with stdin.",
 		commandCandidates: ["yq"],
 		missingInstallHint: "Install yq (brew install yq).",
+		forbiddenArgs: ["-i", "--inplace", "--in-place", "-s", "--split-exp", "--split-exp-file"],
+		forbiddenArgPrefixes: ["-i", "--inplace", "--in-place", "--split-exp=", "--split-exp-file="],
 	});
 }
 

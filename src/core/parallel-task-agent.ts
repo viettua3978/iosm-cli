@@ -43,11 +43,67 @@ function toToolResultError(error: unknown): {
 	};
 }
 
-function skipToolCall(toolCall: ToolCallContent, stream: EventStream<any, any>): ToolResultMessageLike {
-	const result = {
-		content: [{ type: "text", text: "Skipped due to queued user message." }],
+const STEERING_SKIP_TEXT = "Skipped due to queued user message.";
+const STEERING_POLL_INTERVAL_MS = 40;
+
+function createSteeringSkipResult(): {
+	content: Array<{ type: "text"; text: string }>;
+	details: Record<string, never>;
+} {
+	return {
+		content: [{ type: "text", text: STEERING_SKIP_TEXT }],
 		details: {},
 	};
+}
+
+function createLinkedAbortController(
+	primary: AbortSignal,
+	secondary: AbortSignal,
+): { signal: AbortSignal; cleanup: () => void } {
+	const controller = new AbortController();
+	const cleanup = () => {
+		primary.removeEventListener("abort", onAbort);
+		secondary.removeEventListener("abort", onAbort);
+	};
+	const onAbort = () => {
+		cleanup();
+		controller.abort();
+	};
+	if (primary.aborted || secondary.aborted) {
+		controller.abort();
+		return { signal: controller.signal, cleanup };
+	}
+	primary.addEventListener("abort", onAbort, { once: true });
+	secondary.addEventListener("abort", onAbort, { once: true });
+	return { signal: controller.signal, cleanup };
+}
+
+function waitForSteeringPoll(signal: AbortSignal): Promise<void> {
+	return new Promise((resolve) => {
+		if (signal.aborted) {
+			resolve();
+			return;
+		}
+		const timer = setTimeout(() => {
+			signal.removeEventListener("abort", onAbort);
+			resolve();
+		}, STEERING_POLL_INTERVAL_MS);
+		const onAbort = () => {
+			clearTimeout(timer);
+			signal.removeEventListener("abort", onAbort);
+			resolve();
+		};
+		signal.addEventListener("abort", onAbort, { once: true });
+	});
+}
+
+function isAbortError(error: unknown): boolean {
+	if (!(error instanceof Error)) return false;
+	return error.message.toLowerCase().includes("aborted");
+}
+
+function skipToolCall(toolCall: ToolCallContent, stream: EventStream<any, any>): ToolResultMessageLike {
+	const result = createSteeringSkipResult();
 	stream.push({
 		type: "tool_execution_start",
 		toolCallId: toolCall.id,
@@ -159,6 +215,31 @@ async function executeToolCallsParallelTasksOnly(
 	stream: EventStream<any, any>,
 	getSteeringMessages?: () => Promise<AgentMessage[]>,
 ): Promise<{ toolResults: ToolResultMessageLike[]; steeringMessages?: AgentMessage[] }> {
+	const steeringAbortController = new AbortController();
+	const linkedAbort = createLinkedAbortController(signal, steeringAbortController.signal);
+	const executionSignal = linkedAbort.signal;
+	let completedCount = 0;
+	let steeringMessages: AgentMessage[] | undefined;
+
+	const steeringWatcher = getSteeringMessages
+		? (async () => {
+				while (completedCount < toolCalls.length && !executionSignal.aborted) {
+					const steering = await getSteeringMessages();
+					if (steering.length > 0) {
+						steeringMessages = steering;
+						if (!signal.aborted && !steeringAbortController.signal.aborted) {
+							steeringAbortController.abort();
+						}
+						return;
+					}
+					if (completedCount >= toolCalls.length || executionSignal.aborted) {
+						return;
+					}
+					await waitForSteeringPoll(executionSignal);
+				}
+			})()
+		: undefined;
+
 	const executions = toolCalls.map(async (toolCall, index) => {
 		const tool = tools?.find((item) => item.name === toolCall.name);
 		stream.push({
@@ -175,7 +256,7 @@ async function executeToolCallsParallelTasksOnly(
 				throw new Error(`Tool ${toolCall.name} not found`);
 			}
 			const validatedArgs = validateToolArguments(tool, toolCall as any);
-			result = await tool.execute(toolCall.id, validatedArgs, signal, (partialResult) => {
+			result = await tool.execute(toolCall.id, validatedArgs, executionSignal, (partialResult) => {
 				stream.push({
 					type: "tool_execution_update",
 					toolCallId: toolCall.id,
@@ -185,8 +266,11 @@ async function executeToolCallsParallelTasksOnly(
 				});
 			});
 		} catch (error) {
-			result = toToolResultError(error);
+			const interruptedBySteering = steeringAbortController.signal.aborted && !signal.aborted;
+			result = interruptedBySteering && isAbortError(error) ? createSteeringSkipResult() : toToolResultError(error);
 			isError = true;
+		} finally {
+			completedCount += 1;
 		}
 
 		stream.push({
@@ -211,17 +295,29 @@ async function executeToolCallsParallelTasksOnly(
 		return { index, toolResultMessage };
 	});
 
-	const completed = await Promise.all(executions);
-	const orderedResults = completed
-		.slice()
-		.sort((left, right) => left.index - right.index)
-		.map((item) => item.toolResultMessage);
+	try {
+		const completed = await Promise.all(executions);
+		if (steeringWatcher) {
+			await steeringWatcher;
+		}
+		const orderedResults = completed
+			.slice()
+			.sort((left, right) => left.index - right.index)
+			.map((item) => item.toolResultMessage);
 
-	const steeringMessages = getSteeringMessages ? await getSteeringMessages() : undefined;
-	return {
-		toolResults: orderedResults,
-		steeringMessages: steeringMessages && steeringMessages.length > 0 ? steeringMessages : undefined,
-	};
+		if (!steeringMessages && getSteeringMessages) {
+			const trailingSteering = await getSteeringMessages();
+			if (trailingSteering.length > 0) {
+				steeringMessages = trailingSteering;
+			}
+		}
+		return {
+			toolResults: orderedResults,
+			steeringMessages: steeringMessages && steeringMessages.length > 0 ? steeringMessages : undefined,
+		};
+	} finally {
+		linkedAbort.cleanup();
+	}
 }
 
 async function executeToolCallsWithPolicy(
@@ -237,6 +333,10 @@ async function executeToolCallsWithPolicy(
 	}
 	return executeToolCallsSequential(tools, toolCalls, signal, stream, getSteeringMessages);
 }
+
+export const __parallelTaskAgentTestUtils = {
+	executeToolCallsWithPolicy,
+};
 
 async function streamAssistantResponse(
 	context: any,

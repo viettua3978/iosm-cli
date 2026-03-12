@@ -32,11 +32,6 @@ function getTeamRunPath(cwd: string, runId: string): string {
 	return join(getTeamsDir(cwd), `${runId}.json`);
 }
 
-function sleepSync(ms: number): void {
-	const waiter = new Int32Array(new SharedArrayBuffer(4));
-	Atomics.wait(waiter, 0, 0, ms);
-}
-
 export function createTeamRun(input: {
 	cwd: string;
 	mode: "parallel" | "sequential";
@@ -114,18 +109,13 @@ export function updateTeamTaskStatus(input: {
 	let release: (() => void) | undefined;
 	try {
 		mkdirSync(getTeamsDir(input.cwd), { recursive: true });
-		const maxLockAttempts = 12;
-		for (let attempt = 1; attempt <= maxLockAttempts; attempt += 1) {
-			try {
-				release = lockfile.lockSync(runPath, { realpath: false });
-				break;
-			} catch (error) {
-				const code = error && typeof error === "object" && "code" in error ? String(error.code) : "";
-				if (code !== "ELOCKED" || attempt === maxLockAttempts) {
-					return undefined;
-				}
-				sleepSync(Math.min(120, 10 + attempt * 10));
-			}
+		try {
+			release = lockfile.lockSync(runPath, { realpath: false });
+		} catch (error) {
+			const code = error && typeof error === "object" && "code" in error ? String(error.code) : "";
+			// Non-blocking path: avoid synchronous backoff loops that can stall orchestration event handling.
+			if (code === "ELOCKED") return undefined;
+			return undefined;
 		}
 		if (!release) return undefined;
 		const raw = readFileSync(runPath, "utf8");

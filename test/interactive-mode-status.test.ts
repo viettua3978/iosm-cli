@@ -1956,6 +1956,267 @@ describe("InteractiveMode.promptWithTaskFallback", () => {
 		expect(prompt).toHaveBeenCalledTimes(1);
 	});
 
+	test("injects meta correction when top-level tasks use only one worker identity", async () => {
+		let handler: ((event: any) => void) | undefined;
+		const subscribe = vi.fn((next: (event: any) => void) => {
+			handler = next;
+			return () => {
+				handler = undefined;
+			};
+		});
+		const prompt = vi.fn(async (text: string) => {
+			if (text === "аудит безопасности") {
+				handler?.({
+					type: "message_end",
+					message: {
+						role: "custom",
+						customType: TASK_PLAN_CUSTOM_TYPE,
+						details: {
+							complexity: "complex",
+							steps: [
+								{ title: "Recon", status: "done" },
+								{ title: "Workstream A", status: "pending" },
+								{ title: "Workstream B", status: "pending" },
+							],
+							currentStepIndex: 1,
+							completedSteps: 1,
+							totalSteps: 3,
+						},
+					},
+				});
+				handler?.({
+					type: "tool_execution_start",
+					toolName: "task",
+					toolCallId: "task_1",
+					args: { profile: "explore", description: "a" },
+				});
+				handler?.({
+					type: "tool_execution_start",
+					toolName: "task",
+					toolCallId: "task_2",
+					args: { profile: "explore", description: "b" },
+				});
+				handler?.({
+					type: "tool_execution_start",
+					toolName: "task",
+					toolCallId: "task_3",
+					args: { profile: "explore", description: "c" },
+				});
+			}
+		});
+		const fakeThis: any = {
+			sessionManager: { getCwd: () => "/tmp/workspace" },
+			session: { prompt, subscribe },
+			activeProfileName: "meta",
+			resolveMentionedAgent: vi.fn(() => undefined),
+		};
+
+		await (InteractiveMode as any).prototype.promptWithTaskFallback.call(fakeThis, "аудит безопасности");
+
+		expect(prompt).toHaveBeenCalledTimes(2);
+		const [correctionPrompt] = prompt.mock.calls[1] as [string];
+		expect(correctionPrompt).toContain("[META_PARALLELISM_CORRECTION]");
+		expect(correctionPrompt).toContain("Top-level task fan-out currently targets only 1 worker identity");
+	});
+
+	test("injects worker-diversity correction when task calls omit profile/agent fields", async () => {
+		let handler: ((event: any) => void) | undefined;
+		const subscribe = vi.fn((next: (event: any) => void) => {
+			handler = next;
+			return () => {
+				handler = undefined;
+			};
+		});
+		const prompt = vi.fn(async (text: string) => {
+			if (text === "аудит безопасности") {
+				handler?.({
+					type: "message_end",
+					message: {
+						role: "custom",
+						customType: TASK_PLAN_CUSTOM_TYPE,
+						details: {
+							complexity: "complex",
+							steps: [
+								{ title: "Recon", status: "done" },
+								{ title: "Workstream A", status: "pending" },
+								{ title: "Workstream B", status: "pending" },
+							],
+							currentStepIndex: 1,
+							completedSteps: 1,
+							totalSteps: 3,
+						},
+					},
+				});
+				handler?.({
+					type: "tool_execution_start",
+					toolName: "task",
+					toolCallId: "task_1",
+					args: { description: "a" },
+				});
+				handler?.({
+					type: "tool_execution_start",
+					toolName: "task",
+					toolCallId: "task_2",
+					args: { description: "b" },
+				});
+				handler?.({
+					type: "tool_execution_start",
+					toolName: "task",
+					toolCallId: "task_3",
+					args: { description: "c" },
+				});
+			}
+		});
+		const fakeThis: any = {
+			sessionManager: { getCwd: () => "/tmp/workspace" },
+			session: { prompt, subscribe },
+			activeProfileName: "meta",
+			resolveMentionedAgent: vi.fn(() => undefined),
+		};
+
+		await (InteractiveMode as any).prototype.promptWithTaskFallback.call(fakeThis, "аудит безопасности");
+
+		expect(prompt).toHaveBeenCalledTimes(2);
+		const [correctionPrompt] = prompt.mock.calls[1] as [string];
+		expect(correctionPrompt).toContain("Top-level task fan-out currently targets only 1 worker identity");
+	});
+
+	test("emits final meta correction when explicit parallel request produced zero task tool calls", async () => {
+		let handler: ((event: any) => void) | undefined;
+		const subscribe = vi.fn((next: (event: any) => void) => {
+			handler = next;
+			return () => {
+				handler = undefined;
+			};
+		});
+		const prompt = vi.fn(async (_text: string) => {
+			// Intentionally no events: simulates a model turn that did not emit tool calls.
+		});
+		const fakeThis: any = {
+			sessionManager: { getCwd: () => "/tmp/workspace" },
+			session: { prompt, subscribe },
+			activeProfileName: "meta",
+			resolveMentionedAgent: vi.fn(() => undefined),
+		};
+
+		await (InteractiveMode as any).prototype.promptWithTaskFallback.call(
+			fakeThis,
+			"используй 3 параллельных агента для аудита безопасности",
+		);
+
+		expect(prompt).toHaveBeenCalledTimes(2);
+		const [correctionPrompt] = prompt.mock.calls[1] as [string];
+		expect(correctionPrompt).toContain("[META_PARALLELISM_CORRECTION]");
+		expect(correctionPrompt).toContain("at least 3");
+	});
+
+	test("falls back to swarm execution when meta orchestration remains non-compliant after correction", async () => {
+		let handler: ((event: any) => void) | undefined;
+		const subscribe = vi.fn((next: (event: any) => void) => {
+			handler = next;
+			return () => {
+				handler = undefined;
+			};
+		});
+		const prompt = vi.fn(async (_text: string) => {
+			// Deliberately emit no task events for both the initial run and correction run.
+		});
+		const runSwarmFromTask = vi.fn(async () => {});
+		const showWarning = vi.fn();
+		const fakeThis: any = {
+			sessionManager: { getCwd: () => "/tmp/workspace" },
+			session: { prompt, subscribe, isStreaming: false },
+			activeProfileName: "meta",
+			resolveMentionedAgent: vi.fn(() => undefined),
+			runSwarmFromTask,
+			showWarning,
+			iosmAutomationRun: undefined,
+			iosmVerificationSession: undefined,
+		};
+
+		await (InteractiveMode as any).prototype.promptWithTaskFallback.call(
+			fakeThis,
+			"используй 3 параллельных агента для аудита безопасности",
+		);
+
+		expect(prompt).toHaveBeenCalledTimes(2);
+		expect(runSwarmFromTask).toHaveBeenCalledTimes(1);
+		expect(runSwarmFromTask).toHaveBeenCalledWith(
+			"используй 3 параллельных агента для аудита безопасности",
+			{ maxParallel: 3 },
+		);
+		expect(showWarning).toHaveBeenCalledWith(expect.stringContaining("META enforcement fallback"));
+	});
+
+	test("does not inject worker-diversity correction when single worker already delegated internally", async () => {
+		let handler: ((event: any) => void) | undefined;
+		const subscribe = vi.fn((next: (event: any) => void) => {
+			handler = next;
+			return () => {
+				handler = undefined;
+			};
+		});
+		const prompt = vi.fn(async (text: string) => {
+			if (text === "аудит безопасности") {
+				handler?.({
+					type: "message_end",
+					message: {
+						role: "custom",
+						customType: TASK_PLAN_CUSTOM_TYPE,
+						details: {
+							complexity: "complex",
+							steps: [
+								{ title: "Recon", status: "done" },
+								{ title: "Workstream A", status: "pending" },
+								{ title: "Workstream B", status: "pending" },
+							],
+							currentStepIndex: 1,
+							completedSteps: 1,
+							totalSteps: 3,
+						},
+					},
+				});
+				handler?.({
+					type: "tool_execution_start",
+					toolName: "task",
+					toolCallId: "task_1",
+					args: { profile: "explore", description: "a" },
+				});
+				handler?.({
+					type: "tool_execution_start",
+					toolName: "task",
+					toolCallId: "task_2",
+					args: { profile: "explore", description: "b" },
+				});
+				handler?.({
+					type: "tool_execution_start",
+					toolName: "task",
+					toolCallId: "task_3",
+					args: { profile: "explore", description: "c" },
+				});
+				for (const toolCallId of ["task_1", "task_2", "task_3"]) {
+					handler?.({
+						type: "tool_execution_end",
+						toolName: "task",
+						toolCallId,
+						isError: false,
+						result: { details: { delegatedTasks: 2 } },
+					});
+				}
+			}
+		});
+		const fakeThis: any = {
+			sessionManager: { getCwd: () => "/tmp/workspace" },
+			session: { prompt, subscribe },
+			activeProfileName: "meta",
+			resolveMentionedAgent: vi.fn(() => undefined),
+		};
+
+		await (InteractiveMode as any).prototype.promptWithTaskFallback.call(fakeThis, "аудит безопасности");
+
+		expect(prompt).toHaveBeenCalledTimes(1);
+	});
+
 	test("passes through natural-language parallel request without rewriting user text", async () => {
 		const prompt = vi.fn(async () => { });
 		const fakeThis: any = {
@@ -2350,6 +2611,62 @@ describe("InteractiveMode.handleStandardInitSlashCommand", () => {
 });
 
 describe("InteractiveMode.requestToolPermission", () => {
+	test("meta mode blocks direct mutating tools before the first task call", async () => {
+		const fakeThis: any = {
+			activeProfileName: "meta",
+			currentTurnSawTaskToolCall: false,
+			permissionDenyRules: [],
+			permissionAllowRules: [],
+			permissionMode: "auto",
+			sessionAllowedToolSignatures: new Set<string>(),
+			shadowGuard: { shouldDenyTool: () => false },
+			matchesPermissionRule: (InteractiveMode as any).prototype.matchesPermissionRule,
+			getToolPermissionSignature: (InteractiveMode as any).prototype.getToolPermissionSignature,
+			withPermissionDialogLock: async (fn: () => Promise<boolean>) => fn(),
+			showWarning: vi.fn(),
+			showExtensionSelector: vi.fn(),
+		};
+
+		const allowed = await (InteractiveMode as any).prototype.requestToolPermission.call(fakeThis, {
+			toolName: "write",
+			cwd: "/tmp/project",
+			input: { path: "README.md" },
+			summary: "write README.md",
+		});
+
+		expect(allowed).toBe(false);
+		expect(fakeThis.showWarning).toHaveBeenCalledWith(
+			expect.stringContaining("META mode orchestration guard"),
+		);
+	});
+
+	test("meta mode allows mutating tools after a task call has started in the turn", async () => {
+		const fakeThis: any = {
+			activeProfileName: "meta",
+			currentTurnSawTaskToolCall: true,
+			permissionDenyRules: [],
+			permissionAllowRules: [],
+			permissionMode: "auto",
+			sessionAllowedToolSignatures: new Set<string>(),
+			shadowGuard: { shouldDenyTool: () => false },
+			matchesPermissionRule: (InteractiveMode as any).prototype.matchesPermissionRule,
+			getToolPermissionSignature: (InteractiveMode as any).prototype.getToolPermissionSignature,
+			withPermissionDialogLock: async (fn: () => Promise<boolean>) => fn(),
+			showWarning: vi.fn(),
+			showExtensionSelector: vi.fn(),
+		};
+
+		const allowed = await (InteractiveMode as any).prototype.requestToolPermission.call(fakeThis, {
+			toolName: "write",
+			cwd: "/tmp/project",
+			input: { path: "README.md" },
+			summary: "write README.md",
+		});
+
+		expect(allowed).toBe(true);
+		expect(fakeThis.showExtensionSelector).not.toHaveBeenCalled();
+	});
+
 	test("denies execution when a deny rule matches", async () => {
 		const fakeThis: any = {
 			permissionDenyRules: ["bash:rm -rf"],

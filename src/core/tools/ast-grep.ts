@@ -12,6 +12,8 @@ export function createAstGrepTool(cwd: string): AgentTool<typeof externalCliSche
 			"Run ast-grep (sg) for syntax-aware code queries. Pass CLI args directly. Preferred form: [\"run\",\"--pattern\",\"console.log($A)\",\"--lang\",\"javascript\",\"src\"]. If version syntax differs, retry with scan/-p equivalents.",
 		commandCandidates: ["ast-grep", "sg"],
 		missingInstallHint: "Install ast-grep (brew install ast-grep or npm i -g @ast-grep/cli).",
+		forbiddenArgs: ["-i", "--interactive", "-U", "--update-all"],
+		forbiddenArgPrefixes: ["--update-all="],
 	});
 }
 

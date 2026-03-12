@@ -84,7 +84,7 @@ import { getLatestCompactionEntry } from "./session-manager.js";
 import type { SettingsManager } from "./settings-manager.js";
 import { BUILTIN_SLASH_COMMANDS, type SlashCommandInfo, type SlashCommandLocation } from "./slash-commands.js";
 import { buildSystemPrompt } from "./system-prompt.js";
-import type { AgentProfileName } from "./agent-profiles.js";
+import { isReadOnlyProfileName, type AgentProfileName } from "./agent-profiles.js";
 import {
 	applyPostToolUseHooks,
 	applyPreToolUseHooks,
@@ -3163,6 +3163,11 @@ export class AgentSession {
 		onChunk?: (chunk: string) => void,
 		options?: { excludeFromContext?: boolean; operations?: BashOperations },
 	): Promise<BashResult> {
+		if (isReadOnlyProfileName(this._profileName)) {
+			throw new Error(
+				`Bash execution is disabled in ${this._profileName} profile. Switch to full/meta/iosm for command execution.`,
+			);
+		}
 		this._appendSessionTrace({
 			type: "bash_start",
 			command,

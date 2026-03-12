@@ -536,6 +536,106 @@ describe("subagent orchestration", () => {
 		expect(maxActive).toBe(2);
 	});
 
+	it("serializes write-capable profiles when explicit lock_key is provided", async () => {
+		const cwd = makeTempDir();
+		let active = 0;
+		let maxActive = 0;
+		const tool = createTaskTool(cwd, async () => {
+			active += 1;
+			maxActive = Math.max(maxActive, active);
+			await new Promise((resolve) => setTimeout(resolve, 25));
+			active -= 1;
+			return { output: "ok" };
+		});
+
+		await Promise.all([
+			tool.execute("call_plan_lock_1", {
+				description: "full agent one",
+				prompt: "analyze",
+				profile: "full",
+				lock_key: "shared-plan-lock",
+			}),
+			tool.execute("call_plan_lock_2", {
+				description: "full agent two",
+				prompt: "analyze",
+				profile: "full",
+				lock_key: "shared-plan-lock",
+			}),
+		]);
+
+		expect(maxActive).toBe(1);
+	});
+
+	it("uses host profile as fallback when task profile is omitted", async () => {
+		const cwd = makeTempDir();
+		const seenProfiles: string[] = [];
+		const tool = createTaskTool(
+			cwd,
+			async (options) => {
+				seenProfiles.push(options.profileName ?? "unknown");
+				return { output: "ok" };
+			},
+			{ hostProfileName: "plan" },
+		);
+
+		const result = await tool.execute("call_host_profile_fallback", {
+			description: "analyze plan-only",
+			prompt: "inspect architecture",
+		});
+
+		expect((result.content[0] as { type: "text"; text: string }).text).toBe("ok");
+		expect(result.details?.profile).toBe("plan");
+		expect(seenProfiles[0]).toBe("plan");
+	});
+
+	it("rejects write-capable subtasks when host profile is read-only", async () => {
+		const cwd = makeTempDir();
+		const tool = createTaskTool(cwd, async () => ({ output: "ok" }), { hostProfileName: "plan" });
+
+		await expect(
+			tool.execute("call_read_only_host_block", {
+				description: "attempt write",
+				prompt: "apply migration",
+				profile: "full",
+			}),
+		).rejects.toThrow(/Host profile "plan" is read-only/);
+	});
+
+	it("does not deadlock when root and delegate share the same lock_key", async () => {
+		const cwd = makeTempDir();
+		const tool = createTaskTool(cwd, async (options) => {
+			if (options.prompt.includes("root-lock-delegate-task")) {
+				return {
+					output:
+						'Root coordination.\n<delegate_task profile="full" lock_key="shared-lock" description="Child lock stream">child-lock-stream</delegate_task>',
+					stats: { toolCallsStarted: 1, toolCallsCompleted: 1, assistantMessages: 1 },
+				};
+			}
+			if (options.prompt.includes("child-lock-stream")) {
+				return {
+					output: "Child lock stream complete.",
+					stats: { toolCallsStarted: 1, toolCallsCompleted: 1, assistantMessages: 1 },
+				};
+			}
+			return { output: "unexpected" };
+		});
+
+		const resultPromise = tool.execute("call_reentrant_lock", {
+			description: "reentrant lock path",
+			prompt: "root-lock-delegate-task",
+			profile: "full",
+			lock_key: "shared-lock",
+		});
+		const timeoutPromise = new Promise<never>((_, reject) => {
+			setTimeout(() => reject(new Error("timed out waiting for delegated lock completion")), 1200);
+		});
+		const result = await Promise.race([resultPromise, timeoutPromise]);
+		const text = (result.content[0] as { type: "text"; text: string }).text;
+		expect(text).toContain("Child lock stream complete.");
+		expect(result.details?.delegatedTasks).toBe(1);
+		expect(result.details?.delegatedSucceeded).toBe(1);
+	});
+
 	it("waits for team dependencies before running dependent orchestration task", async () => {
 		const cwd = makeTempDir();
 		const run = createTeamRun({
@@ -1335,6 +1435,40 @@ describe("subagent orchestration", () => {
 		expect(result.details?.delegatedFailed ?? 0).toBe(0);
 	});
 
+	it("fails strict meta delegation contract when non-trivial work omits delegates without DELEGATION_IMPOSSIBLE", async () => {
+		const cwd = makeTempDir();
+		let sawEnforcementPrompt = false;
+
+		const tool = createTaskTool(cwd, async (options) => {
+			if (options.prompt.includes("DELEGATION_ENFORCEMENT")) {
+				sawEnforcementPrompt = true;
+				return {
+					output: "Still monolithic output without nested delegation.",
+					stats: { toolCallsStarted: 1, toolCallsCompleted: 1, assistantMessages: 1 },
+				};
+			}
+			if (options.prompt.includes("root-task")) {
+				return {
+					output: "Root analysis without delegation.",
+					stats: { toolCallsStarted: 1, toolCallsCompleted: 1, assistantMessages: 1 },
+				};
+			}
+			return { output: "unexpected" };
+		});
+
+		await expect(
+			tool.execute("call_delegate_strict_meta_violation", {
+				description:
+					"Coordinate security hardening, auth validation, and regression verification across independent workstreams.",
+				prompt: "root-task",
+				profile: "meta",
+				delegate_parallel_hint: 3,
+			}),
+		).rejects.toThrow(/Delegation contract violated/);
+
+		expect(sawEnforcementPrompt).toBe(true);
+	});
+
 	it("supports delegated fan-out up to the 10-child ceiling", async () => {
 		const cwd = makeTempDir();
 		let active = 0;
@@ -1485,6 +1619,46 @@ describe("subagent orchestration", () => {
 				"- split implementation, verification, and risk report into independent workstreams",
 				"- produce rollback notes and integration checklist",
 			].join("\n"),
+			profile: "meta",
+		});
+		const text = (result.content[0] as { type: "text"; text: string }).text;
+
+		expect(sawEnforcementPrompt).toBe(true);
+		expect(text).toContain("### Delegated Subtasks");
+		expect(result.details?.delegatedTasks).toBe(2);
+	});
+
+	it("applies delegation pressure for short action-oriented meta prompts", async () => {
+		const cwd = makeTempDir();
+		let sawEnforcementPrompt = false;
+
+		const tool = createTaskTool(cwd, async (options) => {
+			if (options.prompt.includes("DELEGATION_ENFORCEMENT")) {
+				sawEnforcementPrompt = true;
+				return {
+					output:
+						'Root refined.\n<delegate_task profile="explore" description="Auth checks">child-auth</delegate_task>\n<delegate_task profile="plan" description="RBAC checks">child-rbac</delegate_task>',
+					stats: { toolCallsStarted: 1, toolCallsCompleted: 1, assistantMessages: 1 },
+				};
+			}
+			if (options.prompt.includes("audit auth and rbac")) {
+				return {
+					output: "Root analysis without delegation on first pass.",
+					stats: { toolCallsStarted: 1, toolCallsCompleted: 1, assistantMessages: 1 },
+				};
+			}
+			if (options.prompt.includes("child-auth") || options.prompt.includes("child-rbac")) {
+				return {
+					output: `${options.prompt} done`,
+					stats: { toolCallsStarted: 1, toolCallsCompleted: 1, assistantMessages: 1 },
+				};
+			}
+			return { output: "unexpected" };
+		});
+
+		const result = await tool.execute("call_short_action_meta_prompt", {
+			description: "audit auth and rbac",
+			prompt: "audit auth and rbac",
 			profile: "meta",
 		});
 		const text = (result.content[0] as { type: "text"; text: string }).text;
@@ -1927,32 +2101,34 @@ describe("subagent orchestration", () => {
 		).rejects.toThrow(/Background policy violation/);
 	});
 
-	it("rejects background mode for plan profile due mutable bash tool", async () => {
+	it("allows background mode for plan profile (read-only toolset)", async () => {
 		const cwd = makeTempDir();
 		const tool = createTaskTool(cwd, async () => ({ output: "ok" }));
 
-		await expect(
-			tool.execute("call_bg_policy_plan", {
-				description: "plan background policy check",
-				prompt: "analyze repository",
-				profile: "plan",
-				background: true,
-			}),
-		).rejects.toThrow(/Background policy violation/);
+		const result = await tool.execute("call_bg_policy_plan", {
+			description: "plan background policy check",
+			prompt: "analyze repository",
+			profile: "plan",
+			background: true,
+		});
+		const text = (result.content[0] as { type: "text"; text: string }).text;
+		expect(text).toContain("Started background subagent run");
+		expect(result.details?.background).toBe(true);
 	});
 
-	it("rejects background mode for iosm_analyst profile due mutable bash tool", async () => {
+	it("allows background mode for iosm_analyst profile (read-only toolset)", async () => {
 		const cwd = makeTempDir();
 		const tool = createTaskTool(cwd, async () => ({ output: "ok" }));
 
-		await expect(
-			tool.execute("call_bg_policy_iosm_analyst", {
-				description: "iosm_analyst background policy check",
-				prompt: "analyze metrics",
-				profile: "iosm_analyst",
-				background: true,
-			}),
-		).rejects.toThrow(/Background policy violation/);
+		const result = await tool.execute("call_bg_policy_iosm_analyst", {
+			description: "iosm_analyst background policy check",
+			prompt: "analyze metrics",
+			profile: "iosm_analyst",
+			background: true,
+		});
+		const text = (result.content[0] as { type: "text"; text: string }).text;
+		expect(text).toContain("Started background subagent run");
+		expect(result.details?.background).toBe(true);
 	});
 
 	it("parses delegate_task attributes with single quotes and mixed-case profile", async () => {

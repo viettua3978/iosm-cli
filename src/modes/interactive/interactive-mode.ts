@@ -336,6 +336,7 @@ function buildMetaParallelismCorrection(input: {
 	launchedTopLevelTasks: number;
 	taskPlanSnapshot?: TaskPlanSnapshot;
 	taskToolError?: string;
+	rawRootDelegateBlocks?: number;
 }): string {
 	const validationFailure =
 		input.taskToolError && /Validation failed for tool "task"/i.test(input.taskToolError)
@@ -348,6 +349,9 @@ function buildMetaParallelismCorrection(input: {
 		"Emit the missing top-level task calls in the same assistant response when branches are independent.",
 		"Each task tool call MUST include description and prompt.",
 		'If you want a custom subagent, pass it via agent="name"; keep profile set to the capability profile, not the custom subagent name.',
+		input.rawRootDelegateBlocks && input.rawRootDelegateBlocks > 0
+			? `You emitted ${input.rawRootDelegateBlocks} raw root-level <delegate_task> block(s). Those are not executed automatically in the parent session. Convert each one into an actual top-level task tool call now.`
+			: undefined,
 		"If a child workstream is still broad, require nested <delegate_task> fan-out instead of letting one child do everything alone.",
 		input.taskPlanSnapshot
 			? `You already produced a complex plan with ${input.taskPlanSnapshot.totalSteps} steps. Turn that plan into parallel execution now.`
@@ -361,49 +365,54 @@ function buildMetaParallelismCorrection(input: {
 }
 
 async function promptMetaWithParallelismGuard(input: {
-	session: Pick<AgentSession, "prompt" | "subscribe" | "meta">;
+	session: Pick<AgentSession, "prompt" | "subscribe">;
 	userInput: string;
 }): Promise<void> {
 	let taskToolCalls = 0;
 	let nonTaskToolCalls = 0;
 	let taskPlanSnapshot: TaskPlanSnapshot | undefined;
 	let taskToolError: string | undefined;
-	let correctionInjected = false;
-	let correctionPromise: Promise<void> | undefined;
+	let rawRootDelegateBlocks = 0;
+	let delegationImpossibleDeclared = false;
+	let correctionText: string | undefined;
 
-	const maybeInjectCorrection = () => {
-		if (correctionInjected) return;
+	const maybeScheduleCorrection = () => {
 		const requiredTopLevelTasks = deriveMetaRequiredTopLevelTaskCalls(input.userInput, taskPlanSnapshot);
-		if (!requiredTopLevelTasks || taskToolCalls >= requiredTopLevelTasks) {
+		if (!requiredTopLevelTasks || taskToolCalls >= requiredTopLevelTasks || delegationImpossibleDeclared) {
 			return;
 		}
 		const hasComplexPlan = !!taskPlanSnapshot;
 		const hasTaskFailure = !!taskToolError;
-		if (!hasTaskFailure && nonTaskToolCalls < 1) {
+		const hasRawRootDelegates = rawRootDelegateBlocks > 0;
+		if (!hasTaskFailure && !hasRawRootDelegates && nonTaskToolCalls < 1) {
 			return;
 		}
-		if (!hasComplexPlan && !hasTaskFailure && nonTaskToolCalls < 2) {
+		if (!hasComplexPlan && !hasTaskFailure && !hasRawRootDelegates && nonTaskToolCalls < 2) {
 			return;
 		}
-		correctionInjected = true;
-		correctionPromise = input.session
-			.meta(
-				buildMetaParallelismCorrection({
-					requiredTopLevelTasks,
-					launchedTopLevelTasks: taskToolCalls,
-					taskPlanSnapshot,
-					taskToolError,
-				}),
-			)
-			.catch(() => {});
+		correctionText = buildMetaParallelismCorrection({
+			requiredTopLevelTasks,
+			launchedTopLevelTasks: taskToolCalls,
+			taskPlanSnapshot,
+			taskToolError,
+			rawRootDelegateBlocks,
+		});
 	};
 
 	const unsubscribe = input.session.subscribe((event) => {
 		if (event.type === "message_end" && event.message.role === "custom") {
 			if (event.message.customType === TASK_PLAN_CUSTOM_TYPE && isTaskPlanSnapshot(event.message.details)) {
 				taskPlanSnapshot = event.message.details;
-				maybeInjectCorrection();
+				maybeScheduleCorrection();
 			}
+			return;
+		}
+		if (event.type === "message_end" && event.message.role === "assistant") {
+			const rawText = extractAssistantText(event.message);
+			rawRootDelegateBlocks += (rawText.match(/<delegate_task\b/gi) ?? []).length;
+			delegationImpossibleDeclared =
+				delegationImpossibleDeclared || /^\s*DELEGATION_IMPOSSIBLE\s*:/im.test(rawText);
+			maybeScheduleCorrection();
 			return;
 		}
 		if (event.type === "tool_execution_start") {
@@ -412,19 +421,29 @@ async function promptMetaWithParallelismGuard(input: {
 			} else {
 				nonTaskToolCalls += 1;
 			}
-			maybeInjectCorrection();
+			maybeScheduleCorrection();
 			return;
 		}
 		if (event.type === "tool_execution_end" && event.toolName === "task" && event.isError) {
 			taskToolError = extractTaskToolErrorText(event.result) ?? taskToolError;
-			maybeInjectCorrection();
+			maybeScheduleCorrection();
 		}
 	});
 
 	try {
 		await input.session.prompt(input.userInput);
-		if (correctionPromise) {
-			await correctionPromise;
+		const requiredTopLevelTasks = deriveMetaRequiredTopLevelTaskCalls(input.userInput, taskPlanSnapshot);
+		if (
+			correctionText &&
+			requiredTopLevelTasks &&
+			taskToolCalls < requiredTopLevelTasks &&
+			!delegationImpossibleDeclared
+		) {
+			await input.session.prompt(correctionText, {
+				expandPromptTemplates: false,
+				skipOrchestrationDirective: true,
+				source: "interactive",
+			});
 		}
 	} finally {
 		unsubscribe();

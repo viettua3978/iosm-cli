@@ -107,7 +107,7 @@ export function createSharedMemoryWriteTool(context: SharedMemoryContext): Agent
 				scope: normalizeScope(input.scope),
 				mode: normalizeMode(input.mode),
 				ifVersion: input.if_version,
-			});
+			}, _signal);
 			return {
 				content: [
 					{
@@ -143,7 +143,7 @@ export function createSharedMemoryReadTool(context: SharedMemoryContext): AgentT
 				prefix: input.prefix,
 				limit: input.limit,
 				includeValues: input.include_values ?? true,
-			});
+			}, _signal);
 			const header = `shared memory ${result.scope}: ${result.items.length}/${result.totalMatched}`;
 			const lines =
 				result.items.length === 0

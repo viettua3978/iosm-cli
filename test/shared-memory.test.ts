@@ -1,8 +1,10 @@
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import lockfile from "proper-lockfile";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
+	getSharedMemoryPath,
 	readSharedMemory,
 	type SharedMemoryContext,
 	writeSharedMemory,
@@ -116,5 +118,58 @@ describe("shared memory runtime", () => {
 		});
 		expect(task2Run.items).toHaveLength(1);
 		expect(task2Run.items[0]?.value).toBe("shared-note");
+	});
+
+	it("serves snapshot reads even when write lock is held", async () => {
+		await writeSharedMemory(context("task_1"), {
+			scope: "run",
+			key: "snapshot/key",
+			value: "snapshot-value",
+			mode: "set",
+		});
+		const filePath = getSharedMemoryPath(cwd, "run_mesh");
+		const release = await lockfile.lock(filePath, { realpath: false });
+		try {
+			const startedAt = Date.now();
+			const result = await readSharedMemory(context("task_2"), {
+				scope: "run",
+				key: "snapshot/key",
+				includeValues: true,
+			});
+			const elapsedMs = Date.now() - startedAt;
+			expect(elapsedMs).toBeLessThan(120);
+			expect(result.items[0]?.value).toBe("snapshot-value");
+		} finally {
+			await release();
+		}
+	});
+
+	it("aborts lock-retrying writes when signal is cancelled", async () => {
+		await writeSharedMemory(context("task_1"), {
+			scope: "run",
+			key: "abort/key",
+			value: "seed",
+			mode: "set",
+		});
+		const filePath = getSharedMemoryPath(cwd, "run_mesh");
+		const release = await lockfile.lock(filePath, { realpath: false });
+		const controller = new AbortController();
+		setTimeout(() => controller.abort(), 25);
+		try {
+			await expect(
+				writeSharedMemory(
+					context("task_2"),
+					{
+						scope: "run",
+						key: "abort/key",
+						value: "blocked-write",
+						mode: "append",
+					},
+					controller.signal,
+				),
+			).rejects.toThrow(/aborted/i);
+		} finally {
+			await release();
+		}
 	});
 });

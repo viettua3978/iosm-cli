@@ -20,6 +20,16 @@ export interface TodoTask {
 	activeForm?: string;
 }
 
+type TodoTaskUpdateStatus = TodoTaskStatus | "deleted";
+
+interface TodoTaskUpdateInput {
+	id?: string;
+	subject?: string;
+	description?: string;
+	status?: TodoTaskUpdateStatus;
+	activeForm?: string;
+}
+
 // ============================================================================
 // Path helper
 // ============================================================================
@@ -66,33 +76,53 @@ function countByStatus(tasks: TodoTask[]): Record<TodoTaskStatus, number> {
 // Schemas
 // ============================================================================
 
+const todoTaskUpdateSchema = Type.Object({
+	id: Type.Optional(Type.String({ description: "Unique task identifier (e.g. '1', 'setup-db')" })),
+	subject: Type.Optional(
+		Type.String({
+			description: "Brief imperative title (e.g. 'Fix auth bug', 'Add tests')",
+		}),
+	),
+	description: Type.Optional(
+		Type.String({ description: "Detailed description of what needs to be done" }),
+	),
+	status: Type.Optional(
+		Type.Union(
+			[
+				Type.Literal("pending"),
+				Type.Literal("in_progress"),
+				Type.Literal("completed"),
+				Type.Literal("deleted"),
+			],
+			{ description: "Task status. Use 'deleted' to remove a task." },
+		),
+	),
+	activeForm: Type.Optional(
+		Type.String({
+			description:
+				"Present continuous form shown while in_progress (e.g. 'Fixing auth bug')",
+		}),
+	),
+});
+
 const todoWriteSchema = Type.Object({
-	tasks: Type.Array(
-		Type.Object({
-			id: Type.String({ description: "Unique task identifier (e.g. '1', 'setup-db')" }),
-			subject: Type.String({
-				description: "Brief imperative title (e.g. 'Fix auth bug', 'Add tests')",
-			}),
-			description: Type.Optional(
-				Type.String({ description: "Detailed description of what needs to be done" }),
-			),
-			status: Type.Union(
-				[
-					Type.Literal("pending"),
-					Type.Literal("in_progress"),
-					Type.Literal("completed"),
-					Type.Literal("deleted"),
-				],
-				{ description: "Task status. Use 'deleted' to remove a task." },
-			),
-			activeForm: Type.Optional(
+	tasks: Type.Optional(
+		Type.Union(
+			[
+				Type.Array(todoTaskUpdateSchema, {
+					description:
+						"Tasks to create or update. Merged with existing list by id. Missing id/subject fields are derived automatically.",
+				}),
 				Type.String({
 					description:
-						"Present continuous form shown while in_progress (e.g. 'Fixing auth bug')",
+						"Markdown checklist string (for example '- [in_progress] Audit auth'). Parsed into task objects automatically.",
 				}),
-			),
-		}),
-		{ description: "Tasks to create or update. Merged with existing list by id." },
+			],
+			{
+				description:
+					"Task updates as either an array of task objects or a markdown checklist string.",
+			},
+		),
 	),
 });
 
@@ -100,6 +130,120 @@ export type TodoWriteInput = Static<typeof todoWriteSchema>;
 
 const todoReadSchema = Type.Object({});
 export type TodoReadInput = Static<typeof todoReadSchema>;
+
+function slugifyTaskId(text: string, fallback: string): string {
+	const slug = text
+		.trim()
+		.toLowerCase()
+		.replace(/['"`]/g, "")
+		.replace(/[^a-z0-9]+/g, "-")
+		.replace(/^-+|-+$/g, "");
+	return slug || fallback;
+}
+
+function normalizeTodoStatus(raw: string | undefined): TodoTaskUpdateStatus {
+	if (!raw) return "pending";
+	const normalized = raw.trim().toLowerCase().replace(/[\s-]+/g, "_");
+	if (
+		normalized === "done" ||
+		normalized === "complete" ||
+		normalized === "completed" ||
+		normalized === "x" ||
+		normalized === "checked"
+	) {
+		return "completed";
+	}
+	if (
+		normalized === "in_progress" ||
+		normalized === "inprogress" ||
+		normalized === "doing" ||
+		normalized === "active" ||
+		normalized === "~"
+	) {
+		return "in_progress";
+	}
+	if (normalized === "deleted" || normalized === "delete" || normalized === "removed") {
+		return "deleted";
+	}
+	return "pending";
+}
+
+function nextUniqueId(baseId: string, usedIds: Set<string>): string {
+	let candidate = baseId;
+	let suffix = 2;
+	while (usedIds.has(candidate)) {
+		candidate = `${baseId}-${suffix}`;
+		suffix += 1;
+	}
+	usedIds.add(candidate);
+	return candidate;
+}
+
+function parseMarkdownTaskUpdates(markdown: string): TodoTaskUpdateInput[] {
+	const lines = markdown
+		.split(/\r?\n/g)
+		.map((line) => line.trim())
+		.filter((line) => line.length > 0);
+	const parsed: TodoTaskUpdateInput[] = [];
+	for (const line of lines) {
+		const checklistMatch =
+			line.match(/^(?:[-*]|\d+[.)])\s*\[([^\]]+)\]\s+(.+)$/) ?? line.match(/^\[([^\]]+)\]\s+(.+)$/);
+		if (checklistMatch) {
+			parsed.push({
+				status: normalizeTodoStatus(checklistMatch[1]),
+				subject: checklistMatch[2]?.trim(),
+				description: checklistMatch[2]?.trim(),
+			});
+			continue;
+		}
+
+		const bulletMatch = line.match(/^(?:[-*]|\d+[.)])\s+(.+)$/);
+		if (bulletMatch) {
+			parsed.push({
+				status: "pending",
+				subject: bulletMatch[1]?.trim(),
+				description: bulletMatch[1]?.trim(),
+			});
+		}
+	}
+	return parsed;
+}
+
+function normalizeTaskUpdates(input: TodoWriteInput["tasks"]): Array<{
+	id: string;
+	subject: string;
+	description?: string;
+	status: TodoTaskUpdateStatus;
+	activeForm?: string;
+}> {
+	if (input === undefined) return [];
+	const rawTasks = typeof input === "string" ? parseMarkdownTaskUpdates(input) : input;
+	const usedDerivedIds = new Set<string>();
+	const normalized: Array<{
+		id: string;
+		subject: string;
+		description?: string;
+		status: TodoTaskUpdateStatus;
+		activeForm?: string;
+	}> = [];
+	for (let index = 0; index < rawTasks.length; index += 1) {
+		const item = rawTasks[index];
+		if (!item) continue;
+		const subject = item.subject?.trim() || item.description?.trim() || item.id?.trim() || `Task ${index + 1}`;
+		if (!subject) continue;
+		const explicitId = item.id?.trim();
+		const derivedBaseId = slugifyTaskId(subject, `task-${index + 1}`);
+		const id = explicitId || nextUniqueId(derivedBaseId, usedDerivedIds);
+		normalized.push({
+			id,
+			subject,
+			description: item.description?.trim() || undefined,
+			status: normalizeTodoStatus(item.status),
+			activeForm: item.activeForm?.trim() || undefined,
+		});
+	}
+	return normalized;
+}
 
 // ============================================================================
 // Factories (capture cwd in closure — matches codebase tool pattern)
@@ -110,17 +254,31 @@ export function createTodoWriteTool(cwd: string): AgentTool<typeof todoWriteSche
 		name: "todo_write",
 		label: "todo_write",
 		description:
-			"Create or update the session task list. Use to track progress on multi-step work. Tasks persist across turns. Mark tasks in_progress before starting, completed when done.",
+			"Create or update the session task list. Use to track progress on multi-step work. Tasks persist across turns. Mark tasks in_progress before starting, completed when done. Accepts either an array of task objects or a markdown checklist string.",
 		parameters: todoWriteSchema,
 		execute: async (_toolCallId: string, params: unknown, _signal?: AbortSignal) => {
 			const input = params as TodoWriteInput;
 			const filePath = getTaskFilePath(cwd);
 			const existing = readTasks(filePath);
+			const normalizedTasks = normalizeTaskUpdates(input.tasks);
+
+			if (normalizedTasks.length === 0) {
+				const counts = countByStatus(existing);
+				return {
+					content: [
+						{
+							type: "text" as const,
+							text: "No task updates provided. Pass tasks as an array or markdown checklist string.",
+						},
+					],
+					details: { tasks: existing, counts },
+				};
+			}
 
 			// Merge: patch by id
 			const taskMap = new Map<string, TodoTask>(existing.map((t) => [t.id, t]));
 
-			for (const incoming of input.tasks) {
+			for (const incoming of normalizedTasks) {
 				if (incoming.status === "deleted") {
 					taskMap.delete(incoming.id);
 				} else {

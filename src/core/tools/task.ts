@@ -85,10 +85,12 @@ const taskSchema = Type.Object({
 			description: "Optional custom subagent name loaded from .iosm/agents or global agents directory.",
 		}),
 	),
-	profile: Type.String({
-		description:
-			"Subagent capability profile. Recommended values: explore, plan, iosm, meta, iosm_analyst, iosm_verifier, cycle_planner, full. For custom agents, pass the agent name via `agent`, not `profile`.",
-	}),
+	profile: Type.Optional(
+		Type.String({
+			description:
+				"Optional subagent capability profile. Defaults to full when omitted. Recommended values: explore, plan, iosm, meta, iosm_analyst, iosm_verifier, cycle_planner, full. For custom agents, pass the agent name via `agent`, not `profile`.",
+		}),
+	),
 	cwd: Type.Optional(
 		Type.String({
 			description:
@@ -930,11 +932,10 @@ export function createTaskTool(
 				};
 
 				let normalizedAgentName = agentName?.trim() || undefined;
-				let normalizedProfile = profile.trim().toLowerCase();
-				if (!normalizedProfile) normalizedProfile = "full";
+				let customSubagent = resolveCustom(normalizedAgentName);
+				let normalizedProfile = profile?.trim().toLowerCase() || customSubagent?.profile?.trim().toLowerCase() || "full";
 				const normalizedHostProfile = options?.hostProfileName?.trim().toLowerCase();
 
-				let customSubagent = resolveCustom(normalizedAgentName);
 				if (normalizedAgentName && !customSubagent) {
 					const available =
 						availableCustomNames.length > 0 ? ` Available custom agents: ${availableCustomNames.join(", ")}.` : "";

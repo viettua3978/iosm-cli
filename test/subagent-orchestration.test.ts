@@ -1,6 +1,7 @@
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { TypeCompiler } from "@sinclair/typebox/compiler";
 import { afterEach, describe, expect, it } from "vitest";
 import { createTeamRun, getTeamRun, updateTeamTaskStatus } from "../src/core/agent-teams.js";
 import { MAX_SUBAGENT_DELEGATE_PARALLEL } from "../src/core/orchestration-limits.js";
@@ -186,6 +187,74 @@ describe("subagent orchestration", () => {
 
 		expect((result.content[0] as { type: "text"; text: string }).text).toBe("ok");
 		expect(result.details?.profile).toBe("full");
+	});
+
+	it("accepts task calls without profile and defaults them to full", async () => {
+		const cwd = makeTempDir();
+		let observedTools: string[] = [];
+		const tool = createTaskTool(cwd, async (options) => {
+			observedTools = options.tools.slice();
+			return { output: "ok" };
+		});
+		const validate = TypeCompiler.Compile(tool.parameters);
+
+		expect(
+			validate.Check({
+				description: "missing profile fallback",
+				prompt: "do work without explicit profile",
+			}),
+		).toBe(true);
+
+		const result = await tool.execute("call_missing_profile", {
+			description: "missing profile fallback",
+			prompt: "do work without explicit profile",
+		});
+
+		expect((result.content[0] as { type: "text"; text: string }).text).toBe("ok");
+		expect(result.details?.profile).toBe("full");
+		expect(observedTools).toContain("write");
+	});
+
+	it("uses custom agent profile when profile is omitted", async () => {
+		const cwd = makeTempDir();
+		const tool = createTaskTool(
+			cwd,
+			async (options) => ({ output: options.prompt }),
+			{
+				resolveCustomSubagent: (name) =>
+					name === "codebase_auditor"
+						? {
+								name: "codebase_auditor",
+								description: "Codebase audit specialist",
+								sourcePath: "fixture",
+								profile: "explore",
+								instructions: "Audit with strict evidence.",
+							}
+						: undefined,
+				availableCustomSubagents: ["codebase_auditor"],
+			},
+		);
+		const validate = TypeCompiler.Compile(tool.parameters);
+
+		expect(
+			validate.Check({
+				description: "custom agent without profile",
+				prompt: "inspect repository",
+				agent: "codebase_auditor",
+			}),
+		).toBe(true);
+
+		const result = await tool.execute("call_agent_without_profile", {
+			description: "custom agent without profile",
+			prompt: "inspect repository",
+			agent: "codebase_auditor",
+		});
+
+		expect((result.content[0] as { type: "text"; text: string }).text).toContain(
+			"Audit with strict evidence.",
+		);
+		expect(result.details?.agent).toBe("codebase_auditor");
+		expect(result.details?.profile).toBe("explore");
 	});
 
 	it("uses full-capability tools for meta profile", async () => {

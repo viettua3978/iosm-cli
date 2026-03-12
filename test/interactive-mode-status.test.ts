@@ -12,6 +12,7 @@ import {
 	MAX_ORCHESTRATION_AGENTS,
 	MAX_ORCHESTRATION_PARALLEL,
 } from "../src/core/orchestration-limits.js";
+import { TASK_PLAN_CUSTOM_TYPE } from "../src/core/task-plan.js";
 import { InteractiveMode } from "../src/modes/interactive/interactive-mode.js";
 import { OAuthSelectorComponent } from "../src/modes/interactive/components/oauth-selector.js";
 import { initTheme } from "../src/modes/interactive/theme/theme.js";
@@ -1782,9 +1783,11 @@ describe("InteractiveMode.promptWithTaskFallback", () => {
 
 	test("passes through non-@agent requests unchanged in meta profile", async () => {
 		const prompt = vi.fn(async () => { });
+		const subscribe = vi.fn(() => () => {});
+		const meta = vi.fn(async () => {});
 		const fakeThis: any = {
 			sessionManager: { getCwd: () => "/tmp/workspace" },
-			session: { prompt },
+			session: { prompt, subscribe, meta },
 			activeProfileName: "meta",
 			resolveMentionedAgent: vi.fn(() => undefined),
 		};
@@ -1795,9 +1798,106 @@ describe("InteractiveMode.promptWithTaskFallback", () => {
 		);
 
 		expect(prompt).toHaveBeenCalledTimes(1);
-		const [generatedPrompt, options] = prompt.mock.calls[0] as [string, Record<string, unknown>];
+		const [generatedPrompt] = prompt.mock.calls[0] as [string];
 		expect(generatedPrompt).toBe("добавь интересную фичу в протокол");
-		expect(options).toBeUndefined();
+		expect(subscribe).toHaveBeenCalledTimes(1);
+		expect(meta).not.toHaveBeenCalled();
+	});
+
+	test("injects hidden meta correction when complex plan under-delegates", async () => {
+		let handler: ((event: any) => void) | undefined;
+		const subscribe = vi.fn((next: (event: any) => void) => {
+			handler = next;
+			return () => {
+				handler = undefined;
+			};
+		});
+		const meta = vi.fn(async () => {});
+		const prompt = vi.fn(async () => {
+			handler?.({
+				type: "message_end",
+				message: {
+					role: "custom",
+					customType: TASK_PLAN_CUSTOM_TYPE,
+					details: {
+						complexity: "complex",
+						steps: [
+							{ title: "Recon", status: "done" },
+							{ title: "Audit auth", status: "pending" },
+							{ title: "Audit gateway", status: "pending" },
+							{ title: "Audit llm", status: "pending" },
+						],
+						currentStepIndex: 1,
+						completedSteps: 1,
+						totalSteps: 4,
+					},
+				},
+			});
+			handler?.({
+				type: "tool_execution_start",
+				toolName: "read",
+				toolCallId: "tool_1",
+			});
+		});
+		const fakeThis: any = {
+			sessionManager: { getCwd: () => "/tmp/workspace" },
+			session: { prompt, subscribe, meta },
+			activeProfileName: "meta",
+			resolveMentionedAgent: vi.fn(() => undefined),
+		};
+
+		await (InteractiveMode as any).prototype.promptWithTaskFallback.call(fakeThis, "аудит безопасности");
+
+		expect(prompt).toHaveBeenCalledTimes(1);
+		expect(meta).toHaveBeenCalledTimes(1);
+		expect(meta.mock.calls[0]?.[0]).toContain("[META_PARALLELISM_CORRECTION]");
+		expect(meta.mock.calls[0]?.[0]).toContain("at least 3");
+		expect(meta.mock.calls[0]?.[0]).toContain("Each task tool call MUST include description and prompt.");
+	});
+
+	test("does not inject meta correction when top-level task fan-out already meets target", async () => {
+		let handler: ((event: any) => void) | undefined;
+		const subscribe = vi.fn((next: (event: any) => void) => {
+			handler = next;
+			return () => {
+				handler = undefined;
+			};
+		});
+		const meta = vi.fn(async () => {});
+		const prompt = vi.fn(async () => {
+			handler?.({
+				type: "message_end",
+				message: {
+					role: "custom",
+					customType: TASK_PLAN_CUSTOM_TYPE,
+					details: {
+						complexity: "complex",
+						steps: [
+							{ title: "Recon", status: "done" },
+							{ title: "Workstream A", status: "pending" },
+							{ title: "Workstream B", status: "pending" },
+						],
+						currentStepIndex: 1,
+						completedSteps: 1,
+						totalSteps: 3,
+					},
+				},
+			});
+			handler?.({ type: "tool_execution_start", toolName: "task", toolCallId: "task_1" });
+			handler?.({ type: "tool_execution_start", toolName: "task", toolCallId: "task_2" });
+			handler?.({ type: "tool_execution_start", toolName: "task", toolCallId: "task_3" });
+		});
+		const fakeThis: any = {
+			sessionManager: { getCwd: () => "/tmp/workspace" },
+			session: { prompt, subscribe, meta },
+			activeProfileName: "meta",
+			resolveMentionedAgent: vi.fn(() => undefined),
+		};
+
+		await (InteractiveMode as any).prototype.promptWithTaskFallback.call(fakeThis, "аудит безопасности");
+
+		expect(prompt).toHaveBeenCalledTimes(1);
+		expect(meta).not.toHaveBeenCalled();
 	});
 
 	test("passes through natural-language parallel request without rewriting user text", async () => {

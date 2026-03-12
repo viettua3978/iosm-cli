@@ -182,7 +182,7 @@ import { type SessionContext, SessionManager } from "../../core/session-manager.
 import { SettingsManager } from "../../core/settings-manager.js";
 import { BUILTIN_SLASH_COMMANDS } from "../../core/slash-commands.js";
 import type { ToolPermissionRequest } from "../../core/tools/index.js";
-import { isTaskPlanSnapshot, TASK_PLAN_CUSTOM_TYPE } from "../../core/task-plan.js";
+import { isTaskPlanSnapshot, TASK_PLAN_CUSTOM_TYPE, type TaskPlanSnapshot } from "../../core/task-plan.js";
 import type { TruncationResult } from "../../core/tools/truncate.js";
 import {
 	buildIosmAutomationPrompt,
@@ -279,6 +279,141 @@ type CompactionQueuedMessage = {
 	text: string;
 	mode: "steer" | "followUp" | "meta";
 };
+
+function parseRequestedParallelAgentCount(text: string): number | undefined {
+	const patterns = [
+		/(\d+)\s+(?:parallel|concurrent)\s+agents?/i,
+		/(\d+)\s+agents?/i,
+		/(\d+)\s+паралл\w*\s+агент\w*/i,
+		/(\d+)\s+агент\w*/i,
+	];
+	for (const pattern of patterns) {
+		const match = text.match(pattern);
+		const parsed = match?.[1] ? Number.parseInt(match[1], 10) : Number.NaN;
+		if (Number.isInteger(parsed) && parsed >= 1) {
+			return Math.max(1, Math.min(MAX_ORCHESTRATION_AGENTS, parsed));
+		}
+	}
+	return undefined;
+}
+
+function deriveMetaRequiredTopLevelTaskCalls(
+	userInput: string,
+	taskPlanSnapshot: TaskPlanSnapshot | undefined,
+): number | undefined {
+	const requested = parseRequestedParallelAgentCount(userInput);
+	if (requested) return requested;
+	if (!taskPlanSnapshot) return undefined;
+	return Math.max(2, Math.min(3, taskPlanSnapshot.totalSteps));
+}
+
+function extractTaskToolErrorText(result: unknown): string | undefined {
+	if (!result || typeof result !== "object") return undefined;
+	const candidate = result as Record<string, unknown>;
+	if (typeof candidate.error === "string" && candidate.error.trim()) return candidate.error.trim();
+	if (typeof candidate.output === "string" && candidate.output.trim()) return candidate.output.trim();
+	return undefined;
+}
+
+function buildMetaParallelismCorrection(input: {
+	requiredTopLevelTasks: number;
+	launchedTopLevelTasks: number;
+	taskPlanSnapshot?: TaskPlanSnapshot;
+	taskToolError?: string;
+}): string {
+	const validationFailure =
+		input.taskToolError && /Validation failed for tool "task"/i.test(input.taskToolError)
+			? input.taskToolError.split("\n").slice(0, 3).join("\n")
+			: undefined;
+	return [
+		"[META_PARALLELISM_CORRECTION]",
+		`Meta runtime correction: this run currently has ${input.launchedTopLevelTasks} top-level task call(s), but it should have at least ${input.requiredTopLevelTasks}.`,
+		"Stop manual sequential execution in the main agent and convert the execution graph into parallel task calls now.",
+		"Emit the missing top-level task calls in the same assistant response when branches are independent.",
+		"Each task tool call MUST include description and prompt.",
+		'If you want a custom subagent, pass it via agent="name"; keep profile set to the capability profile, not the custom subagent name.',
+		"If a child workstream is still broad, require nested <delegate_task> fan-out instead of letting one child do everything alone.",
+		input.taskPlanSnapshot
+			? `You already produced a complex plan with ${input.taskPlanSnapshot.totalSteps} steps. Turn that plan into parallel execution now.`
+			: undefined,
+		validationFailure ? `Previous task validation failure:\n${validationFailure}` : undefined,
+		"If you truly cannot split safely, output exactly one line: DELEGATION_IMPOSSIBLE: <precise reason>.",
+		"[/META_PARALLELISM_CORRECTION]",
+	]
+		.filter((line): line is string => typeof line === "string" && line.trim().length > 0)
+		.join("\n");
+}
+
+async function promptMetaWithParallelismGuard(input: {
+	session: Pick<AgentSession, "prompt" | "subscribe" | "meta">;
+	userInput: string;
+}): Promise<void> {
+	let taskToolCalls = 0;
+	let nonTaskToolCalls = 0;
+	let taskPlanSnapshot: TaskPlanSnapshot | undefined;
+	let taskToolError: string | undefined;
+	let correctionInjected = false;
+	let correctionPromise: Promise<void> | undefined;
+
+	const maybeInjectCorrection = () => {
+		if (correctionInjected) return;
+		const requiredTopLevelTasks = deriveMetaRequiredTopLevelTaskCalls(input.userInput, taskPlanSnapshot);
+		if (!requiredTopLevelTasks || taskToolCalls >= requiredTopLevelTasks) {
+			return;
+		}
+		const hasComplexPlan = !!taskPlanSnapshot;
+		const hasTaskFailure = !!taskToolError;
+		if (!hasTaskFailure && nonTaskToolCalls < 1) {
+			return;
+		}
+		if (!hasComplexPlan && !hasTaskFailure && nonTaskToolCalls < 2) {
+			return;
+		}
+		correctionInjected = true;
+		correctionPromise = input.session
+			.meta(
+				buildMetaParallelismCorrection({
+					requiredTopLevelTasks,
+					launchedTopLevelTasks: taskToolCalls,
+					taskPlanSnapshot,
+					taskToolError,
+				}),
+			)
+			.catch(() => {});
+	};
+
+	const unsubscribe = input.session.subscribe((event) => {
+		if (event.type === "message_end" && event.message.role === "custom") {
+			if (event.message.customType === TASK_PLAN_CUSTOM_TYPE && isTaskPlanSnapshot(event.message.details)) {
+				taskPlanSnapshot = event.message.details;
+				maybeInjectCorrection();
+			}
+			return;
+		}
+		if (event.type === "tool_execution_start") {
+			if (event.toolName === "task") {
+				taskToolCalls += 1;
+			} else {
+				nonTaskToolCalls += 1;
+			}
+			maybeInjectCorrection();
+			return;
+		}
+		if (event.type === "tool_execution_end" && event.toolName === "task" && event.isError) {
+			taskToolError = extractTaskToolErrorText(event.result) ?? taskToolError;
+			maybeInjectCorrection();
+		}
+	});
+
+	try {
+		await input.session.prompt(input.userInput);
+		if (correctionPromise) {
+			await correctionPromise;
+		}
+	} finally {
+		unsubscribe();
+	}
+}
 
 type IosmInitVerificationSummary = {
 	completed: boolean;
@@ -10335,6 +10470,13 @@ export class InteractiveMode {
 			await this.session.prompt(mentionPrompt, {
 				expandPromptTemplates: false,
 				source: "interactive",
+			});
+			return;
+		}
+		if (this.activeProfileName === "meta") {
+			await promptMetaWithParallelismGuard({
+				session: this.session,
+				userInput,
 			});
 			return;
 		}

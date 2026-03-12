@@ -259,6 +259,8 @@ Profiles control the agent's behavior, available tools, and system prompt.
 | `iosm_verifier` | IOSM quality gate verification |
 | `cycle_planner` | IOSM cycle planning specialist |
 
+> `meta` profile recommendation: for orchestration-heavy work, prefer modern models with large context windows (`>=128k`, ideally `>=200k`) and high output limits. This improves delegate routing, contract retention, and synthesis reliability.
+
 ### Usage
 
 ```bash

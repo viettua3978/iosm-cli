@@ -1,4 +1,4 @@
-<h1 align="center">IOSM CLI v0.2.2</h1>
+<h1 align="center">IOSM CLI v0.2.4</h1>
 
 <p align="center">
   <strong>AI Engineering Runtime for Professional Developers</strong>
@@ -145,7 +145,7 @@ Core commands to unlock full runtime value:
 
 ```console
 $ iosm
-IOSM CLI v0.2.2 [full]
+IOSM CLI v0.2.4 [full]
 
 you> /singular Refactor auth and split session handling from token validation
 iosm> Option 1 selected
@@ -211,6 +211,31 @@ Artifacts + Memory (.iosm/cycles/*, checkpoints, /memory state)
 | **full** (default) | Daily coding for any level | Generates/updates `AGENTS.md` from real repo scan and prepares `.iosm/agents/` | Use `/swarm` (canonical) and built-in tools directly |
 | **meta** (orchestration-first) | Adaptive agent/delegate execution with verification gates | Same initialization behavior as full profile | `iosm --profile meta` |
 | **iosm** (advanced) | High-risk refactors and system-level engineering loops | Bootstraps full IOSM workspace (`iosm.yaml`, `IOSM.md`, `.iosm/cycles/...`) with optional agent verification | `/iosm [target-index] [--max-iterations N] [--force-init]` |
+
+### Modes At A Glance
+
+| Mode/Profile | Use It When | Avoid It When |
+|------|-------------|----------------|
+| **full** | You want direct coding help and implementation speed | You need strict multi-workstream orchestration contracts |
+| **meta** | You need orchestration-first execution (parallel task/delegate graph + synthesis + verification closure) | You only need casual chat or lightweight Q&A |
+| **iosm** | You run IOSM cycles with metrics, artifacts, and governance | You only need quick one-off coding support |
+| **plan** | You need read-only architecture/planning/review | You are ready to edit and execute changes |
+
+### META Model Requirements (Important)
+
+For strong `meta` orchestration quality, use modern high-capability models with:
+- large context windows (prefer `>=128k`, ideally `>=200k`)
+- high output token limits
+- reliable long-run tool-calling behavior
+
+Why this matters:
+- `meta` mode keeps orchestration contracts, task plans, delegate outputs, and synthesis in context
+- small/legacy models are more likely to stop early, under-delegate, or lose orchestration constraints
+- model capability directly affects orchestration stability and output quality
+
+Practical recommendation:
+- for conversational use, switch to `full` (Shift+Tab)
+- for complex orchestration in `meta`, pick your strongest available model via `/model`
 
 Typical advanced flow:
 

@@ -218,7 +218,12 @@ function buildMetaProfileOrchestrationDirective(text: string): string | undefine
 	return [
 		"[META_ORCHESTRATION_DIRECTIVE]",
 		"Session profile is meta. The main/root agent remains the orchestrator for this request.",
-		"If this prompt is not actionable repository work, you may ignore this directive.",
+		"First classify the user request.",
+		"If the request is conversational or non-repository (for example: quick Q&A, opinion, preference, explanation, rewrite, translation, casual chat), DO NOT orchestrate and DO NOT call `task`.",
+		"For non-repository requests, answer directly as a normal chat assistant in the user's language.",
+		"For non-repository requests, do not run tools, do not inspect repository files, and do not perform reconnaissance unless the user explicitly asks for it.",
+		"Do not output internal reasoning, classification notes, or status preambles (for example: 'The user is asking...' or 'Let me analyze...'). Return only the final user-facing answer.",
+		"Only apply the orchestration rules below when the request is actionable repository work (requires reading/modifying/running/verifying workspace code or project artifacts).",
 		"For actionable repository work, keep recon bounded and read-only, just enough to identify the workstreams.",
 		"The main emphasis of meta mode is parallelism through top-level agents and nested delegates.",
 		"For any non-trivial work, the main/root agent MUST orchestrate with multiple top-level `task` calls in the parent turn when independent streams exist.",
@@ -472,6 +477,11 @@ export class AgentSession {
 	/** Model registry for API key resolution and model discovery */
 	get modelRegistry(): ModelRegistry {
 		return this._modelRegistry;
+	}
+
+	/** Active profile name for runtime orchestration policies. */
+	get profileName(): string | undefined {
+		return this._profileName;
 	}
 
 	// =========================================================================
@@ -1099,6 +1109,17 @@ export class AgentSession {
 		});
 	}
 
+	setProfileName(profileName?: string): void {
+		const previous = this._profileName;
+		const normalized = profileName?.trim().toLowerCase();
+		this._profileName = normalized && normalized.length > 0 ? normalized : undefined;
+		this._emitConfigChange({
+			key: "profile_name",
+			previous,
+			current: this._profileName,
+		});
+	}
+
 	setToolPermissionHandler(handler?: (request: ToolPermissionRequest) => Promise<boolean>): void {
 		this._toolPermissionHandler = handler;
 		this._buildRuntime({
@@ -1334,6 +1355,9 @@ export class AgentSession {
 			: buildSubagentOrchestrationDirective(expandedText) ??
 				(this._profileName === "meta" ? buildMetaProfileOrchestrationDirective(expandedText) : undefined);
 		const promptText = orchestrationDirective ? `${expandedText}\n\n${orchestrationDirective}` : expandedText;
+		const orchestrationDisplayText = orchestrationDirective
+			? deriveOrchestrationDisplayText(expandedText) ?? expandedText
+			: undefined;
 		this._appendSessionTrace({
 			type: "prompt_expanded",
 			text: promptText,
@@ -1341,47 +1365,47 @@ export class AgentSession {
 			orchestrationInjected: orchestrationDirective !== undefined,
 		});
 
-			// If streaming, queue via steer(), followUp(), or meta() based on option
-			if (this.isStreaming) {
-				if (!options?.streamingBehavior) {
-					throw new Error(
-						"Agent is already processing. Specify streamingBehavior ('steer', 'followUp', or 'meta') to queue the message.",
-					);
-				}
-				await this._injectIosmRuntimeContext(currentText, options.streamingBehavior, {
-					source: inputSource,
-					skip: options?.skipIosmAutopilot,
-				});
-				if (options.streamingBehavior === "followUp") {
+		if (orchestrationDirective) {
+			this._appendCustomMessageLocally({
+				customType: INTERNAL_UI_META_CUSTOM_TYPE,
+				content: "",
+				display: false,
+				details: {
+					kind: "orchestration_context",
+					rawPrompt: promptText,
+					displayText: orchestrationDisplayText,
+				},
+			});
+		}
+
+		// If streaming, queue via steer(), followUp(), or meta() based on option
+		if (this.isStreaming) {
+			if (!options?.streamingBehavior) {
+				throw new Error(
+					"Agent is already processing. Specify streamingBehavior ('steer', 'followUp', or 'meta') to queue the message.",
+				);
+			}
+			await this._injectIosmRuntimeContext(currentText, options.streamingBehavior, {
+				source: inputSource,
+				skip: options?.skipIosmAutopilot,
+			});
+			if (options.streamingBehavior === "followUp") {
 				await this._queueFollowUp(promptText, currentImages);
 			} else if (options.streamingBehavior === "meta") {
 				await this._queueMeta(promptText, currentImages);
 			} else {
 				await this._queueSteer(promptText, currentImages);
 			}
-				this._appendSessionTrace({
-					type: "prompt_queued",
-					mode: options.streamingBehavior,
-					text: promptText,
-				});
-				return;
-			}
+			this._appendSessionTrace({
+				type: "prompt_queued",
+				mode: options.streamingBehavior,
+				text: promptText,
+			});
+			return;
+		}
 
-			if (orchestrationDirective) {
-				this._appendCustomMessageLocally({
-					customType: INTERNAL_UI_META_CUSTOM_TYPE,
-					content: "",
-					display: false,
-					details: {
-						kind: "orchestration_context",
-						rawPrompt: promptText,
-						displayText: deriveOrchestrationDisplayText(expandedText),
-					},
-				});
-			}
-
-			// Flush any pending bash messages before the new prompt
-			this._flushPendingBashMessages();
+		// Flush any pending bash messages before the new prompt
+		this._flushPendingBashMessages();
 
 		// Validate model
 		if (!this.model) {

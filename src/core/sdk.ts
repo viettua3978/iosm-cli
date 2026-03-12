@@ -737,8 +737,9 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				})),
 				getMetaMessages: () => sessionRef?.getMetaMessages() ?? [],
 				hostProfileName: profile?.name,
+				getHostProfileName: () => sessionRef?.profileName ?? profile?.name,
 			})
-		: undefined;
+			: undefined;
 
 	// Wire in ask_user, task tool, and any caller-supplied custom tools
 	const baseCustomTools: ToolDefinition[] = [

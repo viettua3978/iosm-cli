@@ -632,6 +632,7 @@ export interface ConfigChangeEvent {
 		| "stream_input_mode"
 		| "system_prompt_suffix"
 		| "iosm_autopilot_enabled"
+		| "profile_name"
 		| "auto_compaction_enabled"
 		| "retry_enabled";
 	previous: unknown;

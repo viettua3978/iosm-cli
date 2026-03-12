@@ -6,7 +6,7 @@ import { type AssistantMessage, type AssistantMessageEvent, EventStream, getMode
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { AgentSession } from "../src/core/agent-session.js";
 import { AuthStorage } from "../src/core/auth-storage.js";
-import { convertToLlm } from "../src/core/messages.js";
+import { convertToLlm, INTERNAL_UI_META_CUSTOM_TYPE } from "../src/core/messages.js";
 import { ModelRegistry } from "../src/core/model-registry.js";
 import { SessionManager } from "../src/core/session-manager.js";
 import { SettingsManager } from "../src/core/settings-manager.js";
@@ -137,6 +137,38 @@ describe("AgentSession meta orchestration directive", () => {
 				}),
 			]),
 		);
+		expect(capturedMessages[0]?.content).toEqual(
+			expect.arrayContaining([
+				expect.objectContaining({
+					type: "text",
+					text: expect.stringContaining("DO NOT orchestrate and DO NOT call `task`"),
+				}),
+			]),
+		);
+	});
+
+	it("stores hidden orchestration metadata with a display alias for meta prompts", async () => {
+		createSession("meta");
+
+		await session.prompt("добавь интересную фичу", {
+			expandPromptTemplates: false,
+		});
+
+		const internalMessage = session.messages.find(
+			(message) => message.role === "custom" && message.customType === INTERNAL_UI_META_CUSTOM_TYPE,
+		);
+		expect(internalMessage).toBeDefined();
+		expect(internalMessage?.role).toBe("custom");
+		if (internalMessage?.role !== "custom") return;
+
+		expect(internalMessage.display).toBe(false);
+		expect(internalMessage.details).toMatchObject({
+			kind: "orchestration_context",
+			displayText: "добавь интересную фичу",
+		});
+		expect((internalMessage.details as { rawPrompt?: string }).rawPrompt).toContain(
+			"[META_ORCHESTRATION_DIRECTIVE]",
+		);
 	});
 
 	it("does not inject meta directive for full profile", async () => {
@@ -168,5 +200,24 @@ describe("AgentSession meta orchestration directive", () => {
 				.filter((part) => part.type === "text")
 				.map((part) => part.text) ?? [];
 		expect(textParts.join("\n")).not.toContain("[META_ORCHESTRATION_DIRECTIVE]");
+	});
+
+	it("applies meta directive after runtime profile switch", async () => {
+		createSession("full");
+		session.setProfileName("meta");
+
+		await session.prompt("добавь интересную фичу", {
+			expandPromptTemplates: false,
+		});
+
+		expect(capturedMessages).toHaveLength(1);
+		expect(capturedMessages[0]?.content).toEqual(
+			expect.arrayContaining([
+				expect.objectContaining({
+					type: "text",
+					text: expect.stringContaining("[META_ORCHESTRATION_DIRECTIVE]"),
+				}),
+			]),
+		);
 	});
 });

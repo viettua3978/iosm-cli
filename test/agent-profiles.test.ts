@@ -25,6 +25,10 @@ describe("agent profiles", () => {
 		expect(AGENT_PROFILES.meta.systemPromptAppend).toContain("multiple top-level task calls");
 		expect(AGENT_PROFILES.meta.systemPromptAppend).toContain("primary optimization target is safe parallel execution");
 		expect(AGENT_PROFILES.meta.systemPromptAppend).toContain("single-agent execution is the exception");
+		expect(AGENT_PROFILES.meta.systemPromptAppend).toContain(
+			"For conversational or non-repository requests",
+		);
+		expect(AGENT_PROFILES.meta.systemPromptAppend).toContain("Do not output internal reasoning");
 	});
 
 	it("includes meta in main profile cycling order", () => {

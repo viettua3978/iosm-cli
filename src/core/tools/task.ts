@@ -199,8 +199,10 @@ export interface TaskToolOptions {
 	availableCustomSubagentHints?: Array<{ name: string; description: string }>;
 	/** Returns pending live meta updates entered during an active run. */
 	getMetaMessages?: () => readonly string[];
-	/** Active profile of the host session that is invoking the task tool. */
+	/** Active profile of the host session that is invoking the task tool (static fallback). */
 	hostProfileName?: string;
+	/** Returns active profile of the host session dynamically (preferred over static fallback when provided). */
+	getHostProfileName?: () => string | undefined;
 }
 
 /** Tool names available per profile */
@@ -1028,7 +1030,8 @@ export function createTaskTool(
 				let normalizedAgentName = agentName?.trim() || undefined;
 				let customSubagent = resolveCustom(normalizedAgentName);
 				let normalizedProfile = profile?.trim().toLowerCase() || customSubagent?.profile?.trim().toLowerCase() || "full";
-				const normalizedHostProfile = options?.hostProfileName?.trim().toLowerCase();
+				const normalizedHostProfile =
+					options?.getHostProfileName?.()?.trim().toLowerCase() ?? options?.hostProfileName?.trim().toLowerCase();
 
 				if (normalizedAgentName && !customSubagent) {
 					const available =

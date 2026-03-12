@@ -8,6 +8,7 @@ import { ENV_AGENT_DIR } from "../src/config.js";
 import { AuthStorage } from "../src/core/auth-storage.js";
 import { createTeamRun } from "../src/core/agent-teams.js";
 import { KeybindingsManager } from "../src/core/keybindings.js";
+import { INTERNAL_UI_META_CUSTOM_TYPE } from "../src/core/messages.js";
 import {
 	MAX_ORCHESTRATION_AGENTS,
 	MAX_ORCHESTRATION_PARALLEL,
@@ -2120,6 +2121,165 @@ describe("InteractiveMode.getUserMessageText", () => {
 
 		const output = (InteractiveMode as any).prototype.getUserMessageText.call(fakeThis, input);
 		expect(output).toBe("please continue\n\n[ORCHESTRATION_DIRECTIVE]\ninternal details");
+	});
+});
+
+describe("InteractiveMode.handleInternalUiMetaMessage", () => {
+	test("does not suppress assistant text for META orchestration directive metadata", () => {
+		const fakeThis: any = {
+			pendingAssistantOrchestrationContexts: 0,
+			pendingInternalUserDisplayAliases: [],
+		};
+		const message: any = {
+			role: "custom",
+			customType: INTERNAL_UI_META_CUSTOM_TYPE,
+			details: {
+				kind: "orchestration_context",
+				rawPrompt: "привет\n\n[META_ORCHESTRATION_DIRECTIVE]\n...",
+				displayText: "привет",
+			},
+		};
+
+		(InteractiveMode as any).prototype.handleInternalUiMetaMessage.call(fakeThis, message);
+
+		expect(fakeThis.pendingAssistantOrchestrationContexts).toBe(0);
+		expect(fakeThis.pendingInternalUserDisplayAliases).toEqual([
+			{
+				rawPrompt: "привет\n\n[META_ORCHESTRATION_DIRECTIVE]\n...",
+				displayText: "привет",
+			},
+		]);
+	});
+
+	test("suppresses assistant text for legacy orchestration contracts", () => {
+		const fakeThis: any = {
+			pendingAssistantOrchestrationContexts: 0,
+			pendingInternalUserDisplayAliases: [],
+		};
+		const message: any = {
+			role: "custom",
+			customType: INTERNAL_UI_META_CUSTOM_TYPE,
+			details: {
+				kind: "orchestration_context",
+				rawPrompt: "<orchestrate ...>\n\n[ORCHESTRATION_DIRECTIVE]\n...",
+				displayText: "@agent audit",
+			},
+		};
+
+		(InteractiveMode as any).prototype.handleInternalUiMetaMessage.call(fakeThis, message);
+
+		expect(fakeThis.pendingAssistantOrchestrationContexts).toBe(1);
+		expect(fakeThis.pendingInternalUserDisplayAliases).toHaveLength(1);
+	});
+});
+
+describe("InteractiveMode.showMetaModeInterruptionHint", () => {
+	test("shows guidance for aborted turns in meta profile", () => {
+		const showWarning = vi.fn();
+		const fakeThis: any = {
+			activeProfileName: "meta",
+			showWarning,
+		};
+
+		(InteractiveMode as any).prototype.showMetaModeInterruptionHint.call(fakeThis, "aborted");
+
+		expect(showWarning).toHaveBeenCalledTimes(1);
+		expect(showWarning).toHaveBeenCalledWith(
+			expect.stringContaining("Please repeat your request following META profile rules"),
+		);
+		expect(showWarning).toHaveBeenCalledWith(expect.stringContaining("Shift+Tab"));
+		expect(showWarning).toHaveBeenCalledWith(expect.stringContaining("profile to `full`"));
+	});
+
+	test("does not show guidance outside meta profile", () => {
+		const showWarning = vi.fn();
+		const fakeThis: any = {
+			activeProfileName: "full",
+			showWarning,
+		};
+
+		(InteractiveMode as any).prototype.showMetaModeInterruptionHint.call(fakeThis, "error");
+
+		expect(showWarning).not.toHaveBeenCalled();
+	});
+});
+
+describe("InteractiveMode.showMetaModeProfileHint", () => {
+	test("shows meta onboarding hint when active profile is meta", () => {
+		const showWarning = vi.fn();
+		const fakeThis: any = {
+			activeProfileName: "meta",
+			showWarning,
+		};
+
+		(InteractiveMode as any).prototype.showMetaModeProfileHint.call(fakeThis);
+
+		expect(showWarning).toHaveBeenCalledTimes(1);
+		expect(showWarning).toHaveBeenCalledWith(expect.stringContaining("META mode is orchestration-first"));
+		expect(showWarning).toHaveBeenCalledWith(expect.stringContaining("Shift+Tab"));
+	});
+
+	test("does not show onboarding hint outside meta profile", () => {
+		const showWarning = vi.fn();
+		const fakeThis: any = {
+			activeProfileName: "full",
+			showWarning,
+		};
+
+		(InteractiveMode as any).prototype.showMetaModeProfileHint.call(fakeThis);
+
+		expect(showWarning).not.toHaveBeenCalled();
+	});
+});
+
+describe("InteractiveMode.handleEvent meta interruption fallback", () => {
+	test("shows meta guidance on agent_end when no assistant message arrived", async () => {
+		const showMetaModeInterruptionHint = vi.fn();
+		const ui = { requestRender: vi.fn() };
+		const fakeThis: any = {
+			isInitialized: true,
+			footer: { invalidate: vi.fn() },
+			activeProfileName: "meta",
+			currentTurnSawAssistantMessage: false,
+			showMetaModeInterruptionHint,
+			loadingAnimation: undefined,
+			streamingComponent: undefined,
+			streamingMessage: undefined,
+			pendingTools: new Map(),
+			subagentComponents: new Map(),
+			clearSubagentElapsedTimer: vi.fn(),
+			checkShutdownRequested: vi.fn(async () => {}),
+			ui,
+		};
+
+		await (InteractiveMode as any).prototype.handleEvent.call(fakeThis, { type: "agent_end" });
+
+		expect(showMetaModeInterruptionHint).toHaveBeenCalledTimes(1);
+		expect(showMetaModeInterruptionHint).toHaveBeenCalledWith("error");
+	});
+
+	test("does not show fallback when assistant message was seen", async () => {
+		const showMetaModeInterruptionHint = vi.fn();
+		const ui = { requestRender: vi.fn() };
+		const fakeThis: any = {
+			isInitialized: true,
+			footer: { invalidate: vi.fn() },
+			activeProfileName: "meta",
+			currentTurnSawAssistantMessage: true,
+			showMetaModeInterruptionHint,
+			loadingAnimation: undefined,
+			streamingComponent: undefined,
+			streamingMessage: undefined,
+			pendingTools: new Map(),
+			subagentComponents: new Map(),
+			clearSubagentElapsedTimer: vi.fn(),
+			checkShutdownRequested: vi.fn(async () => {}),
+			ui,
+		};
+
+		await (InteractiveMode as any).prototype.handleEvent.call(fakeThis, { type: "agent_end" });
+
+		expect(showMetaModeInterruptionHint).not.toHaveBeenCalled();
 	});
 });
 

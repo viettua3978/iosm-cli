@@ -335,6 +335,8 @@ iosm --no-extensions --no-skills --no-prompt-templates
 | `iosm_verifier` | IOSM verification specialist |
 | `cycle_planner` | Cycle planning specialist |
 
+**Meta mode quality note:** for complex orchestration use modern models with large context windows (`>=128k`, ideally `>=200k`) and high token limits. Smaller models degrade orchestration stability and synthesis quality.
+
 **Examples:**
 
 ```bash

@@ -339,6 +339,9 @@ Profiles change the agent's behavior, available tools, and system prompt:
 | `iosm` | All + IOSM context | IOSM cycle execution with artifact sync |
 | `meta` | Full toolset + orchestration-first contract | Adaptive multi-agent/delegate execution with verification closure |
 
+> `meta` profile recommendation: use modern high-capability models with large context windows (`>=128k`, ideally `>=200k`) and high output limits.  
+> This directly impacts orchestration quality (delegate fan-out, constraint retention, and final synthesis reliability).
+
 ### Advanced Profiles (via `--profile` or orchestration)
 
 | Profile | Use Case |

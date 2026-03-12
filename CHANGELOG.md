@@ -9,6 +9,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 _No unreleased changes._
 
+## [0.2.4] - 2026-03-12
+
+### Added
+
+- **META profile onboarding UX** — switching to `meta` now shows an explicit runtime hint describing orchestration-first usage and when to switch back to `full`
+- **META interruption fallback hint** — when a run ends without any assistant message in `meta`, the UI now emits a recovery warning with concrete prompt guidance
+- **Task host-profile runtime getter** — task tool integration now supports dynamic host profile reads (`getHostProfileName`) so orchestration pressure follows live profile changes during a session
+
+### Changed
+
+- **META directive policy (chat-safe classification)** — meta orchestration directive now explicitly classifies non-repository prompts as direct chat responses and limits orchestration rules to actionable repository work
+- **META profile system prompt alignment** — profile-level prompt now mirrors the chat-safe classification behavior to avoid conflicting orchestration instructions
+- **Internal orchestration metadata aliasing** — hidden orchestration UI metadata now always persists display aliases (including streaming paths) for safer prompt display substitution
+
+### Fixed
+
+- **Profile switch propagation into task orchestration** — runtime profile changes now propagate through session config-change events and task-tool host-profile resolution
+- **Invisible assistant responses in meta chat prompts** — assistant prose suppression no longer triggers for `META_ORCHESTRATION_DIRECTIVE` metadata (suppression remains for legacy `ORCHESTRATION_DIRECTIVE` blocks only)
+- **Meta interruption messaging consistency** — differentiated interruption guidance now appears for both assistant-level abort/error and run-level early termination scenarios
+
+### Documentation
+
+- Updated README version markers and added a dedicated **Modes At A Glance** block
+- Added explicit **META model requirements** guidance (modern models, large context windows, high output limits) in README, CLI reference, interactive mode docs, and configuration docs
+
 ## [0.2.3] - 2026-03-11
 
 ### Fixed

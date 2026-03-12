@@ -975,6 +975,7 @@ export class InteractiveMode {
 	// Streaming message tracking
 	private streamingComponent: AssistantMessageComponent | undefined = undefined;
 	private streamingMessage: AssistantMessage | undefined = undefined;
+	private currentTurnSawAssistantMessage = false;
 
 	// Tool execution tracking: toolCallId -> component
 	private pendingTools = new Map<string, ToolExecutionComponent>();
@@ -3976,6 +3977,7 @@ export class InteractiveMode {
 
 		switch (event.type) {
 			case "agent_start":
+				this.currentTurnSawAssistantMessage = false;
 				// Restore main escape handler if retry handler is still active
 				// (retry success event fires later, but we need main handler now)
 				if (this.retryEscapeHandler) {
@@ -4016,6 +4018,7 @@ export class InteractiveMode {
 					this.updatePendingMessagesDisplay();
 					this.ui.requestRender();
 				} else if (event.message.role === "assistant") {
+					this.currentTurnSawAssistantMessage = true;
 					this.activeAssistantOrchestrationContext = this.pendingAssistantOrchestrationContexts > 0;
 					if (this.activeAssistantOrchestrationContext) {
 						this.pendingAssistantOrchestrationContexts -= 1;
@@ -4077,6 +4080,7 @@ export class InteractiveMode {
 				if (this.streamingComponent && event.message.role === "assistant") {
 					this.streamingMessage = event.message;
 					let errorMessage: string | undefined;
+					let interruptedStopReason: "aborted" | "error" | undefined;
 					if (this.streamingMessage.stopReason === "aborted") {
 						const retryAttempt = this.session.retryAttempt;
 						errorMessage =
@@ -4084,10 +4088,14 @@ export class InteractiveMode {
 								? `Aborted after ${retryAttempt} retry attempt${retryAttempt > 1 ? "s" : ""}`
 								: "Operation aborted";
 						this.streamingMessage.errorMessage = errorMessage;
+						interruptedStopReason = "aborted";
 					}
 					this.streamingComponent.updateContent(this.sanitizeAssistantDisplayMessage(this.streamingMessage));
 
 					if (this.streamingMessage.stopReason === "aborted" || this.streamingMessage.stopReason === "error") {
+						if (this.streamingMessage.stopReason === "error") {
+							interruptedStopReason = "error";
+						}
 						if (!errorMessage) {
 							errorMessage = this.streamingMessage.errorMessage || "Error";
 						}
@@ -4103,6 +4111,9 @@ export class InteractiveMode {
 						for (const [, component] of this.pendingTools.entries()) {
 							component.setArgsComplete();
 						}
+					}
+					if (interruptedStopReason) {
+						this.showMetaModeInterruptionHint(interruptedStopReason);
 					}
 					this.streamingComponent = undefined;
 					this.streamingMessage = undefined;
@@ -4353,6 +4364,9 @@ export class InteractiveMode {
 			}
 
 			case "agent_end":
+				if (this.activeProfileName === "meta" && !this.currentTurnSawAssistantMessage) {
+					this.showMetaModeInterruptionHint("error");
+				}
 				if (this.loadingAnimation) {
 					this.loadingAnimation.stop();
 					this.loadingAnimation = undefined;
@@ -4366,6 +4380,7 @@ export class InteractiveMode {
 				this.pendingTools.clear();
 				this.subagentComponents.clear();
 				this.clearSubagentElapsedTimer();
+				this.currentTurnSawAssistantMessage = false;
 
 				await this.checkShutdownRequested();
 
@@ -4495,7 +4510,12 @@ export class InteractiveMode {
 		if (!isInternalUiMetaDetails(message.details)) return;
 		if (message.details.kind !== "orchestration_context") return;
 
-		this.pendingAssistantOrchestrationContexts += 1;
+		// Hide assistant prose only for explicit legacy orchestration contracts.
+		// META profile guidance should not suppress normal chat/task responses.
+		const rawPrompt = message.details.rawPrompt ?? "";
+		if (rawPrompt.includes("[ORCHESTRATION_DIRECTIVE]")) {
+			this.pendingAssistantOrchestrationContexts += 1;
+		}
 		if (message.details.rawPrompt && message.details.displayText) {
 			this.pendingInternalUserDisplayAliases.push({
 				rawPrompt: message.details.rawPrompt,
@@ -4528,6 +4548,26 @@ export class InteractiveMode {
 		this.lastStatusSpacer = spacer;
 		this.lastStatusText = text;
 		this.ui.requestRender();
+	}
+
+	private showMetaModeInterruptionHint(reason: "aborted" | "error"): void {
+		if (this.activeProfileName !== "meta") return;
+
+		const reasonText = reason === "error" ? "response failed unexpectedly" : "response was interrupted";
+		this.showWarning(
+			`META mode ${reasonText}. ` +
+				"Please repeat your request following META profile rules: concrete repository task (goal + scope + constraints + expected output). " +
+				"For conversational chat, switch profile to `full` (Shift+Tab).",
+		);
+	}
+
+	private showMetaModeProfileHint(): void {
+		if (this.activeProfileName !== "meta") return;
+		this.showWarning(
+			"META mode is orchestration-first. " +
+				"Send concrete repository tasks (goal + scope + constraints + expected output). " +
+				"For conversational chat, switch profile to `full` (Shift+Tab).",
+		);
 	}
 
 	private showProgressLine(message: string): void {
@@ -4989,6 +5029,7 @@ export class InteractiveMode {
 		const nextActiveTools = this.getProfileToolNames(profile.name);
 		this.session.setActiveToolsByName(nextActiveTools);
 		this.session.setThinkingLevel(profile.thinkingLevel);
+		this.session.setProfileName(profile.name);
 		this.profilePromptSuffix = profile.systemPromptAppend || undefined;
 		this.syncRuntimePromptSuffix();
 		this.session.setIosmAutopilotEnabled(profile.name === "iosm");
@@ -5001,6 +5042,7 @@ export class InteractiveMode {
 		this.updateEditorBorderColor();
 		this.refreshBuiltInHeader();
 		this.showStatus(`Profile: ${profile.name}`);
+		this.showMetaModeProfileHint();
 	}
 
 	private cycleProfile(direction: "forward" | "backward"): void {

@@ -1443,6 +1443,68 @@ describe("subagent orchestration", () => {
 		expect(result.details?.delegatedTasks).toBe(2);
 	});
 
+	it("uses dynamic host profile getter for meta delegation pressure after runtime profile switch", async () => {
+		const cwd = makeTempDir();
+		let hostProfile = "full";
+		let sawEnforcementPrompt = false;
+
+		const tool = createTaskTool(
+			cwd,
+			async (options) => {
+				if (options.prompt.includes("DELEGATION_ENFORCEMENT")) {
+					sawEnforcementPrompt = true;
+					return {
+						output: 'Root refined.\n<delegate_task profile="explore" description="Child audit">child-task</delegate_task>',
+						stats: { toolCallsStarted: 1, toolCallsCompleted: 1, assistantMessages: 1 },
+					};
+				}
+				if (options.prompt.includes("Scope:")) {
+					return {
+						output: "Root analysis without delegation on first pass.",
+						stats: { toolCallsStarted: 1, toolCallsCompleted: 1, assistantMessages: 1 },
+					};
+				}
+				if (options.prompt.includes("child-task")) {
+					return {
+						output: "Child audit complete.",
+						stats: { toolCallsStarted: 1, toolCallsCompleted: 1, assistantMessages: 1 },
+					};
+				}
+				return { output: "unexpected" };
+			},
+			{
+				getHostProfileName: () => hostProfile,
+			},
+		);
+
+		const prompt = [
+			"Scope:",
+			"- review auth module",
+			"- review gateway middleware",
+			"- produce remediation plan",
+		].join("\n");
+
+		const fullResult = await tool.execute("call_dynamic_host_profile_full", {
+			description: "runtime host profile check",
+			prompt,
+			profile: "full",
+		});
+		expect(sawEnforcementPrompt).toBe(false);
+		expect(fullResult.details?.delegatedTasks ?? 0).toBe(0);
+
+		hostProfile = "meta";
+		sawEnforcementPrompt = false;
+		const metaResult = await tool.execute("call_dynamic_host_profile_meta", {
+			description: "runtime host profile check",
+			prompt,
+			profile: "full",
+		});
+		const metaText = (metaResult.content[0] as { type: "text"; text: string }).text;
+		expect(sawEnforcementPrompt).toBe(true);
+		expect(metaText).toContain("### Delegated Subtasks");
+		expect(metaResult.details?.delegatedTasks).toBe(1);
+	});
+
 	it("keeps single-agent path for simple orchestrator tasks without explicit hint", async () => {
 		const cwd = makeTempDir();
 		let sawEnforcementPrompt = false;

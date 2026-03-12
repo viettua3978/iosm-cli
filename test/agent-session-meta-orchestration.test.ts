@@ -220,4 +220,30 @@ describe("AgentSession meta orchestration directive", () => {
 			]),
 		);
 	});
+
+	it("parses explicit orchestrate contracts with single-quoted attributes", async () => {
+		createSession("full");
+		const contractText = [
+			"<orchestrate mode='parallel' agents='2' max_parallel='2'>",
+			"- agent 1: profile=explore cwd=/tmp/a",
+			"- agent 2: profile=plan cwd=/tmp/b",
+			"task: audit codebase",
+			"</orchestrate>",
+		].join("\n");
+
+		await session.prompt(contractText, {
+			expandPromptTemplates: false,
+		});
+
+		expect(capturedMessages).toHaveLength(1);
+		const textParts =
+			capturedMessages[0]?.content
+				.filter((part) => part.type === "text")
+				.map((part) => part.text) ?? [];
+		const merged = textParts.join("\n");
+		expect(merged).toContain("[ORCHESTRATION_DIRECTIVE]");
+		expect(merged).toContain("Execution mode: parallel.");
+		expect(merged).toContain("Requested subagent count: 2.");
+		expect(merged).toContain("Max parallel workers: 2.");
+	});
 });

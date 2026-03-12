@@ -1,7 +1,7 @@
 import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { basename, join, resolve } from "node:path";
 import { parseFrontmatter } from "../utils/frontmatter.js";
-import type { AgentProfileName } from "./agent-profiles.js";
+import { isValidProfileName, type AgentProfileName } from "./agent-profiles.js";
 
 export type CustomSubagentSourceScope = "builtin" | "global" | "project";
 
@@ -422,10 +422,17 @@ function parseSubagentFile(filePath: string, cwd: string): { agent?: CustomSubag
 	const defaultName = filePath.split("/").pop()?.replace(/\.md$/i, "") ?? "subagent";
 	const name = (nameRaw || defaultName).trim();
 	const description = typeof frontmatter.description === "string" ? frontmatter.description.trim() : "";
+	const profileRaw = typeof frontmatter.profile === "string" ? frontmatter.profile.trim() : "";
+	if (profileRaw.length > 0 && !isValidProfileName(profileRaw.toLowerCase())) {
+		return {
+			diagnostic: {
+				path: filePath,
+				message: `Invalid profile "${profileRaw}". Valid profiles: explore, plan, iosm, iosm_analyst, iosm_verifier, cycle_planner, meta, full.`,
+			},
+		};
+	}
 	const profile =
-		typeof frontmatter.profile === "string" && frontmatter.profile.trim().length > 0
-			? (frontmatter.profile.trim() as AgentProfileName)
-			: undefined;
+		profileRaw.length > 0 ? (profileRaw.toLowerCase() as AgentProfileName) : undefined;
 	const tools = asStringArray(frontmatter.tools);
 	const disallowedTools = asStringArray(frontmatter.disallowed_tools);
 	const systemPrompt =

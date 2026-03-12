@@ -188,18 +188,17 @@ describe("subagent orchestration", () => {
 		expect(observedCalls[0]?.systemPrompt).toContain("Audit with strict evidence.");
 	});
 
-	it("falls back unknown profile to full without validation failure", async () => {
+	it("rejects unknown explicit profile values", async () => {
 		const cwd = makeTempDir();
 		const tool = createTaskTool(cwd, async () => ({ output: "ok" }));
 
-		const result = await tool.execute("call_unknown_profile", {
-			description: "unknown profile fallback",
-			prompt: "do work",
-			profile: "non_existing_profile",
-		});
-
-		expect((result.content[0] as { type: "text"; text: string }).text).toBe("ok");
-		expect(result.details?.profile).toBe("full");
+		await expect(
+			tool.execute("call_unknown_profile", {
+				description: "unknown profile fallback",
+				prompt: "do work",
+				profile: "non_existing_profile",
+			}),
+		).rejects.toThrow(/Unknown profile/);
 	});
 
 	it("accepts task calls without profile and defaults them to full", async () => {
@@ -1065,6 +1064,58 @@ describe("subagent orchestration", () => {
 		expect(result.details?.delegatedSucceeded).toBe(1);
 	});
 
+	it("supports delegated custom agents referenced via profile alias", async () => {
+		const cwd = makeTempDir();
+		const calls: Array<{ prompt: string; profileName?: string }> = [];
+		const tool = createTaskTool(
+			cwd,
+			async (options) => {
+				calls.push({ prompt: options.prompt, profileName: options.profileName });
+				if (options.prompt.includes("root-task")) {
+					return {
+						output:
+							'Root analysis complete.\n<delegate_task profile="security_reviewer" description="Security deep dive">scan module</delegate_task>',
+						stats: { toolCallsStarted: 1, toolCallsCompleted: 1, assistantMessages: 1 },
+					};
+				}
+				if (options.prompt.includes("scan module")) {
+					return {
+						output: "Security review complete.",
+						stats: { toolCallsStarted: 1, toolCallsCompleted: 1, assistantMessages: 1 },
+					};
+				}
+				return { output: "unexpected" };
+			},
+			{
+				resolveCustomSubagent: (name) =>
+					name === "security_reviewer"
+						? {
+								name: "security_reviewer",
+								description: "Security reviewer",
+								sourcePath: "fixture",
+								profile: "plan",
+								instructions: "Security-focused reviewer.",
+							}
+						: undefined,
+				availableCustomSubagents: ["security_reviewer"],
+			},
+		);
+
+		const result = await tool.execute("call_delegate_custom_agent_profile_alias", {
+			description: "delegate custom agent via profile alias",
+			prompt: "root-task",
+			profile: "full",
+		});
+
+		const text = (result.content[0] as { type: "text"; text: string }).text;
+		expect(calls).toHaveLength(2);
+		expect(calls[1]?.profileName).toBe("plan");
+		expect(text).toContain("security_reviewer/plan");
+		expect(result.details?.delegatedTasks).toBe(1);
+		expect(result.details?.delegatedSucceeded).toBe(1);
+		expect(result.details?.delegatedFailed).toBe(0);
+	});
+
 	it("emits delegate mini-list progress updates", async () => {
 		const cwd = makeTempDir();
 		const tool = createTaskTool(cwd, async (options) => {
@@ -1751,6 +1802,77 @@ describe("subagent orchestration", () => {
 		expect(result.details?.delegatedTasks).toBe(3);
 	});
 
+	it("runs nested delegated subtasks in parallel and honors nested depends_on", async () => {
+		const cwd = makeTempDir();
+		let nestedFirstCompleted = false;
+		let nestedSecondStartedBeforeFirstDone = false;
+		let nestedThirdStartedBeforeSecondDone = false;
+		let nestedSecondCompleted = false;
+		const tool = createTaskTool(
+			cwd,
+			async (options) => {
+				if (options.prompt.includes("root-nested-depends-task")) {
+					return {
+						output:
+							'Root analysis.\n<delegate_task profile="full" description="Implementation stream">child-implementation-task</delegate_task>',
+						stats: { toolCallsStarted: 1, toolCallsCompleted: 1, assistantMessages: 1 },
+					};
+				}
+				if (options.prompt.includes("child-implementation-task")) {
+					return {
+						output:
+							'Child implementation planning.\n<delegate_task profile="explore" description="First">nested-first-task</delegate_task>\n<delegate_task profile="plan" description="Second">nested-second-task</delegate_task>\n<delegate_task profile="explore" description="Third" depends_on="2">nested-third-task</delegate_task>',
+						stats: { toolCallsStarted: 1, toolCallsCompleted: 1, assistantMessages: 1 },
+					};
+				}
+				if (options.prompt.includes("nested-first-task")) {
+					await new Promise((resolve) => setTimeout(resolve, 30));
+					nestedFirstCompleted = true;
+					return {
+						output: "Nested first complete.",
+						stats: { toolCallsStarted: 1, toolCallsCompleted: 1, assistantMessages: 1 },
+					};
+				}
+				if (options.prompt.includes("nested-second-task")) {
+					if (!nestedFirstCompleted) nestedSecondStartedBeforeFirstDone = true;
+					await new Promise((resolve) => setTimeout(resolve, 40));
+					nestedSecondCompleted = true;
+					return {
+						output: "Nested second complete.",
+						stats: { toolCallsStarted: 1, toolCallsCompleted: 1, assistantMessages: 1 },
+					};
+				}
+				if (options.prompt.includes("nested-third-task")) {
+					if (!nestedSecondCompleted) nestedThirdStartedBeforeSecondDone = true;
+					return {
+						output: "Nested third complete.",
+						stats: { toolCallsStarted: 1, toolCallsCompleted: 1, assistantMessages: 1 },
+					};
+				}
+				return { output: "unexpected" };
+			},
+			{
+				hostProfileName: "meta",
+			},
+		);
+
+		const result = await tool.execute("call_nested_delegate_depends_parallel", {
+			description: "nested delegate depends/parallel",
+			prompt: "root-nested-depends-task",
+			profile: "meta",
+		});
+
+		const text = (result.content[0] as { type: "text"; text: string }).text;
+		expect(text).toContain("Nested first complete.");
+		expect(text).toContain("Nested second complete.");
+		expect(text).toContain("Nested third complete.");
+		expect(nestedSecondStartedBeforeFirstDone).toBe(true);
+		expect(nestedThirdStartedBeforeSecondDone).toBe(false);
+		expect(result.details?.delegatedTasks).toBe(4);
+		expect(result.details?.delegatedSucceeded).toBe(4);
+		expect(result.details?.delegatedFailed).toBe(0);
+	});
+
 	it("rejects write-capable background policy", async () => {
 		const cwd = makeTempDir();
 		const tool = createTaskTool(cwd, async () => ({ output: "ok" }), {
@@ -1800,6 +1922,34 @@ describe("subagent orchestration", () => {
 				description: "iosm background policy check",
 				prompt: "write files",
 				profile: "iosm",
+				background: true,
+			}),
+		).rejects.toThrow(/Background policy violation/);
+	});
+
+	it("rejects background mode for plan profile due mutable bash tool", async () => {
+		const cwd = makeTempDir();
+		const tool = createTaskTool(cwd, async () => ({ output: "ok" }));
+
+		await expect(
+			tool.execute("call_bg_policy_plan", {
+				description: "plan background policy check",
+				prompt: "analyze repository",
+				profile: "plan",
+				background: true,
+			}),
+		).rejects.toThrow(/Background policy violation/);
+	});
+
+	it("rejects background mode for iosm_analyst profile due mutable bash tool", async () => {
+		const cwd = makeTempDir();
+		const tool = createTaskTool(cwd, async () => ({ output: "ok" }));
+
+		await expect(
+			tool.execute("call_bg_policy_iosm_analyst", {
+				description: "iosm_analyst background policy check",
+				prompt: "analyze metrics",
+				profile: "iosm_analyst",
 				background: true,
 			}),
 		).rejects.toThrow(/Background policy violation/);

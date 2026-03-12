@@ -18,6 +18,7 @@ import {
 	MAX_SUBAGENT_DELEGATION_DEPTH,
 	MAX_SUBAGENT_DELEGATIONS_PER_TASK,
 } from "../orchestration-limits.js";
+import { AGENT_PROFILES, isValidProfileName, type AgentProfileName } from "../agent-profiles.js";
 import type { SharedMemoryContext } from "../shared-memory.js";
 import type { CustomSubagentDefinition } from "../subagents.js";
 
@@ -205,17 +206,14 @@ export interface TaskToolOptions {
 	getHostProfileName?: () => string | undefined;
 }
 
-/** Tool names available per profile */
-const toolsByProfile: Record<string, string[]> = {
-	explore: ["read", "grep", "find", "ls"],
-	plan: ["read", "bash", "grep", "find", "ls"],
-	iosm: ["read", "bash", "edit", "write", "grep", "find", "ls"],
-	meta: ["read", "bash", "edit", "write", "grep", "find", "ls"],
-	iosm_analyst: ["read", "bash", "grep", "find", "ls"],
-	iosm_verifier: ["read", "bash", "write"],
-	cycle_planner: ["read", "bash", "write"],
-	full: ["read", "bash", "edit", "write", "grep", "find", "ls"],
-};
+/** Tool names available per profile (kept in sync with AGENT_PROFILES). */
+const toolsByProfile: Record<AgentProfileName, string[]> = Object.values(AGENT_PROFILES).reduce(
+	(acc, profile) => {
+		acc[profile.name] = [...profile.tools];
+		return acc;
+	},
+	{} as Record<AgentProfileName, string[]>,
+);
 
 /** System prompt injected per profile */
 const systemPromptByProfile: Record<string, string> = {
@@ -233,7 +231,16 @@ const systemPromptByProfile: Record<string, string> = {
 	full: "You are a software engineering agent. Execute the task end-to-end.",
 };
 
-const writeCapableProfiles = new Set(["full", "meta", "iosm", "iosm_verifier", "cycle_planner"]);
+const writeMutationTools = new Set(["edit", "write"]);
+const backgroundUnsafeTools = new Set(["bash", "edit", "write"]);
+const writeCapableProfiles = new Set(
+	(Object.keys(toolsByProfile) as AgentProfileName[]).filter((profileName) =>
+		toolsByProfile[profileName].some((tool) => writeMutationTools.has(tool)),
+	),
+);
+const backgroundSafeProfiles = (Object.keys(toolsByProfile) as AgentProfileName[]).filter((profileName) =>
+	toolsByProfile[profileName].every((tool) => !backgroundUnsafeTools.has(tool)),
+);
 const delegationTagName = "delegate_task";
 
 type DelegationRequest = {
@@ -624,11 +631,12 @@ function parseDelegationRequests(output: string, maxRequests: number): ParsedDel
 			return "";
 		}
 		const profileRaw = (attrs.profile ?? "explore").trim();
-		const profile = profileRaw.toLowerCase();
-		if (!(profile in toolsByProfile)) {
-			warnings.push(`Ignored delegation block with unknown profile "${profileRaw}".`);
+		if (!profileRaw) {
+			warnings.push(`Ignored delegation block with empty profile.`);
 			return "";
 		}
+		const normalizedProfile = profileRaw.toLowerCase();
+		const profile = isValidProfileName(normalizedProfile) ? normalizedProfile : profileRaw;
 		const isolationRaw = (attrs.isolation ?? "").trim().toLowerCase();
 		const isolation =
 			isolationRaw === "worktree" ? "worktree" : isolationRaw === "none" ? "none" : undefined;
@@ -661,6 +669,10 @@ function parseDelegationRequests(output: string, maxRequests: number): ParsedDel
 		warnings,
 		cleanedOutput: normalizeSpacing(cleaned),
 	};
+}
+
+function isBackgroundSafeToolset(tools: readonly string[]): boolean {
+	return tools.every((toolName) => !backgroundUnsafeTools.has(toolName));
 }
 
 function getCwdLockKey(cwd: string): string {
@@ -1025,12 +1037,21 @@ export function createTaskTool(
 				const availableCustomNames = options?.availableCustomSubagents ?? [];
 				const resolveCustom = (name: string | undefined): CustomSubagentDefinition | undefined => {
 					if (!name || !options?.resolveCustomSubagent) return undefined;
-					return options.resolveCustomSubagent(name);
+					const trimmed = name.trim();
+					if (!trimmed) return undefined;
+					const resolved = options.resolveCustomSubagent(trimmed);
+					if (resolved) return resolved;
+					const lowered = trimmed.toLowerCase();
+					if (lowered !== trimmed) {
+						return options.resolveCustomSubagent(lowered);
+					}
+					return undefined;
 				};
 
 				let normalizedAgentName = agentName?.trim() || undefined;
 				let customSubagent = resolveCustom(normalizedAgentName);
-				let normalizedProfile = profile?.trim().toLowerCase() || customSubagent?.profile?.trim().toLowerCase() || "full";
+				const requestedProfileRaw = profile?.trim() || undefined;
+				let normalizedProfile = requestedProfileRaw?.toLowerCase() || customSubagent?.profile?.trim().toLowerCase() || "full";
 				const normalizedHostProfile =
 					options?.getHostProfileName?.()?.trim().toLowerCase() ?? options?.hostProfileName?.trim().toLowerCase();
 
@@ -1050,14 +1071,26 @@ export function createTaskTool(
 						}
 					}
 
-					if (!toolsByProfile[normalizedProfile]) {
-						normalizedProfile = "full";
+					if (!customSubagent && !isValidProfileName(normalizedProfile)) {
+						throw new Error(
+							`Unknown profile "${requestedProfileRaw ?? normalizedProfile}". Valid profiles: ${Object.keys(
+								toolsByProfile,
+							).join(", ")}.`,
+						);
 					}
 
-				const effectiveProfile = customSubagent?.profile ?? normalizedProfile;
+				const effectiveProfileCandidate = (customSubagent?.profile ?? normalizedProfile).trim().toLowerCase();
+				if (!isValidProfileName(effectiveProfileCandidate)) {
+					throw new Error(
+						`Invalid resolved profile "${effectiveProfileCandidate}". Valid profiles: ${Object.keys(
+							toolsByProfile,
+						).join(", ")}.`,
+					);
+				}
+				const effectiveProfile = effectiveProfileCandidate as AgentProfileName;
 			let tools = customSubagent?.tools
 				? [...customSubagent.tools]
-				: [...(toolsByProfile[effectiveProfile] ?? toolsByProfile.explore)];
+				: [...toolsByProfile[effectiveProfile]];
 			if (customSubagent?.disallowedTools?.length) {
 				const blocked = new Set(customSubagent.disallowedTools);
 				tools = tools.filter((tool) => !blocked.has(tool));
@@ -1134,9 +1167,11 @@ export function createTaskTool(
 			if (!existsSync(requestedSubagentCwd) || !statSync(requestedSubagentCwd).isDirectory()) {
 				throw new Error(`Subagent cwd does not exist or is not a directory: ${requestedSubagentCwd}`);
 			}
-			if (runInBackground && writeCapableProfiles.has(effectiveProfile)) {
+			if (runInBackground && !isBackgroundSafeToolset(tools)) {
 				throw new Error(
-					`Background policy violation: profile "${effectiveProfile}" is write-capable. Use explore/plan/iosm_analyst for background mode.`,
+					`Background policy violation: profile "${effectiveProfile}" has mutable tools (${tools
+						.filter((toolName) => backgroundUnsafeTools.has(toolName))
+						.join(", ")}). Background mode requires read-only toolsets. Safe baseline profiles: ${backgroundSafeProfiles.join(", ")}.`,
 				);
 			}
 			const useWorktree = isolation === "worktree";
@@ -1545,29 +1580,84 @@ export function createTaskTool(
 								}
 
 								const nestedWarnings: string[] = [];
-								const sections: string[] = [];
+								const sectionsByIndex: Array<string | undefined> = new Array(requests.length);
+								const statuses: TaskDelegateProgressStatus[] = Array.from(
+									{ length: requests.length },
+									() => "pending",
+								);
+								const totalNested = requests.length;
+								const normalizedDependsOn: number[][] = requests.map((request, index) => {
+									const current = index + 1;
+									const raw = request.dependsOn ?? [];
+									const unique = new Set<number>();
+									for (const dep of raw) {
+										if (!Number.isInteger(dep) || dep <= 0 || dep > totalNested || dep === current) {
+											nestedWarnings.push(
+												`Nested delegated task ${lineage}${current} has invalid depends_on reference "${dep}" and it was ignored.`,
+											);
+											continue;
+										}
+										unique.add(dep);
+									}
+									return Array.from(unique).sort((a, b) => a - b);
+								});
 
-								for (const [nestedIndex, nestedRequest] of requests.entries()) {
+								const statusOf = (index: number): TaskDelegateProgressStatus => statuses[index] ?? "pending";
+								const markNestedFailed = (
+									nestedIndex: number,
+									requestLabel: string,
+									nestedRequest: DelegationRequest,
+									nestedProfileLabel: string,
+									message: string,
+									cause: FailureCause,
+								): void => {
+									statuses[nestedIndex] = "failed";
+									recordFailureCause(cause);
+									delegatedTasks += 1;
+									delegatedFailed += 1;
+									sectionsByIndex[nestedIndex] =
+										`###### ${requestLabel}. ${nestedRequest.description} (${nestedProfileLabel})\nERROR [cause=${cause}]: ${message}`;
+								};
+
+								const runNestedDelegate = async (nestedIndex: number): Promise<void> => {
+									const nestedRequest = requests[nestedIndex]!;
 									const requestLabel = `${lineage}${nestedIndex + 1}`;
-									const requestedNestedAgent = nestedRequest.agent?.trim() || undefined;
-									const nestedCustomSubagent = resolveCustom(requestedNestedAgent);
+									statuses[nestedIndex] = "running";
+									let requestedNestedAgent = nestedRequest.agent?.trim() || undefined;
+									let nestedCustomSubagent = resolveCustom(requestedNestedAgent);
+									if (!nestedCustomSubagent && !requestedNestedAgent) {
+										const profileAsAgent = resolveCustom(nestedRequest.profile);
+										if (profileAsAgent) {
+											nestedCustomSubagent = profileAsAgent;
+											requestedNestedAgent = profileAsAgent.name;
+										}
+									}
 									if (requestedNestedAgent && !nestedCustomSubagent) {
 										nestedWarnings.push(
 											`Nested delegated task "${nestedRequest.description}" requested unknown agent "${requestedNestedAgent}". Falling back to profile "${nestedRequest.profile}".`,
 										);
 									}
-									const nestedProfileRaw = nestedCustomSubagent?.profile ?? nestedRequest.profile;
-									const normalizedNestedProfile = nestedProfileRaw.trim().toLowerCase();
-									const nestedProfile =
-										normalizedNestedProfile && toolsByProfile[normalizedNestedProfile]
-											? normalizedNestedProfile
-											: "full";
+
+									const nestedProfileCandidate = (nestedCustomSubagent?.profile ?? nestedRequest.profile).trim();
+									const normalizedNestedProfile = nestedProfileCandidate.toLowerCase();
+									if (!isValidProfileName(normalizedNestedProfile)) {
+										markNestedFailed(
+											nestedIndex,
+											requestLabel,
+											nestedRequest,
+											nestedProfileCandidate || "unknown",
+											`nested delegate skipped: unknown profile "${nestedProfileCandidate || nestedRequest.profile}"`,
+											"logic_error",
+										);
+										return;
+									}
+									const nestedProfile = normalizedNestedProfile as AgentProfileName;
 									const nestedProfileLabel = nestedCustomSubagent?.name
 										? `${nestedCustomSubagent.name}/${nestedProfile}`
 										: nestedProfile;
 									let nestedTools = nestedCustomSubagent?.tools
 										? [...nestedCustomSubagent.tools]
-										: [...(toolsByProfile[nestedProfile] ?? toolsByProfile.explore)];
+										: [...toolsByProfile[nestedProfile]];
 									if (nestedCustomSubagent?.disallowedTools?.length) {
 										const blocked = new Set(nestedCustomSubagent.disallowedTools);
 										nestedTools = nestedTools.filter((tool) => !blocked.has(tool));
@@ -1587,13 +1677,15 @@ export function createTaskTool(
 										? path.resolve(parentCwd, nestedRequest.cwd)
 										: nestedCustomSubagent?.cwd ?? parentCwd;
 									if (!existsSync(requestedNestedCwd) || !statSync(requestedNestedCwd).isDirectory()) {
-										recordFailureCause("dependency_env");
-										delegatedFailed += 1;
-										delegatedTasks += 1;
-										sections.push(
-											`###### ${requestLabel}. ${nestedRequest.description} (${nestedProfileLabel})\nERROR [cause=dependency_env]: nested delegate skipped: missing cwd`,
+										markNestedFailed(
+											nestedIndex,
+											requestLabel,
+											nestedRequest,
+											nestedProfileLabel,
+											"nested delegate skipped: missing cwd",
+											"dependency_env",
 										);
-										continue;
+										return;
 									}
 
 									let nestedReleaseLock: (() => void) | undefined;
@@ -1655,6 +1747,7 @@ export function createTaskTool(
 										const nestedStats = typeof nestedResult === "string" ? undefined : nestedResult.stats;
 										delegatedTasks += 1;
 										delegatedSucceeded += 1;
+										statuses[nestedIndex] = "done";
 										delegatedStats.toolCallsStarted += nestedStats?.toolCallsStarted ?? 0;
 										delegatedStats.toolCallsCompleted += nestedStats?.toolCallsCompleted ?? 0;
 										delegatedStats.assistantMessages += nestedStats?.assistantMessages ?? 0;
@@ -1664,9 +1757,15 @@ export function createTaskTool(
 											depthRemaining > 1 ? effectiveMaxDelegations : 0,
 										);
 										nestedOutput = parsedNestedDelegation.cleanedOutput;
-										nestedWarnings.push(...parsedNestedDelegation.warnings.map((warning) => `Nested child ${requestLabel}: ${warning}`));
+										nestedWarnings.push(
+											...parsedNestedDelegation.warnings.map(
+												(warning) => `Nested child ${requestLabel}: ${warning}`,
+											),
+										);
 
-										let nestedSection = `###### ${requestLabel}. ${nestedRequest.description} (${nestedProfileLabel})\n${nestedOutput.trim() || "(no output)"}`;
+										let nestedSection = `###### ${requestLabel}. ${nestedRequest.description} (${nestedProfileLabel})\n${
+											nestedOutput.trim() || "(no output)"
+										}`;
 										if (parsedNestedDelegation.requests.length > 0 && depthRemaining > 1) {
 											const deeper = await executeNestedDelegates(
 												parsedNestedDelegation.requests,
@@ -1676,45 +1775,145 @@ export function createTaskTool(
 											);
 											nestedWarnings.push(...deeper.warnings);
 											if (deeper.sections.length > 0) {
-												nestedSection = `${nestedSection}\n\n##### Nested Delegated Subtasks\n\n${deeper.sections.join("\n\n")}`;
+												nestedSection = `${nestedSection}\n\n##### Nested Delegated Subtasks\n\n${deeper.sections.join(
+													"\n\n",
+												)}`;
 											}
 										}
-										sections.push(nestedSection);
+										sectionsByIndex[nestedIndex] = nestedSection;
 									} catch (error) {
 										const message = error instanceof Error ? error.message : String(error);
 										const cause = classifyFailureCause(message);
-										recordFailureCause(cause);
-										delegatedTasks += 1;
-										delegatedFailed += 1;
-										sections.push(
-											`###### ${requestLabel}. ${nestedRequest.description} (${nestedProfileLabel})\nERROR [cause=${cause}]: ${message}`,
+										markNestedFailed(
+											nestedIndex,
+											requestLabel,
+											nestedRequest,
+											nestedProfileLabel,
+											message,
+											cause,
 										);
 									} finally {
 										nestedReleaseIsolation?.();
 										nestedReleaseLock?.();
 										cleanupWriteLock(nestedRequest.lockKey?.trim());
 									}
+								};
+
+								const pendingIndices = new Set<number>(Array.from({ length: totalNested }, (_v, i) => i));
+								const runningNested = new Map<number, Promise<void>>();
+								const maxNestedParallel = Math.max(
+									1,
+									Math.min(totalNested, effectiveMaxDelegateParallel),
+								);
+
+								const resolveBlockedByFailedDependencies = (): boolean => {
+									let changed = false;
+									for (const nestedIndex of Array.from(pendingIndices)) {
+										const deps = normalizedDependsOn[nestedIndex] ?? [];
+										if (deps.length === 0) continue;
+										const failedDep = deps.find((dep) => statusOf(dep - 1) === "failed");
+										if (!failedDep) continue;
+										pendingIndices.delete(nestedIndex);
+										const nestedRequest = requests[nestedIndex]!;
+										const requestLabel = `${lineage}${nestedIndex + 1}`;
+										markNestedFailed(
+											nestedIndex,
+											requestLabel,
+											nestedRequest,
+											nestedRequest.profile,
+											`nested delegate skipped: dependency ${lineage}${failedDep} failed`,
+											"logic_error",
+										);
+										changed = true;
+									}
+									return changed;
+								};
+
+								const launchReadyNested = (): boolean => {
+									let launched = false;
+									while (runningNested.size < maxNestedParallel) {
+										let nextIndex: number | undefined;
+										for (const nestedIndex of pendingIndices) {
+											const deps = normalizedDependsOn[nestedIndex] ?? [];
+											const allDone = deps.every((dep) => statusOf(dep - 1) === "done");
+											if (allDone) {
+												nextIndex = nestedIndex;
+												break;
+											}
+										}
+										if (nextIndex === undefined) break;
+										pendingIndices.delete(nextIndex);
+										const promise = runNestedDelegate(nextIndex).finally(() => {
+											runningNested.delete(nextIndex);
+										});
+										runningNested.set(nextIndex, promise);
+										launched = true;
+									}
+									return launched;
+								};
+
+								while (pendingIndices.size > 0 || runningNested.size > 0) {
+									throwIfAborted();
+									const changed = resolveBlockedByFailedDependencies();
+									const launched = launchReadyNested();
+									if (runningNested.size === 0) {
+										if (pendingIndices.size > 0 && !changed && !launched) {
+											for (const nestedIndex of Array.from(pendingIndices)) {
+												pendingIndices.delete(nestedIndex);
+												const nestedRequest = requests[nestedIndex]!;
+												const deps = normalizedDependsOn[nestedIndex] ?? [];
+												const requestLabel = `${lineage}${nestedIndex + 1}`;
+												markNestedFailed(
+													nestedIndex,
+													requestLabel,
+													nestedRequest,
+													nestedRequest.profile,
+													`nested delegate blocked: unresolved depends_on (${deps.join(", ") || "unknown"})`,
+													"logic_error",
+												);
+											}
+										}
+										break;
+									}
+									await Promise.race(Array.from(runningNested.values()));
 								}
 
+								const sections = sectionsByIndex.filter(
+									(section): section is string => typeof section === "string" && section.trim().length > 0,
+								);
 								return { sections, warnings: nestedWarnings };
 							};
 
 							const runDelegate = async (index: number): Promise<void> => {
 								throwIfAborted();
 								const request = parsedDelegation.requests[index];
-							const requestedChildAgent = request.agent?.trim() || undefined;
-							const childCustomSubagent = resolveCustom(requestedChildAgent);
+							let requestedChildAgent = request.agent?.trim() || undefined;
+							let childCustomSubagent = resolveCustom(requestedChildAgent);
+							if (!childCustomSubagent && !requestedChildAgent) {
+								const profileAsAgent = resolveCustom(request.profile);
+								if (profileAsAgent) {
+									childCustomSubagent = profileAsAgent;
+									requestedChildAgent = profileAsAgent.name;
+								}
+							}
 							if (requestedChildAgent && !childCustomSubagent) {
 								delegationWarnings.push(
 									`Delegated task "${request.description}" requested unknown agent "${requestedChildAgent}". Falling back to profile "${request.profile}".`,
 								);
 							}
-							const childProfileRaw = childCustomSubagent?.profile ?? request.profile;
-							const normalizedChildProfile = childProfileRaw.trim().toLowerCase();
-							const childProfile =
-								normalizedChildProfile && toolsByProfile[normalizedChildProfile]
-									? normalizedChildProfile
-									: "full";
+							const childProfileRaw = (childCustomSubagent?.profile ?? request.profile).trim();
+							const normalizedChildProfile = childProfileRaw.toLowerCase();
+							if (!isValidProfileName(normalizedChildProfile)) {
+								recordFailureCause("logic_error");
+								markDelegateFailed(
+									index,
+									`delegate ${index + 1}/${delegateTotal} skipped: unknown profile "${childProfileRaw || request.profile}"`,
+									`Delegated task "${request.description}" requested unknown profile "${childProfileRaw || request.profile}".`,
+									"logic_error",
+								);
+								return;
+							}
+							const childProfile = normalizedChildProfile as AgentProfileName;
 							const childProfileLabel = childCustomSubagent?.name
 								? `${childCustomSubagent.name}/${childProfile}`
 								: childProfile;
@@ -1736,7 +1935,7 @@ export function createTaskTool(
 
 							let childTools = childCustomSubagent?.tools
 								? [...childCustomSubagent.tools]
-								: [...(toolsByProfile[childProfile] ?? toolsByProfile.explore)];
+								: [...toolsByProfile[childProfile]];
 							if (childCustomSubagent?.disallowedTools?.length) {
 								const blocked = new Set(childCustomSubagent.disallowedTools);
 								childTools = childTools.filter((tool) => !blocked.has(tool));

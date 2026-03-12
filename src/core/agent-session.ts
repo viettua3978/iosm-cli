@@ -150,8 +150,8 @@ function parseOrchestrateBlock(text: string):
 	const attrs = match[1] ?? "";
 	const body = (match[2] ?? "").trim();
 	const readAttr = (name: string): string | undefined => {
-		const attrMatch = attrs.match(new RegExp(`${name}="([^"]+)"`, "i"));
-		return attrMatch?.[1]?.trim();
+		const attrMatch = attrs.match(new RegExp(`${name}\\s*=\\s*(?:"([^"]+)"|'([^']+)')`, "i"));
+		return (attrMatch?.[1] ?? attrMatch?.[2])?.trim();
 	};
 
 	const mode = readAttr("mode");

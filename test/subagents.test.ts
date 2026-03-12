@@ -216,4 +216,31 @@ describe("loadCustomSubagents", () => {
 			"ux_specialist",
 		);
 	});
+
+	it("rejects custom subagents with invalid profile values", () => {
+		const root = makeTempDir();
+		const cwd = join(root, "workspace");
+		const agentDir = join(root, "agent-home");
+		mkdirSync(cwd, { recursive: true });
+		mkdirSync(agentDir, { recursive: true });
+
+		writeAgentFile(
+			join(cwd, ".iosm", "agents", "bad_profile.md"),
+			[
+				"---",
+				'name: "bad_profile"',
+				'description: "Invalid profile test"',
+				'profile: "meta_orchestrator"',
+				"---",
+				"",
+				"Should not load.",
+				"",
+			].join("\n"),
+		);
+
+		const loaded = loadCustomSubagents({ cwd, agentDir });
+		expect(loaded.agents.some((agent) => agent.name === "bad_profile")).toBe(false);
+		expect(loaded.diagnostics.some((item) => item.path.includes("bad_profile.md"))).toBe(true);
+		expect(loaded.diagnostics.some((item) => item.message.includes("Invalid profile"))).toBe(true);
+	});
 });

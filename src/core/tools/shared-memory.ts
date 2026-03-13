@@ -61,13 +61,46 @@ const sharedMemoryReadSchema = Type.Object({
 	),
 	include_values: Type.Optional(
 		Type.Boolean({
-			description: "When false, returns only metadata (key/version/writer).",
+			description: "When false (default), returns only metadata (key/version/writer).",
 		}),
 	),
 });
 
 export type SharedMemoryWriteInput = Static<typeof sharedMemoryWriteSchema>;
 export type SharedMemoryReadInput = Static<typeof sharedMemoryReadSchema>;
+
+function summarizeSharedMemoryItemForDetails(
+	item: {
+		key: string;
+		scope: SharedMemoryScope;
+		version: number;
+		updatedAt: string;
+		writer: { taskId?: string; delegateId?: string; profile?: string };
+		value?: string;
+	},
+	includeValuePreview: boolean,
+): Record<string, unknown> {
+	const base: Record<string, unknown> = {
+		key: item.key,
+		scope: item.scope,
+		version: item.version,
+		updatedAt: item.updatedAt,
+		writer: item.writer,
+	};
+	if (typeof item.value !== "string") return base;
+	const valueLength = item.value.length;
+	if (!includeValuePreview) {
+		return {
+			...base,
+			valueLength,
+		};
+	}
+	return {
+		...base,
+		valueLength,
+		valuePreview: item.value.length > 200 ? `${item.value.slice(0, 197)}...` : item.value,
+	};
+}
 
 function ensureContext(context: SharedMemoryContext): SharedMemoryContext {
 	if (!context.runId || !context.runId.trim()) {
@@ -117,7 +150,7 @@ export function createSharedMemoryWriteTool(context: SharedMemoryContext): Agent
 				],
 				details: {
 					runId: ensured.runId,
-					item: result,
+					item: summarizeSharedMemoryItemForDetails(result, false),
 				},
 			};
 		},
@@ -142,7 +175,7 @@ export function createSharedMemoryReadTool(context: SharedMemoryContext): AgentT
 				key: input.key,
 				prefix: input.prefix,
 				limit: input.limit,
-				includeValues: input.include_values ?? true,
+				includeValues: input.include_values ?? false,
 			}, _signal);
 			const header = `shared memory ${result.scope}: ${result.items.length}/${result.totalMatched}`;
 			const lines =
@@ -164,7 +197,12 @@ export function createSharedMemoryReadTool(context: SharedMemoryContext): AgentT
 						});
 			return {
 				content: [{ type: "text" as const, text: [header, ...lines].join("\n") }],
-				details: result,
+				details: {
+					runId: result.runId,
+					scope: result.scope,
+					totalMatched: result.totalMatched,
+					items: result.items.map((item) => summarizeSharedMemoryItemForDetails(item, input.include_values === true)),
+				},
 			};
 		},
 	};

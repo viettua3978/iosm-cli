@@ -9,6 +9,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 _No unreleased changes._
 
+## [0.2.5] - 2026-03-13
+
+### Added
+
+- **Orchestrate parallel fan-out defaults** — `/orchestrate --parallel` now auto-sets `--max-parallel` to the selected agent count when omitted, reducing accidental single-lane execution
+- **Parallel worker profile auto-selection** — when no worker profile is provided in parallel orchestration, assignments default to `meta` in write-capable host contexts for stronger orchestration behavior
+- **Delegate hint propagation for orchestrate assignments** — assignment generation now injects `delegate_parallel_hint` guidance to drive nested delegate fan-out inside child tasks
+- **Swarm dispatch timeout controls** — scheduler now supports bounded dispatch timeouts (including `IOSM_SWARM_DISPATCH_TIMEOUT_MS`) to avoid silent long stalls
+- **Interactive swarm progress surfaces** — improved live subagent task/delegate progress rendering and swarm-aware footer busy state in TUI
+
+### Changed
+
+- **Task profile defaulting** — task tool now defaults missing `profile` to current host profile (fallback `full`) instead of always forcing `full`
+- **Delegation depth baseline** — max delegation depth default increased to `2` for better nested decomposition capacity
+- **Shared memory read behavior** — `shared_memory_read` now returns metadata-only by default (`include_values=false`) with safe value preview details when requested
+- **Swarm planning fan-out quality** — planner now prioritizes code-relevant touches and partitions work into multiple workstreams more aggressively for parallel execution
+- **Singular run id generation** — `/singular` run ids now include milliseconds and random suffix for collision-resistant rapid runs
+
+### Fixed
+
+- **Dependent-task dead-end behavior** — scheduler now marks downstream tasks as blocked when dependencies fail, preventing ambiguous pending states
+- **Status update loss under file lock contention** — team task status writes now queue and retry asynchronously instead of being dropped during temporary lock conflicts
+- **Steering skip false errors** — parallel task agent no longer marks steering-driven tool skips as execution errors
+- **Swarm-from-singular startup guard** — execution now fails fast with a clear warning if no active model is configured
+- **Strict delegation in orchestrated contexts** — nested delegation contract now also applies in run/task orchestrated contexts when delegate hints indicate required fan-out
+
+### Documentation
+
+- Updated README to `v0.2.5` and added a focused "What's New in v0.2.5" section
+- Expanded orchestration docs (`interactive-mode`, `cli-reference`, `orchestration-and-subagents`) with `/orchestrate` parallel defaults and delegation guidance
+
 ## [0.2.4] - 2026-03-12
 
 ### Added

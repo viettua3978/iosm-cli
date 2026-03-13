@@ -12,6 +12,7 @@ import { INTERNAL_UI_META_CUSTOM_TYPE } from "../src/core/messages.js";
 import {
 	MAX_ORCHESTRATION_AGENTS,
 	MAX_ORCHESTRATION_PARALLEL,
+	MAX_SUBAGENT_DELEGATE_PARALLEL,
 } from "../src/core/orchestration-limits.js";
 import { TASK_PLAN_CUSTOM_TYPE } from "../src/core/task-plan.js";
 import {
@@ -1622,6 +1623,59 @@ describe("InteractiveMode contract/singular commands", () => {
 		);
 	});
 
+	test("runSwarmFromSingular fails fast when no active model is configured", async () => {
+		const showWarning = vi.fn();
+		const loadSingularAnalysisByRunId = vi.fn();
+		const executeSwarmRun = vi.fn();
+		const fakeThis: any = Object.create((InteractiveMode as any).prototype);
+		fakeThis.session = { model: undefined };
+		fakeThis.showWarning = showWarning;
+		fakeThis.loadSingularAnalysisByRunId = loadSingularAnalysisByRunId;
+		fakeThis.executeSwarmRun = executeSwarmRun;
+
+		await (InteractiveMode as any).prototype.runSwarmFromSingular.call(fakeThis, {
+			runId: "singular_run_missing_model",
+			option: 1,
+		});
+
+		expect(showWarning).toHaveBeenCalledWith(
+			expect.stringContaining("Cannot launch Swarm from /singular: no active model"),
+		);
+		expect(loadSingularAnalysisByRunId).not.toHaveBeenCalled();
+		expect(executeSwarmRun).not.toHaveBeenCalled();
+	});
+
+	test("resolveSwarmMaxParallel auto-scales singular runs for higher fan-out", () => {
+		const fakeThis: any = Object.create((InteractiveMode as any).prototype);
+		const plan = {
+			source: "singular",
+			request: "harden auth and gateway",
+			tasks: [
+				{ id: "task_1", concurrency_class: "analysis", depends_on: [] },
+				{ id: "task_2", concurrency_class: "implementation", depends_on: [] },
+				{ id: "task_3", concurrency_class: "implementation", depends_on: [] },
+				{ id: "task_4", concurrency_class: "implementation", depends_on: ["task_1"] },
+				{ id: "task_5", concurrency_class: "tests", depends_on: ["task_2", "task_3"] },
+				{ id: "task_6", concurrency_class: "verification", depends_on: ["task_4", "task_5"] },
+			],
+			notes: [],
+		};
+
+		const auto = (InteractiveMode as any).prototype.resolveSwarmMaxParallel.call(fakeThis, {
+			plan,
+			source: "singular",
+		});
+		expect(auto).toBeGreaterThanOrEqual(4);
+		expect(auto).toBeLessThanOrEqual(MAX_ORCHESTRATION_PARALLEL);
+
+		const explicit = (InteractiveMode as any).prototype.resolveSwarmMaxParallel.call(fakeThis, {
+			plan,
+			source: "singular",
+			requested: 2,
+		});
+		expect(explicit).toBe(2);
+	});
+
 	test("promptSingularDecision allows swarm start when defer recommendation exists but user picks non-defer option", async () => {
 		const result = {
 			runId: "2026-03-11-091500",
@@ -1818,6 +1872,108 @@ describe("InteractiveMode.promptWithTaskFallback", () => {
 			task: "fan out task",
 		});
 		expect(fakeThis.showWarning).not.toHaveBeenCalled();
+	});
+
+	test("defaults orchestrate parallel max-parallel to agent count when omitted", () => {
+		const fakeThis: any = {
+			parseSlashArgs: (InteractiveMode as any).prototype.parseSlashArgs,
+			showWarning: vi.fn(),
+		};
+
+		const parsed = (InteractiveMode as any).prototype.parseOrchestrateSlashCommand.call(
+			fakeThis,
+			"/orchestrate --parallel --agents 4 harden auth workflow",
+		);
+
+		expect(parsed).toMatchObject({
+			mode: "parallel",
+			agents: 4,
+			maxParallel: 4,
+			task: "harden auth workflow",
+		});
+		expect(fakeThis.showWarning).not.toHaveBeenCalled();
+	});
+
+	test("selects meta as default worker profile for parallel orchestrate on full host", () => {
+		const fakeThis: any = {
+			activeProfileName: "full",
+		};
+		const profile = (InteractiveMode as any).prototype.resolveOrchestrateDefaultAssignmentProfile.call(fakeThis, {
+			mode: "parallel",
+			agents: 3,
+			task: "security audit",
+		});
+		expect(profile).toBe("meta");
+	});
+
+	test("derives bounded delegate hints for orchestrate assignments", () => {
+		const fakeThis: any = {};
+		const highRiskHint = (InteractiveMode as any).prototype.deriveOrchestrateDelegateParallelHint.call(fakeThis, {
+			task: "Refactor auth migration with rollback safety",
+			mode: "parallel",
+			agents: 4,
+			maxParallel: 4,
+			dependencyEdges: 3,
+			hasLock: false,
+			hasDependencies: false,
+		});
+		const lockedHint = (InteractiveMode as any).prototype.deriveOrchestrateDelegateParallelHint.call(fakeThis, {
+			task: "Refactor auth migration with rollback safety",
+			mode: "parallel",
+			agents: 4,
+			maxParallel: 4,
+			dependencyEdges: 3,
+			hasLock: true,
+			hasDependencies: true,
+		});
+
+		expect(highRiskHint).toBeGreaterThanOrEqual(6);
+		expect(highRiskHint).toBeLessThanOrEqual(MAX_SUBAGENT_DELEGATE_PARALLEL);
+		expect(lockedHint).toBeLessThanOrEqual(4);
+		expect(lockedHint).toBeGreaterThanOrEqual(1);
+	});
+
+	test("handleOrchestrateSlashCommand injects meta defaults and delegate hints for parallel runs", async () => {
+		const cwd = mkdtempSync(join(tmpdir(), "iosm-orchestrate-defaults-"));
+		try {
+			const prompt = vi.fn(async () => {});
+			const fakeThis: any = {
+				session: { isStreaming: false, isCompacting: false, prompt },
+				sessionManager: { getCwd: () => cwd },
+				activeProfileName: "full",
+				chatContainer: new Container(),
+				ui: { requestRender: vi.fn() },
+				showWarning: vi.fn(),
+				showStatus: vi.fn(),
+				showCommandTextBlock: vi.fn(),
+			};
+			fakeThis.parseSlashArgs = (InteractiveMode as any).prototype.parseSlashArgs.bind(fakeThis);
+			fakeThis.parseOrchestrateSlashCommand = (InteractiveMode as any).prototype.parseOrchestrateSlashCommand.bind(fakeThis);
+			fakeThis.buildSwarmRecommendationFromOrchestrate =
+				(InteractiveMode as any).prototype.buildSwarmRecommendationFromOrchestrate.bind(fakeThis);
+			fakeThis.resolveOrchestrateDefaultAssignmentProfile =
+				(InteractiveMode as any).prototype.resolveOrchestrateDefaultAssignmentProfile.bind(fakeThis);
+			fakeThis.deriveOrchestrateDelegateParallelHint =
+				(InteractiveMode as any).prototype.deriveOrchestrateDelegateParallelHint.bind(fakeThis);
+
+			await (InteractiveMode as any).prototype.handleOrchestrateSlashCommand.call(
+				fakeThis,
+				"/orchestrate --parallel --agents 2 audit auth and rbac workflows",
+			);
+
+			expect(prompt).toHaveBeenCalledTimes(1);
+			const payload = (prompt.mock.calls[0] as [string])[0];
+			expect(payload).toContain("<orchestrate");
+			expect(payload).toContain("profile=meta");
+			expect(payload).toContain("delegate_parallel_hint=");
+			expect(payload).toContain("required_task_calls:");
+			expect(payload).toContain("include delegate_parallel_hint from each assignment/task_call hint");
+			expect(fakeThis.showStatus).toHaveBeenCalledWith(
+				expect.stringContaining("auto-profile: using `meta` workers"),
+			);
+		} finally {
+			rmSync(cwd, { recursive: true, force: true });
+		}
 	});
 
 	test("passes through non-@agent requests unchanged in meta profile", async () => {

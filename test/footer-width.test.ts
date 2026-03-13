@@ -59,11 +59,12 @@ function createSession(options: {
 	return session as unknown as AgentSession;
 }
 
-function createFooterData(providerCount: number): ReadonlyFooterDataProvider {
+function createFooterData(providerCount: number, options?: { swarmBusy?: boolean }): ReadonlyFooterDataProvider {
 	const provider = {
 		getGitBranch: () => "main",
 		getExtensionStatuses: () => new Map<string, string>(),
 		getAvailableProviderCount: () => providerCount,
+		getSwarmBusy: () => options?.swarmBusy ?? false,
 		onBranchChange: (callback: () => void) => {
 			void callback;
 			return () => {};
@@ -139,5 +140,15 @@ describe("FooterComponent width handling", () => {
 		const planBadgeMatches = statsLine.match(/\[plan\]/g) ?? [];
 		expect(planBadgeMatches.length).toBe(1);
 		expect(statsLine).not.toContain("[PLAN]");
+	});
+
+	it("shows working status when swarm run is active", () => {
+		const session = createSession({ sessionName: "", modelId: "gpt-5", provider: "openai" });
+		const footer = new FooterComponent(session, createFooterData(1, { swarmBusy: true }));
+
+		const lines = footer.render(160);
+		const statsLine = stripAnsi(lines[1] ?? "");
+		expect(statsLine).toContain("[working]");
+		expect(statsLine).not.toContain("[ready]");
 	});
 });

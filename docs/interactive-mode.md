@@ -110,6 +110,8 @@ In `/semantic setup`, the headers step is optional: press `Enter` on empty input
 `/contract` edits contract fields interactively (`goal`, scope, constraints, quality gates, DoD, risks, etc.), then writes JSON automatically.
 `/singular <request>` runs a two-pass feasibility analysis (baseline scan + standard agent pass), builds concrete implementation options, then prompts `Start with Swarm` / `Continue without Swarm` / `Cancel`.
 `/swarm` enforces `Scopes -> Touches -> Locks -> Gates -> Done`. If effective contract is missing, it blocks execution and opens a bootstrap menu (auto-draft, guided Q&A, or manual `/contract` editor).
+`/orchestrate --parallel` defaults `--max-parallel` to `--agents` when omitted and auto-selects `meta` workers when profiles are not explicitly set (outside read-only host contexts).
+For orchestrate assignments, `delegate_parallel_hint` is carried into child task calls; high hints should trigger nested delegate fan-out or explicit `DELEGATION_IMPOSSIBLE`.
 `/blast` and `/shadow` are removed from active interactive workflow.
 
 ### `/contract` Detailed Guide

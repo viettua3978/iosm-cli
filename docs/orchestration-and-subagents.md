@@ -146,6 +146,11 @@ Legacy orchestration remains available for existing workflows:
   Analyze security, optimize performance, verify IOSM compliance
 ```
 
+`/orchestrate` parallel defaults in current runtime:
+- if `--max-parallel` is omitted, it defaults to `--agents` (bounded by runtime limit)
+- if worker profiles are omitted, parallel assignments default to `meta` in non-read-only host contexts
+- assignments include `delegate_parallel_hint`; when hint is high, child tasks are expected to fan out with nested delegates (or emit explicit `DELEGATION_IMPOSSIBLE: <reason>`)
+
 Use legacy mode when you explicitly need old team-run semantics.
 
 ---

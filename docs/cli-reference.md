@@ -137,6 +137,10 @@ These commands run inside interactive mode (`iosm`), not as top-level CLI subcom
   - consistency model: `Scopes -> Touches -> Locks -> Gates -> Done`
   - built-in scheduler guards: progress heuristic + conflict density guard
   - high-risk spawn candidates are confirmation-gated
+- `/orchestrate` — legacy manual team splitting remains available:
+  - in `--parallel` mode, omitted `--max-parallel` defaults to selected `--agents`
+  - if profiles are omitted for parallel assignments, runtime defaults workers to `meta` (except read-only host contexts)
+  - assignment hints include `delegate_parallel_hint` for nested delegate planning
 
 Migration notes:
 - `/blast` removed in favor of `/singular`

@@ -1,5 +1,5 @@
 import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import lockfile from "proper-lockfile";
 
 export type TeamTaskStatus = "pending" | "running" | "done" | "error" | "cancelled";
@@ -30,6 +30,89 @@ function getTeamsDir(cwd: string): string {
 
 function getTeamRunPath(cwd: string, runId: string): string {
 	return join(getTeamsDir(cwd), `${runId}.json`);
+}
+
+type PendingStatusUpdate = {
+	input: {
+		cwd: string;
+		runId: string;
+		taskId: string;
+		status: TeamTaskStatus;
+	};
+	attempts: number;
+};
+
+const statusUpdateRetryDelayMs = 25;
+const maxQueuedStatusAttempts = 50;
+const pendingStatusUpdates = new Map<string, PendingStatusUpdate>();
+let pendingStatusFlushTimer: ReturnType<typeof setTimeout> | undefined;
+
+function isTerminalStatus(status: TeamTaskStatus): boolean {
+	return status === "done" || status === "error" || status === "cancelled";
+}
+
+function shouldReplacePendingStatus(current: TeamTaskStatus, next: TeamTaskStatus): boolean {
+	if (current === next) return false;
+	if (isTerminalStatus(current)) return false;
+	if (isTerminalStatus(next)) return true;
+	if (current === "running" && next === "pending") return false;
+	return true;
+}
+
+function pendingStatusKey(input: { cwd: string; runId: string; taskId: string }): string {
+	return `${resolve(input.cwd).toLowerCase()}::${input.runId}::${input.taskId}`;
+}
+
+function schedulePendingStatusFlush(delayMs = statusUpdateRetryDelayMs): void {
+	if (pendingStatusFlushTimer) return;
+	pendingStatusFlushTimer = setTimeout(() => {
+		pendingStatusFlushTimer = undefined;
+		flushPendingStatusUpdates();
+	}, delayMs);
+}
+
+function queuePendingStatusUpdate(input: {
+	cwd: string;
+	runId: string;
+	taskId: string;
+	status: TeamTaskStatus;
+}): void {
+	const key = pendingStatusKey(input);
+	const existing = pendingStatusUpdates.get(key);
+	if (!existing) {
+		pendingStatusUpdates.set(key, { input, attempts: 0 });
+		schedulePendingStatusFlush();
+		return;
+	}
+	if (shouldReplacePendingStatus(existing.input.status, input.status)) {
+		pendingStatusUpdates.set(key, {
+			input,
+			attempts: existing.attempts,
+		});
+	}
+	schedulePendingStatusFlush();
+}
+
+function flushPendingStatusUpdates(): void {
+	if (pendingStatusUpdates.size === 0) return;
+	for (const [key, pending] of Array.from(pendingStatusUpdates.entries())) {
+		if (pending.attempts >= maxQueuedStatusAttempts) {
+			pendingStatusUpdates.delete(key);
+			continue;
+		}
+		const result = tryUpdateTeamTaskStatus(pending.input);
+		if (result === "locked") {
+			pendingStatusUpdates.set(key, {
+				input: pending.input,
+				attempts: pending.attempts + 1,
+			});
+			continue;
+		}
+		pendingStatusUpdates.delete(key);
+	}
+	if (pendingStatusUpdates.size > 0) {
+		schedulePendingStatusFlush();
+	}
 }
 
 export function createTeamRun(input: {
@@ -98,12 +181,12 @@ export function listTeamRuns(cwd: string, limit = 20): TeamRunRecord[] {
 	return runs;
 }
 
-export function updateTeamTaskStatus(input: {
+function tryUpdateTeamTaskStatus(input: {
 	cwd: string;
 	runId: string;
 	taskId: string;
 	status: TeamTaskStatus;
-}): TeamRunRecord | undefined {
+}): TeamRunRecord | "locked" | undefined {
 	const runPath = getTeamRunPath(input.cwd, input.runId);
 	if (!existsSync(runPath)) return undefined;
 	let release: (() => void) | undefined;
@@ -113,16 +196,13 @@ export function updateTeamTaskStatus(input: {
 			release = lockfile.lockSync(runPath, { realpath: false });
 		} catch (error) {
 			const code = error && typeof error === "object" && "code" in error ? String(error.code) : "";
-			// Non-blocking path: avoid synchronous backoff loops that can stall orchestration event handling.
-			if (code === "ELOCKED") return undefined;
+			if (code === "ELOCKED") return "locked";
 			return undefined;
 		}
 		if (!release) return undefined;
 		const raw = readFileSync(runPath, "utf8");
 		const existing = JSON.parse(raw) as TeamRunRecord;
-		const nextTasks = existing.tasks.map((task) =>
-			task.id === input.taskId ? { ...task, status: input.status } : task,
-		);
+		const nextTasks = existing.tasks.map((task) => (task.id === input.taskId ? { ...task, status: input.status } : task));
 		if (!nextTasks.some((task) => task.id === input.taskId)) {
 			return undefined;
 		}
@@ -138,4 +218,23 @@ export function updateTeamTaskStatus(input: {
 	} finally {
 		release?.();
 	}
+}
+
+export function updateTeamTaskStatus(input: {
+	cwd: string;
+	runId: string;
+	taskId: string;
+	status: TeamTaskStatus;
+}): TeamRunRecord | undefined {
+	const result = tryUpdateTeamTaskStatus(input);
+	if (result === "locked") {
+		// Non-blocking reliability path: queue status update for retry instead of dropping lifecycle transitions.
+		queuePendingStatusUpdate(input);
+		return undefined;
+	}
+	const key = pendingStatusKey(input);
+	if (pendingStatusUpdates.has(key) && result) {
+		pendingStatusUpdates.delete(key);
+	}
+	return result;
 }

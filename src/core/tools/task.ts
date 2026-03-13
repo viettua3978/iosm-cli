@@ -113,7 +113,7 @@ const taskSchema = Type.Object({
 	profile: Type.Optional(
 		Type.String({
 			description:
-				"Optional subagent capability profile. Defaults to full when omitted. Recommended values: explore, plan, iosm, meta, iosm_analyst, iosm_verifier, cycle_planner, full. For custom agents, pass the agent name via `agent`, not `profile`.",
+				"Optional subagent capability profile. Defaults to the current host profile when omitted (or full if host profile is unavailable). Recommended values: explore, plan, iosm, meta, iosm_analyst, iosm_verifier, cycle_planner, full. For custom agents, pass the agent name via `agent`, not `profile`.",
 		}),
 	),
 	cwd: Type.Optional(
@@ -338,7 +338,7 @@ const maxParallelFromEnv = parseBoundedInt(
 const subagentSemaphore = new Semaphore(maxParallelFromEnv);
 const maxDelegationDepthFromEnv = parseBoundedInt(
 	process.env.IOSM_SUBAGENT_MAX_DELEGATION_DEPTH,
-	1,
+	2,
 	0,
 	MAX_SUBAGENT_DELEGATION_DEPTH,
 );
@@ -655,7 +655,7 @@ function deriveAutoDelegateProfile(baseProfile: AgentProfileName, description: s
 	const signal = `${description}\n${prompt}`.toLowerCase();
 	const writeIntent = /\b(?:implement|fix|patch|refactor|rewrite|edit|update|migrate|change|write|apply)\b/.test(signal);
 
-	if (baseProfile === "full") return "full";
+	if (baseProfile === "full") return writeIntent ? "full" : "explore";
 	if (baseProfile === "meta") return writeIntent ? "full" : "explore";
 	if (baseProfile === "iosm") return writeIntent ? "full" : "explore";
 	if (baseProfile === "iosm_verifier") return "iosm_verifier";
@@ -744,6 +744,7 @@ function synthesizeDelegationRequests(input: {
 	}
 
 	const defaultProfile = deriveAutoDelegateProfile(input.baseProfile, input.description, input.prompt);
+	const synthesizedLockKey = writeCapableProfiles.has(defaultProfile) ? "auto-synth-write-lock" : undefined;
 	return titles.map((streamTitle, index) => ({
 		description: `Auto: ${streamTitle}`,
 		profile: defaultProfile,
@@ -756,7 +757,7 @@ function synthesizeDelegationRequests(input: {
 			total: input.currentDelegates + titles.length,
 		}),
 		cwd: undefined,
-		lockKey: undefined,
+		lockKey: synthesizedLockKey,
 		model: undefined,
 		isolation: undefined,
 		dependsOn: undefined,
@@ -1314,10 +1315,12 @@ export function createTaskTool(
 					effectiveProfile === "meta" || normalizedHostProfile === "meta" || normalizedAgentName?.toLowerCase().includes("orchestrator")
 						? Math.max(delegationDepth, 2)
 						: delegationDepth;
+				const orchestratedRunContext = !!(orchestrationRunId && orchestrationTaskId);
 				const strictDelegationContract =
 					effectiveProfile === "meta" ||
 					normalizedHostProfile === "meta" ||
-					normalizedAgentName?.toLowerCase().includes("orchestrator");
+					normalizedAgentName?.toLowerCase().includes("orchestrator") ||
+					(orchestratedRunContext && (effectiveDelegateParallelHint ?? 0) >= 2);
 				let effectiveMaxDelegations = Math.max(
 					0,
 					Math.min(maxDelegationsPerTaskFromEnv, effectiveDelegateParallelHint ?? maxDelegationsPerTaskFromEnv),
@@ -1326,14 +1329,21 @@ export function createTaskTool(
 					1,
 					Math.min(maxDelegatedParallelFromEnv, effectiveDelegateParallelHint ?? maxDelegatedParallelFromEnv),
 				);
-				const preferredDelegationFloor = effectiveProfile === "meta" || normalizedHostProfile === "meta" ? 3 : 2;
+				const isMetaDelegationContext = effectiveProfile === "meta" || normalizedHostProfile === "meta";
+				const preferredDelegationFloorBase = isMetaDelegationContext ? 3 : 2;
+				const preferredDelegationFloorMin = isMetaDelegationContext ? 2 : 1;
+				const metaDelegationCapacityFloor = 3;
+				const preferredDelegationFloor = Math.max(
+					preferredDelegationFloorMin,
+					Math.min(preferredDelegationFloorBase, effectiveDelegateParallelHint ?? preferredDelegationFloorBase),
+				);
 				const applyMetaDelegationFloor =
 					requestedDelegateParallelHint === undefined &&
 					(effectiveProfile === "meta" || normalizedHostProfile === "meta");
 				if (applyMetaDelegationFloor) {
 					effectiveMaxDelegations = Math.max(
 						effectiveMaxDelegations,
-						Math.min(maxDelegationsPerTaskFromEnv, preferredDelegationFloor),
+						Math.min(maxDelegationsPerTaskFromEnv, metaDelegationCapacityFloor),
 					);
 					effectiveMaxDelegateParallel = Math.max(
 						effectiveMaxDelegateParallel,

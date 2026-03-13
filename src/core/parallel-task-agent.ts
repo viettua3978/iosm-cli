@@ -48,11 +48,11 @@ const STEERING_POLL_INTERVAL_MS = 40;
 
 function createSteeringSkipResult(): {
 	content: Array<{ type: "text"; text: string }>;
-	details: Record<string, never>;
+	details: { steeringSkipped: true };
 } {
 	return {
 		content: [{ type: "text", text: STEERING_SKIP_TEXT }],
-		details: {},
+		details: { steeringSkipped: true },
 	};
 }
 
@@ -115,15 +115,15 @@ function skipToolCall(toolCall: ToolCallContent, stream: EventStream<any, any>):
 		toolCallId: toolCall.id,
 		toolName: toolCall.name,
 		result,
-		isError: true,
+		isError: false,
 	});
 	const toolResultMessage: ToolResultMessageLike = {
 		role: "toolResult",
 		toolCallId: toolCall.id,
 		toolName: toolCall.name,
 		content: result.content,
-		details: {},
-		isError: true,
+		details: result.details,
+		isError: false,
 		timestamp: Date.now(),
 	};
 	stream.push({ type: "message_start", message: toolResultMessage });
@@ -267,8 +267,9 @@ async function executeToolCallsParallelTasksOnly(
 			});
 		} catch (error) {
 			const interruptedBySteering = steeringAbortController.signal.aborted && !signal.aborted;
-			result = interruptedBySteering && isAbortError(error) ? createSteeringSkipResult() : toToolResultError(error);
-			isError = true;
+			const steeringSkip = interruptedBySteering && isAbortError(error);
+			result = steeringSkip ? createSteeringSkipResult() : toToolResultError(error);
+			isError = !steeringSkip;
 		} finally {
 			completedCount += 1;
 		}

@@ -43,6 +43,7 @@ export class FooterDataProvider {
 	private gitWatcher: FSWatcher | null = null;
 	private branchChangeCallbacks = new Set<() => void>();
 	private availableProviderCount = 0;
+	private swarmBusy = false;
 
 	constructor() {
 		this.setupGitWatcher();
@@ -96,9 +97,19 @@ export class FooterDataProvider {
 		return this.availableProviderCount;
 	}
 
+	/** True while a foreground /swarm run is executing. */
+	getSwarmBusy(): boolean {
+		return this.swarmBusy;
+	}
+
 	/** Internal: update available provider count */
 	setAvailableProviderCount(count: number): void {
 		this.availableProviderCount = count;
+	}
+
+	/** Internal: update swarm busy status for footer state rendering. */
+	setSwarmBusy(busy: boolean): void {
+		this.swarmBusy = busy;
 	}
 
 	/** Internal: cleanup */
@@ -140,5 +151,5 @@ export class FooterDataProvider {
 /** Read-only view for extensions - excludes setExtensionStatus, setAvailableProviderCount and dispose */
 export type ReadonlyFooterDataProvider = Pick<
 	FooterDataProvider,
-	"getGitBranch" | "getExtensionStatuses" | "getAvailableProviderCount" | "onBranchChange"
+	"getGitBranch" | "getExtensionStatuses" | "getAvailableProviderCount" | "getSwarmBusy" | "onBranchChange"
 >;

@@ -1007,6 +1007,24 @@ type RunningSubagentState = {
 	delegateItems?: SubagentDelegateItem[];
 };
 
+type SwarmSubagentProgress = {
+	phase?: string;
+	phaseState?: SubagentPhaseState;
+	cwd?: string;
+	activeTool?: string;
+	toolCallsStarted?: number;
+	toolCallsCompleted?: number;
+	assistantMessages?: number;
+	delegatedTasks?: number;
+	delegatedSucceeded?: number;
+	delegatedFailed?: number;
+	delegateIndex?: number;
+	delegateTotal?: number;
+	delegateDescription?: string;
+	delegateProfile?: string;
+	delegateItems?: SubagentDelegateItem[];
+};
+
 export class InteractiveMode {
 	private session: AgentSession;
 	private ui: TUI;
@@ -1038,6 +1056,8 @@ export class InteractiveMode {
 	private singularService: SingularService;
 	private singularLastEffectiveContract: EngineeringContract = {};
 	private swarmActiveRunId: string | undefined = undefined;
+	private swarmStopRequested = false;
+	private swarmAbortController: AbortController | undefined = undefined;
 
 	private lastSigintTime = 0;
 	private lastEscapeTime = 0;
@@ -2929,12 +2949,12 @@ export class InteractiveMode {
 		const createContext = (): ExtensionContext => ({
 			ui: this.createExtensionUIContext(),
 			hasUI: true,
-			cwd: process.cwd(),
-			sessionManager: this.sessionManager,
-			modelRegistry: this.session.modelRegistry,
-			model: this.session.model,
-			isIdle: () => !this.session.isStreaming,
-			abort: () => this.session.abort(),
+				cwd: process.cwd(),
+				sessionManager: this.sessionManager,
+				modelRegistry: this.session.modelRegistry,
+				model: this.session.model,
+				isIdle: () => !this.session.isStreaming && this.swarmActiveRunId === undefined,
+				abort: () => this.session.abort(),
 			hasPendingMessages: () => this.session.pendingMessageCount > 0,
 			shutdown: () => {
 				this.shutdownRequested = true;
@@ -3605,17 +3625,18 @@ export class InteractiveMode {
 		this.defaultEditor.onEscape = () => {
 			const queuedMessages = this.getAllQueuedMessages();
 			const queuedMeta = queuedMessages.meta ?? [];
-			const hasInterruptibleWork =
-				this.session.isStreaming ||
-				this.session.isBashRunning ||
-				this.session.isCompacting ||
-				this.session.isRetrying ||
-				this.iosmAutomationRun !== undefined ||
-				this.iosmVerificationSession !== undefined ||
-				this.singularAnalysisSession !== undefined ||
-				queuedMessages.steering.length > 0 ||
-				queuedMessages.followUp.length > 0 ||
-				queuedMeta.length > 0;
+				const hasInterruptibleWork =
+					this.session.isStreaming ||
+					this.session.isBashRunning ||
+					this.session.isCompacting ||
+					this.session.isRetrying ||
+					this.iosmAutomationRun !== undefined ||
+					this.iosmVerificationSession !== undefined ||
+					this.swarmActiveRunId !== undefined ||
+					this.singularAnalysisSession !== undefined ||
+					queuedMessages.steering.length > 0 ||
+					queuedMessages.followUp.length > 0 ||
+					queuedMeta.length > 0;
 
 			if (hasInterruptibleWork) {
 				void this.interruptCurrentWork();
@@ -4027,6 +4048,192 @@ export class InteractiveMode {
 			delegateItems: subagent.delegateItems,
 			durationMs: Date.now() - subagent.startTime,
 		});
+	}
+
+	private getSwarmSubagentKey(runId: string, taskId: string): string {
+		return `swarm:${runId}:${taskId}`;
+	}
+
+	private ensureSwarmSubagentDisplay(input: {
+		runId: string;
+		taskId: string;
+		task: SwarmTaskPlan;
+		profile?: string;
+	}): RunningSubagentState {
+		const key = this.getSwarmSubagentKey(input.runId, input.taskId);
+		const existing = this.subagentComponents.get(key);
+		if (existing) {
+			return existing;
+		}
+		const profile = (input.profile?.trim() || this.resolveSwarmTaskProfile(input.task)).trim();
+		const info: SubagentInfo = {
+			description: input.task.brief || input.task.id,
+			profile,
+			status: "running",
+			phase: "starting subagent",
+			phaseState: "starting",
+			cwd: this.sessionManager.getCwd(),
+			toolCallsStarted: 0,
+			toolCallsCompleted: 0,
+			assistantMessages: 0,
+			delegatedTasks: 0,
+			delegatedSucceeded: 0,
+			delegatedFailed: 0,
+		};
+		const component = new SubagentMessageComponent(info);
+		this.chatContainer.addChild(component);
+		const state: RunningSubagentState = {
+			component,
+			startTime: Date.now(),
+			profile: info.profile,
+			description: info.description,
+			cwd: info.cwd,
+			agent: info.agent,
+			lockKey: info.lockKey,
+			isolation: info.isolation,
+			phase: info.phase,
+			phaseState: info.phaseState,
+			activeTool: info.activeTool,
+			toolCallsStarted: info.toolCallsStarted ?? 0,
+			toolCallsCompleted: info.toolCallsCompleted ?? 0,
+			assistantMessages: info.assistantMessages ?? 0,
+			delegatedTasks: info.delegatedTasks,
+			delegatedSucceeded: info.delegatedSucceeded,
+			delegatedFailed: info.delegatedFailed,
+			delegateIndex: info.delegateIndex,
+			delegateTotal: info.delegateTotal,
+			delegateDescription: info.delegateDescription,
+			delegateProfile: info.delegateProfile,
+			delegateItems: info.delegateItems,
+		};
+		this.subagentComponents.set(key, state);
+		this.ensureSubagentElapsedTimer();
+		this.ui.requestRender();
+		return state;
+	}
+
+	private updateSwarmSubagentProgress(input: {
+		runId: string;
+		taskId: string;
+		task: SwarmTaskPlan;
+		profile?: string;
+		progress: SwarmSubagentProgress;
+	}): void {
+		const state = this.ensureSwarmSubagentDisplay({
+			runId: input.runId,
+			taskId: input.taskId,
+			task: input.task,
+			profile: input.profile,
+		});
+		const progress = input.progress;
+		if (typeof progress.phase === "string" && progress.phase.trim()) {
+			state.phase = progress.phase.trim();
+		}
+		if (isSubagentPhaseState(progress.phaseState)) {
+			state.phaseState = progress.phaseState;
+		}
+		if (typeof progress.cwd === "string" && progress.cwd.trim()) {
+			state.cwd = progress.cwd.trim();
+		}
+		if ("activeTool" in progress) {
+			state.activeTool =
+				typeof progress.activeTool === "string" && progress.activeTool.trim().length > 0
+					? progress.activeTool.trim()
+					: undefined;
+		}
+		if (typeof progress.toolCallsStarted === "number" && Number.isFinite(progress.toolCallsStarted)) {
+			state.toolCallsStarted = Math.max(0, progress.toolCallsStarted);
+		}
+		if (typeof progress.toolCallsCompleted === "number" && Number.isFinite(progress.toolCallsCompleted)) {
+			state.toolCallsCompleted = Math.max(0, progress.toolCallsCompleted);
+		}
+		if (typeof progress.assistantMessages === "number" && Number.isFinite(progress.assistantMessages)) {
+			state.assistantMessages = Math.max(0, progress.assistantMessages);
+		}
+		if (typeof progress.delegatedTasks === "number" && Number.isFinite(progress.delegatedTasks)) {
+			state.delegatedTasks = Math.max(0, progress.delegatedTasks);
+		}
+		if (typeof progress.delegatedSucceeded === "number" && Number.isFinite(progress.delegatedSucceeded)) {
+			state.delegatedSucceeded = Math.max(0, progress.delegatedSucceeded);
+		}
+		if (typeof progress.delegatedFailed === "number" && Number.isFinite(progress.delegatedFailed)) {
+			state.delegatedFailed = Math.max(0, progress.delegatedFailed);
+		}
+		if ("delegateIndex" in progress) {
+			state.delegateIndex =
+				typeof progress.delegateIndex === "number" && progress.delegateIndex > 0
+					? Math.floor(progress.delegateIndex)
+					: undefined;
+		}
+		if ("delegateTotal" in progress) {
+			state.delegateTotal =
+				typeof progress.delegateTotal === "number" && progress.delegateTotal > 0
+					? Math.floor(progress.delegateTotal)
+					: undefined;
+		}
+		if ("delegateDescription" in progress) {
+			state.delegateDescription =
+				typeof progress.delegateDescription === "string" && progress.delegateDescription.trim().length > 0
+					? progress.delegateDescription.trim()
+					: undefined;
+		}
+		if ("delegateProfile" in progress) {
+			state.delegateProfile =
+				typeof progress.delegateProfile === "string" && progress.delegateProfile.trim().length > 0
+					? progress.delegateProfile.trim()
+					: undefined;
+		}
+		if ("delegateItems" in progress) {
+			state.delegateItems = Array.isArray(progress.delegateItems) ? progress.delegateItems : undefined;
+		}
+		this.updateRunningSubagentDisplay(state);
+		this.ui.requestRender();
+	}
+
+	private finalizeSwarmSubagentDisplay(input: {
+		runId: string;
+		taskId: string;
+		status: "done" | "error";
+		errorMessage?: string;
+	}): void {
+		const key = this.getSwarmSubagentKey(input.runId, input.taskId);
+		const state = this.subagentComponents.get(key);
+		if (!state) return;
+		const durationMs = Date.now() - state.startTime;
+		state.component.update({
+			description: state.description,
+			profile: state.profile,
+			status: input.status,
+			durationMs,
+			phaseState: state.phaseState,
+			cwd: state.cwd,
+			agent: state.agent,
+			lockKey: state.lockKey,
+			isolation: state.isolation,
+			toolCallsStarted: state.toolCallsStarted,
+			toolCallsCompleted: state.toolCallsCompleted,
+			assistantMessages: state.assistantMessages,
+			delegatedTasks: state.delegatedTasks,
+			delegatedSucceeded: state.delegatedSucceeded,
+			delegatedFailed: state.delegatedFailed,
+			errorMessage: input.status === "error" ? input.errorMessage ?? "error" : undefined,
+		});
+		this.subagentComponents.delete(key);
+		this.stopSubagentElapsedTimerIfIdle();
+		this.ui.requestRender();
+	}
+
+	private finalizeSwarmRunSubagentDisplays(runId: string, errorMessage: string): void {
+		for (const [key] of this.subagentComponents.entries()) {
+			if (!key.startsWith(`swarm:${runId}:`)) continue;
+			const taskId = key.slice(`swarm:${runId}:`.length);
+			this.finalizeSwarmSubagentDisplay({
+				runId,
+				taskId,
+				status: "error",
+				errorMessage,
+			});
+		}
 	}
 
 	private ensureSubagentElapsedTimer(): void {
@@ -4954,6 +5161,15 @@ export class InteractiveMode {
 
 	private handleCtrlC(): void {
 		const now = Date.now();
+		if (this.swarmActiveRunId) {
+			if (this.swarmStopRequested && now - this.lastSigintTime < 500) {
+				void this.shutdown();
+				return;
+			}
+			this.lastSigintTime = now;
+			void this.interruptCurrentWork();
+			return;
+		}
 		if (this.iosmAutomationRun) {
 			if (this.iosmAutomationRun.cancelRequested && now - this.lastSigintTime < 500) {
 				void this.shutdown();
@@ -5425,6 +5641,7 @@ export class InteractiveMode {
 		const hasAutomationWork = this.iosmAutomationRun !== undefined;
 		const verificationSession = this.iosmVerificationSession;
 		const hasVerificationWork = verificationSession !== undefined;
+		const hasSwarmWork = this.swarmActiveRunId !== undefined;
 		const singularSession = this.singularAnalysisSession;
 		const hasSingularWork = singularSession !== undefined;
 		const hasMainStreaming = this.session.isStreaming;
@@ -5434,10 +5651,11 @@ export class InteractiveMode {
 
 		if (
 			!hasPendingQueuedMessages &&
-			!hasAutomationWork &&
-			!hasVerificationWork &&
-			!hasSingularWork &&
-			!hasMainStreaming &&
+				!hasAutomationWork &&
+				!hasVerificationWork &&
+				!hasSwarmWork &&
+				!hasSingularWork &&
+				!hasMainStreaming &&
 			!hasRetryWork &&
 			!hasCompactionWork &&
 			!hasBashWork
@@ -5451,6 +5669,10 @@ export class InteractiveMode {
 
 		if (this.iosmAutomationRun) {
 			this.iosmAutomationRun.cancelRequested = true;
+		}
+		if (hasSwarmWork) {
+			this.swarmStopRequested = true;
+			this.swarmAbortController?.abort();
 		}
 		if (hasPendingQueuedMessages) {
 			this.restoreQueuedMessagesToEditor();
@@ -5468,15 +5690,17 @@ export class InteractiveMode {
 			this.session.abortBranchSummary();
 		}
 
-		this.showStatus(
-			hasAutomationWork
-				? "Stopping IOSM automation..."
-				: hasVerificationWork
-					? "Stopping IOSM verification..."
-					: hasSingularWork
-						? "Stopping /singular analysis..."
-						: "Stopping current run...",
-		);
+			this.showStatus(
+				hasAutomationWork
+					? "Stopping IOSM automation..."
+					: hasVerificationWork
+						? "Stopping IOSM verification..."
+						: hasSwarmWork
+							? "Stopping swarm run..."
+							: hasSingularWork
+								? "Stopping /singular analysis..."
+								: "Stopping current run...",
+			);
 
 		const abortPromises: Promise<unknown>[] = [];
 		if (hasMainStreaming) {
@@ -9509,7 +9733,10 @@ export class InteractiveMode {
 		});
 		options.push("Close without decision");
 		const selected = await this.showExtensionSelector("/singular: choose next step", options);
-		if (!selected || selected === "Close without decision") return;
+		if (!selected || selected === "Close without decision") {
+			this.showStatus("Singular: decision closed without execution.");
+			return;
+		}
 
 		const match = selected.match(/^Option\s+(\d+)/);
 		if (!match) return;
@@ -10667,9 +10894,20 @@ export class InteractiveMode {
 				onPersistentNonCompliance: async (details) => {
 					if (typeof this.runSwarmFromTask !== "function") return;
 					if (this.session.isStreaming || this.iosmAutomationRun || this.iosmVerificationSession) return;
+					const explicitRequested = parseRequestedParallelAgentCount(userInput);
+					const hasComplexSignal =
+						/\b(audit|security|hardening|refactor|migration|orchestrat|parallel|delegate|multi[-\s]?agent)\b/i.test(
+							userInput,
+						);
 					const fallbackParallel = Math.max(
 						1,
-						Math.min(MAX_ORCHESTRATION_PARALLEL, details.requiredTopLevelTasks),
+						Math.min(
+							MAX_ORCHESTRATION_PARALLEL,
+							explicitRequested ??
+								(hasComplexSignal
+									? Math.max(details.requiredTopLevelTasks, 6)
+									: Math.max(details.requiredTopLevelTasks, 3)),
+						),
 					);
 					this.showWarning(
 						`META enforcement fallback: orchestration contract not satisfied (${details.launchedTopLevelTasks}/${details.requiredTopLevelTasks} task calls). Launching /swarm run.`,
@@ -10978,6 +11216,54 @@ export class InteractiveMode {
 			reasons,
 			command: commandParts.join(" "),
 		};
+	}
+
+	private resolveOrchestrateDefaultAssignmentProfile(parsed: ParsedOrchestrateCommand): AgentProfileName {
+		const active = this.activeProfileName || "full";
+		if (parsed.mode !== "parallel") return active;
+		if (parsed.profile || (parsed.profiles && parsed.profiles.length > 0)) return active;
+		if (isReadOnlyProfileName(active)) return active;
+		return "meta";
+	}
+
+	private deriveOrchestrateDelegateParallelHint(input: {
+		task: string;
+		mode: OrchestrationMode;
+		agents: number;
+		maxParallel?: number;
+		dependencyEdges: number;
+		hasLock: boolean;
+		hasDependencies: boolean;
+	}): number {
+		const normalizedTask = input.task.toLowerCase();
+		const highRisk =
+			/\b(refactor|rewrite|migration|migrate|breaking|rollback|security|auth|authentication|authorization|permission|payment|billing|schema|database|critical)\b/i.test(
+				normalizedTask,
+			);
+		const mediumRisk = /\b(cross[-\s]?module|architecture|infra|platform|multi[-\s]?file|integration|audit|hardening)\b/i.test(
+			normalizedTask,
+		);
+
+		let hint =
+			input.mode === "parallel"
+				? Math.max(2, Math.min(MAX_SUBAGENT_DELEGATE_PARALLEL, input.maxParallel ?? input.agents))
+				: 1;
+
+		if (highRisk) {
+			hint = Math.max(hint, 7);
+		} else if (mediumRisk) {
+			hint = Math.max(hint, 5);
+		}
+		if (input.mode === "parallel" && input.dependencyEdges >= input.agents) {
+			hint = Math.max(hint, 6);
+		}
+		if (input.hasDependencies) {
+			hint = Math.max(2, Math.min(hint, 6));
+		}
+		if (input.hasLock) {
+			hint = Math.max(1, Math.min(hint, 4));
+		}
+		return Math.max(1, Math.min(MAX_SUBAGENT_DELEGATE_PARALLEL, hint));
 	}
 
 	private isEffectiveContractReady(contract: EngineeringContract): boolean {
@@ -11359,9 +11645,11 @@ export class InteractiveMode {
 	}
 
 	private resolveSwarmTaskProfile(task: SwarmTaskPlan): AgentProfileName {
+		const hint = this.deriveSwarmTaskDelegateParallelHint(task);
+		if (task.concurrency_class === "docs") return "plan";
+		if (hint >= 2) return "meta";
 		if (task.concurrency_class === "analysis") return "explore";
 		if (task.concurrency_class === "verification" || task.concurrency_class === "tests") return "iosm_verifier";
-		if (task.concurrency_class === "docs") return "plan";
 		return "full";
 	}
 
@@ -11380,6 +11668,11 @@ export class InteractiveMode {
 			/(overhaul|major|system-wide|cross-cutting|multi-service|facet|registry)/i.test(brief) ||
 			task.touches.length >= 5 ||
 			task.scopes.length >= 4;
+		if (task.concurrency_class === "analysis" || task.concurrency_class === "docs") {
+			if (task.severity === "low") return 1;
+			if (task.touches.length >= 6 || task.scopes.length >= 4 || hasComplexKeyword) return 2;
+			return 1;
+		}
 		if (task.severity === "low" && task.touches.length <= 2 && task.scopes.length <= 2 && !hasComplexKeyword) {
 			return 1;
 		}
@@ -11390,6 +11683,52 @@ export class InteractiveMode {
 		if (task.severity === "medium" && (hasVeryComplexSignal || task.touches.length >= 4 || hasComplexKeyword)) return 7;
 		if (task.severity === "medium") return 5;
 		return hasComplexKeyword ? 3 : 1;
+	}
+
+	private ensureSwarmModelReady(source: "plain" | "singular"): boolean {
+		if (this.session.model) return true;
+		if (source === "singular") {
+			this.showWarning(
+				"Cannot launch Swarm from /singular: no active model. Select one via /model and retry.",
+			);
+		} else {
+			this.showWarning("Cannot run /swarm: no active model selected. Configure /model first.");
+		}
+		return false;
+	}
+
+	private resolveSwarmMaxParallel(input: {
+		requested?: number;
+		plan: SwarmPlan;
+		source: "plain" | "singular";
+	}): number {
+		const requested = input.requested;
+		if (typeof requested === "number" && Number.isFinite(requested)) {
+			return Math.max(1, Math.min(MAX_ORCHESTRATION_PARALLEL, Math.floor(requested)));
+		}
+
+		const totalTasks = Math.max(1, input.plan.tasks.length);
+		const initialFanout = Math.max(1, input.plan.tasks.filter((task) => task.depends_on.length === 0).length);
+		const parallelizable =
+			input.plan.tasks.filter((task) => task.concurrency_class === "implementation" || task.concurrency_class === "tests")
+				.length;
+		const sourceFloor = input.source === "singular" ? 4 : 3;
+		const autoCap = Math.min(MAX_ORCHESTRATION_PARALLEL, 10);
+		const heuristic = Math.max(
+			sourceFloor,
+			Math.ceil(totalTasks / 2),
+			initialFanout,
+			parallelizable >= 4 ? Math.ceil(parallelizable / 2) : 1,
+		);
+		return Math.max(1, Math.min(autoCap, heuristic));
+	}
+
+	private resolveSwarmDispatchTimeoutMs(): number {
+		const dispatchTimeoutRaw = Number.parseInt(process.env.IOSM_SWARM_DISPATCH_TIMEOUT_MS ?? "", 10);
+		if (Number.isInteger(dispatchTimeoutRaw) && dispatchTimeoutRaw > 0) {
+			return Math.max(1_000, Math.min(1_800_000, dispatchTimeoutRaw));
+		}
+		return 180_000;
 	}
 
 	private parseSwarmSpawnCandidates(output: string, parentTaskId: string): SwarmDispatchResult["spawnCandidates"] {
@@ -11426,6 +11765,8 @@ export class InteractiveMode {
 		task: SwarmTaskPlan;
 		runtime: SwarmTaskRuntimeState;
 		contract: EngineeringContract;
+		onProgress?: (progress: SwarmSubagentProgress) => void;
+		stopSignal?: AbortSignal;
 	}): Promise<SwarmDispatchResult> {
 		const model = this.session.model;
 		if (!model) {
@@ -11439,6 +11780,17 @@ export class InteractiveMode {
 
 		const profile = this.resolveSwarmTaskProfile(input.task);
 		const delegateParallelHint = this.deriveSwarmTaskDelegateParallelHint(input.task);
+		const requiresStrongDelegation =
+			input.task.concurrency_class !== "analysis" &&
+			input.task.concurrency_class !== "docs" &&
+			(input.task.severity === "high" || delegateParallelHint >= 7);
+		const minDelegatesRequired = !requiresStrongDelegation
+			? 0
+			: delegateParallelHint >= 8
+				? 3
+				: delegateParallelHint >= 5
+					? 2
+					: 1;
 		const safeDescription = input.task.brief.replace(/\s+/g, " ").trim().slice(0, 120).replace(/"/g, "'");
 		const prompt = [
 			`<swarm_task run_id="${input.meta.runId}" task_id="${input.task.id}" profile_hint="${profile}">`,
@@ -11451,13 +11803,18 @@ export class InteractiveMode {
 			"",
 			"Execution requirements:",
 			`- Use the task tool exactly once with description="${safeDescription || input.task.id}", profile="${profile}", delegate_parallel_hint=${delegateParallelHint}, run_id="${input.meta.runId}", task_id="${input.task.id}".`,
-			`- Inside this single task call, prefer decomposition into <delegate_task> subtasks when delegate_parallel_hint >= 2 (target parallel fan-out up to ${delegateParallelHint}).`,
-			"- If decomposition is not beneficial, continue with single-agent execution (optional note: DELEGATION_IMPOSSIBLE: <reason>).",
-			"- Keep edits inside declared scopes/touches. If scope expansion is required, explain and stop.",
-			"- If blocked, respond with line: BLOCKED: <reason>",
-			"- Optional spawn candidates format: '- <description> | <path> | <change_type> | <low|medium|high>'",
-			"</swarm_task>",
-		].join("\n");
+			minDelegatesRequired > 0
+				? `- Inside this single task call, emit at least ${minDelegatesRequired} independent <delegate_task> subtasks (target parallel fan-out up to ${delegateParallelHint}).`
+				: "- Delegation is optional for this task; keep execution focused.",
+			minDelegatesRequired > 0
+				? '- If safe decomposition is impossible, output exactly one line: DELEGATION_IMPOSSIBLE: <reason>.'
+				: "- If decomposition is not beneficial, continue with single-agent execution.",
+				"- Keep edits inside declared scopes/touches. If scope expansion is required, explain and stop.",
+				"- If blocked, respond with line: BLOCKED: <reason>",
+				"- Return concise execution output; avoid long narrative if not needed.",
+				"- Optional spawn candidates format: '- <description> | <path> | <change_type> | <low|medium|high>'",
+				"</swarm_task>",
+			].join("\n");
 
 		const cwd = this.sessionManager.getCwd();
 		const agentDir = getAgentDir();
@@ -11493,7 +11850,7 @@ export class InteractiveMode {
 				resourceLoader,
 				model,
 				thinkingLevel: this.session.thinkingLevel,
-				profile: "full",
+				profile: "meta",
 				enableTaskTool: true,
 			});
 			swarmSession = created.session;
@@ -11510,6 +11867,14 @@ export class InteractiveMode {
 		const taskErrors: string[] = [];
 		let delegatedFailed = 0;
 		let delegatedTasks = 0;
+		let toolCallsStarted = 0;
+		let toolCallsCompleted = 0;
+		let assistantMessages = 0;
+		let activeTool: string | undefined;
+		const dispatchTimeoutMs = this.resolveSwarmDispatchTimeoutMs();
+		let timedOut = false;
+		let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
+		let detachStopListener: (() => void) | undefined;
 		const delegatedFailureCauses = new Map<string, number>();
 		const accumulateFailureCauses = (raw: unknown): void => {
 			if (!raw || typeof raw !== "object") return;
@@ -11520,13 +11885,79 @@ export class InteractiveMode {
 				delegatedFailureCauses.set(cause, (delegatedFailureCauses.get(cause) ?? 0) + numeric);
 			}
 		};
+		const emitProgress = (progress: SwarmSubagentProgress): void => {
+			input.onProgress?.({
+				activeTool,
+				toolCallsStarted,
+				toolCallsCompleted,
+				assistantMessages,
+				delegatedTasks,
+				delegatedFailed,
+				...progress,
+			});
+		};
 		const chunks: string[] = [];
 		const unsubscribe = swarmSession.subscribe((event) => {
-			if (event.type === "tool_execution_start" && event.toolName === "task") {
-				taskToolCalls += 1;
+			if (event.type === "tool_execution_start") {
+				toolCallsStarted += 1;
+				activeTool = event.toolName;
+				if (event.toolName === "task") {
+					taskToolCalls += 1;
+				}
+				emitProgress({
+					phase: event.toolName ? `running ${event.toolName}` : "running",
+					phaseState: "running",
+				});
+				return;
+			}
+			if (event.type === "tool_execution_update" && event.toolName === "task") {
+				const partial = event.partialResult as { details?: Record<string, unknown> } | undefined;
+				const progressCandidate = partial?.details?.progress;
+				if (progressCandidate && typeof progressCandidate === "object") {
+					const progress = progressCandidate as Record<string, unknown>;
+					const delegateItems = parseSubagentDelegateItems(progress.delegateItems);
+					emitProgress({
+						phase: typeof progress.message === "string" ? progress.message : undefined,
+						phaseState: isSubagentPhaseState(progress.phase) ? progress.phase : undefined,
+						cwd: typeof progress.cwd === "string" ? progress.cwd : undefined,
+						activeTool:
+							typeof progress.activeTool === "string" && progress.activeTool.trim().length > 0
+								? progress.activeTool.trim()
+								: activeTool,
+						toolCallsStarted:
+							typeof progress.toolCallsStarted === "number" && Number.isFinite(progress.toolCallsStarted)
+								? progress.toolCallsStarted
+								: undefined,
+						toolCallsCompleted:
+							typeof progress.toolCallsCompleted === "number" && Number.isFinite(progress.toolCallsCompleted)
+								? progress.toolCallsCompleted
+								: undefined,
+						assistantMessages:
+							typeof progress.assistantMessages === "number" && Number.isFinite(progress.assistantMessages)
+								? progress.assistantMessages
+								: undefined,
+						delegateIndex:
+							typeof progress.delegateIndex === "number" && Number.isFinite(progress.delegateIndex)
+								? progress.delegateIndex
+								: undefined,
+						delegateTotal:
+							typeof progress.delegateTotal === "number" && Number.isFinite(progress.delegateTotal)
+								? progress.delegateTotal
+								: undefined,
+						delegateDescription:
+							typeof progress.delegateDescription === "string" ? progress.delegateDescription : undefined,
+						delegateProfile:
+							typeof progress.delegateProfile === "string" ? progress.delegateProfile : undefined,
+						delegateItems,
+					});
+				}
 				return;
 			}
 			if (event.type === "tool_execution_end" && event.toolName === "task") {
+				toolCallsCompleted += 1;
+				if (activeTool === event.toolName) {
+					activeTool = undefined;
+				}
 				const result = event.result as { output?: string; error?: string; details?: Record<string, unknown> } | undefined;
 				const details = result?.details;
 				if (typeof details?.delegatedFailed === "number" && Number.isFinite(details.delegatedFailed)) {
@@ -11536,37 +11967,129 @@ export class InteractiveMode {
 					delegatedTasks += Math.max(0, details.delegatedTasks);
 				}
 				accumulateFailureCauses(details?.failureCauses);
+				emitProgress({
+					phase: event.isError ? "task tool failed" : "task tool completed",
+					phaseState: "running",
+					delegatedTasks:
+						typeof details?.delegatedTasks === "number" && Number.isFinite(details.delegatedTasks)
+							? details.delegatedTasks
+							: undefined,
+					delegatedSucceeded:
+						typeof details?.delegatedSucceeded === "number" && Number.isFinite(details.delegatedSucceeded)
+							? details.delegatedSucceeded
+							: undefined,
+					delegatedFailed:
+						typeof details?.delegatedFailed === "number" && Number.isFinite(details.delegatedFailed)
+							? details.delegatedFailed
+							: undefined,
+				});
 				if (event.isError) {
 					taskErrors.push(result?.error ?? result?.output ?? "task tool failed");
 				}
 				return;
 			}
+			if (event.type === "tool_execution_end") {
+				toolCallsCompleted += 1;
+				if (activeTool === event.toolName) {
+					activeTool = undefined;
+				}
+				emitProgress({
+					phase: event.toolName ? `completed ${event.toolName}` : "running",
+					phaseState: "running",
+				});
+				return;
+			}
 			if (event.type === "message_end" && event.message.role === "assistant") {
+				assistantMessages += 1;
 				for (const part of event.message.content) {
 					if (part.type === "text" && part.text.trim()) {
 						chunks.push(part.text.trim());
 					}
 				}
+				emitProgress({
+					phase: "drafting response",
+					phaseState: "responding",
+				});
 			}
 		});
 
 		try {
-			await swarmSession.prompt(prompt, {
+			emitProgress({
+				phase: "booting subagent",
+				phaseState: "starting",
+			});
+			if (input.stopSignal?.aborted) {
+				return {
+					taskId: input.task.id,
+					status: "blocked",
+					error: "Swarm run interrupted.",
+					failureCause: "interrupted",
+					costUsd: this.estimateSwarmTaskCostUsd(input.task),
+				};
+			}
+			const promptPromise = swarmSession.prompt(prompt, {
 				expandPromptTemplates: false,
 				skipIosmAutopilot: true,
 				skipOrchestrationDirective: true,
 				source: "interactive",
 			});
+			// Guard against provider/model hangs in isolated swarm sessions.
+			void promptPromise.catch(() => {
+				// handled by race below
+			});
+			const timeoutPromise = new Promise<void>((_, reject) => {
+				timeoutHandle = setTimeout(() => {
+					timedOut = true;
+					void swarmSession.abort().catch(() => {
+						// best effort
+					});
+					emitProgress({
+						phase: "dispatch timeout",
+						phaseState: "responding",
+					});
+					reject(new Error(`Swarm task dispatch timed out after ${dispatchTimeoutMs}ms.`));
+				}, dispatchTimeoutMs);
+			});
+			const stopPromise = new Promise<void>((_, reject) => {
+				if (!input.stopSignal) return;
+				const onAbort = () => {
+					void swarmSession.abort().catch(() => {
+						// best effort
+					});
+					emitProgress({
+						phase: "dispatch interrupted",
+						phaseState: "responding",
+					});
+					reject(new Error("Swarm task dispatch interrupted."));
+				};
+				if (input.stopSignal.aborted) {
+					onAbort();
+					return;
+				}
+				input.stopSignal.addEventListener("abort", onAbort, { once: true });
+				detachStopListener = () => input.stopSignal?.removeEventListener("abort", onAbort);
+			});
+			await Promise.race([promptPromise, timeoutPromise, stopPromise]);
 		} catch (error) {
 			return {
 				taskId: input.task.id,
 				status: "error",
 				error: error instanceof Error ? error.message : String(error),
+				failureCause:
+					error instanceof Error && /interrupted/i.test(error.message)
+						? "interrupted"
+						: timedOut
+							? "timeout"
+							: undefined,
 				costUsd: this.estimateSwarmTaskCostUsd(input.task),
 			};
 		} finally {
+			detachStopListener?.();
+			if (timeoutHandle) {
+				clearTimeout(timeoutHandle);
+			}
 			unsubscribe();
-			if (swarmSession.isStreaming) {
+			if (timedOut || swarmSession.isStreaming) {
 				await swarmSession.abort().catch(() => {
 					// best effort
 				});
@@ -11589,6 +12112,7 @@ export class InteractiveMode {
 				taskId: input.task.id,
 				status: "error",
 				error: "No task tool call executed by assistant.",
+				failureCause: "protocol_violation",
 				costUsd: this.estimateSwarmTaskCostUsd(input.task),
 			};
 		}
@@ -11640,6 +12164,7 @@ export class InteractiveMode {
 		if (!input.resumeState) {
 			store.init(input.meta, input.plan, initialState);
 		}
+		const swarmTaskById = new Map(input.plan.tasks.map((task) => [task.id, task]));
 		let rollingIndex = input.projectIndex;
 		let localStopRequested = false;
 		const refreshIncrementalIndex = (): void => {
@@ -11656,55 +12181,163 @@ export class InteractiveMode {
 		};
 
 		this.swarmActiveRunId = input.runId;
+		this.swarmStopRequested = false;
+		this.swarmAbortController = new AbortController();
+		this.footerDataProvider.setSwarmBusy(true);
+		this.footer.invalidate();
 		this.showStatus(`Swarm run started: ${input.runId}`);
-		const schedulerResult = await runSwarmScheduler({
-			runId: input.runId,
-			plan: input.plan,
-			contract: input.contract,
-			maxParallel: input.meta.maxParallel,
-			budgetUsd: input.budgetUsd,
-			existingState: initialState,
-			dispatchTask: async ({ task, runtime }) =>
-				this.dispatchSwarmTaskWithAgent({
-					meta: input.meta,
-					task,
-					runtime,
-					contract: input.contract,
-				}),
-			confirmSpawn: async ({ candidate, parentTask }) => {
-				const requiresConfirmation = candidate.severity === "high" || parentTask.spawn_policy === "manual_high_risk";
-				if (!requiresConfirmation) return true;
-				const choice = await this.showExtensionSelector(
-					[
-						`/swarm spawn candidate requires confirmation`,
-						`severity=${candidate.severity} task=${parentTask.id}`,
-						`description=${candidate.description}`,
-						`path=${candidate.path}`,
-					].join("\n"),
-					["Approve spawn", "Reject spawn (Recommended)", "Abort run"],
-				);
-				if (!choice || choice.startsWith("Reject")) {
-					this.showStatus(`Swarm spawn rejected: ${candidate.description}`);
-					return false;
-				}
-				if (choice === "Abort run") {
-					localStopRequested = true;
-					this.showWarning("Swarm run marked to stop after current scheduling step.");
-					return false;
-				}
-				return true;
-			},
-			onEvent: (event) => {
-				store.appendEvent(event);
-			},
-			onStateChanged: (state) => {
-				store.saveState(state);
-				store.saveCheckpoint(state);
-				refreshIncrementalIndex();
-			},
-			shouldStop: () => this.shutdownRequested || localStopRequested,
-		});
-		this.swarmActiveRunId = undefined;
+		let schedulerResult: Awaited<ReturnType<typeof runSwarmScheduler>>;
+		try {
+			schedulerResult = await runSwarmScheduler({
+				runId: input.runId,
+				plan: input.plan,
+				contract: input.contract,
+				maxParallel: input.meta.maxParallel,
+				budgetUsd: input.budgetUsd,
+				existingState: initialState,
+				dispatchTask: async ({ task, runtime }) =>
+					this.dispatchSwarmTaskWithAgent({
+						meta: input.meta,
+						task,
+						runtime,
+						contract: input.contract,
+						stopSignal: this.swarmAbortController?.signal,
+						onProgress: (progress) => {
+							this.updateSwarmSubagentProgress({
+								runId: input.runId,
+								taskId: task.id,
+								task,
+								profile: this.resolveSwarmTaskProfile(task),
+								progress,
+							});
+						},
+					}),
+				confirmSpawn: async ({ candidate, parentTask }) => {
+					const requiresConfirmation = candidate.severity === "high" || parentTask.spawn_policy === "manual_high_risk";
+					if (!requiresConfirmation) return true;
+					const choice = await this.showExtensionSelector(
+						[
+							`/swarm spawn candidate requires confirmation`,
+							`severity=${candidate.severity} task=${parentTask.id}`,
+							`description=${candidate.description}`,
+							`path=${candidate.path}`,
+						].join("\n"),
+						["Approve spawn", "Reject spawn (Recommended)", "Abort run"],
+					);
+					if (!choice || choice.startsWith("Reject")) {
+						this.showStatus(`Swarm spawn rejected: ${candidate.description}`);
+						return false;
+					}
+					if (choice === "Abort run") {
+						localStopRequested = true;
+						this.showWarning("Swarm run marked to stop after current scheduling step.");
+						return false;
+					}
+					return true;
+					},
+				dispatchTimeoutMs: Math.min(1_800_000, this.resolveSwarmDispatchTimeoutMs() + 5_000),
+				onEvent: (event) => {
+					store.appendEvent(event);
+					if (event.type === "task_running" && event.taskId) {
+						const task = swarmTaskById.get(event.taskId);
+						if (task) {
+							this.updateSwarmSubagentProgress({
+								runId: input.runId,
+								taskId: task.id,
+								task,
+								profile: this.resolveSwarmTaskProfile(task),
+								progress: {
+									phase: "starting subagent",
+									phaseState: "starting",
+								},
+							});
+						}
+						this.showStatus(`Swarm ${event.taskId}: running`);
+					}
+					if (event.type === "task_done" && event.taskId) {
+						this.finalizeSwarmSubagentDisplay({
+							runId: input.runId,
+							taskId: event.taskId,
+							status: "done",
+						});
+						this.showStatus(`Swarm ${event.taskId}: done`);
+					}
+					if (event.type === "task_retry" && event.taskId) {
+						const task = swarmTaskById.get(event.taskId);
+						if (task) {
+							this.updateSwarmSubagentProgress({
+								runId: input.runId,
+								taskId: event.taskId,
+								task,
+								profile: this.resolveSwarmTaskProfile(task),
+								progress: {
+									phase: event.message,
+									phaseState: "running",
+								},
+							});
+						}
+						this.showWarning(`Swarm ${event.taskId}: ${event.message}`);
+					}
+					if (event.type === "task_error" && event.taskId) {
+						this.finalizeSwarmSubagentDisplay({
+							runId: input.runId,
+							taskId: event.taskId,
+							status: "error",
+							errorMessage: event.message,
+						});
+						this.showWarning(`Swarm ${event.taskId} failed: ${event.message}`);
+					}
+					if (event.type === "task_blocked" && event.taskId) {
+						this.finalizeSwarmSubagentDisplay({
+							runId: input.runId,
+							taskId: event.taskId,
+							status: "error",
+							errorMessage: event.message,
+						});
+						this.showWarning(`Swarm ${event.taskId} blocked: ${event.message}`);
+					}
+					if ((event.type === "run_blocked" || event.type === "run_failed" || event.type === "run_stopped") && event.message) {
+						this.showWarning(`Swarm ${event.type.replace("run_", "")}: ${event.message}`);
+					}
+				},
+				onStateChanged: (state) => {
+					store.saveState(state);
+					store.saveCheckpoint(state);
+					refreshIncrementalIndex();
+				},
+				shouldStop: () => this.shutdownRequested || localStopRequested || this.swarmStopRequested,
+			});
+		} catch (error) {
+			const message = error instanceof Error ? error.message : String(error);
+			const failedState = store.loadState() ?? initialState;
+			failedState.status = "failed";
+			failedState.lastError = message;
+			failedState.updatedAt = new Date().toISOString();
+			store.appendEvent({
+				type: "run_failed",
+				timestamp: new Date().toISOString(),
+				runId: input.runId,
+				tick: failedState.tick,
+				message,
+			});
+			store.saveState(failedState);
+			store.saveCheckpoint(failedState);
+			this.finalizeSwarmRunSubagentDisplays(input.runId, message);
+			this.showWarning(`Swarm run failed unexpectedly: ${message}`);
+			return;
+		} finally {
+			this.swarmActiveRunId = undefined;
+			this.swarmStopRequested = false;
+			this.swarmAbortController = undefined;
+			this.footerDataProvider.setSwarmBusy(false);
+			this.footer.invalidate();
+		}
+		if (schedulerResult.state.status !== "completed") {
+			this.finalizeSwarmRunSubagentDisplays(
+				input.runId,
+				schedulerResult.state.lastError ?? `Swarm run ${schedulerResult.state.status}`,
+			);
+		}
 
 		const taskStates = Object.values(schedulerResult.state.tasks);
 		const doneCount = taskStates.filter((task) => task.status === "done").length;
@@ -11770,6 +12403,8 @@ export class InteractiveMode {
 	}
 
 	private async runSwarmFromTask(task: string, options: { maxParallel?: number; budgetUsd?: number }): Promise<void> {
+		if (!this.ensureSwarmModelReady("plain")) return;
+
 		const contract = await this.ensureSwarmEffectiveContract(task);
 		if (!contract) return;
 
@@ -11785,7 +12420,11 @@ export class InteractiveMode {
 		});
 
 		const runId = `swarm_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
-		const maxParallel = Math.max(1, Math.min(MAX_ORCHESTRATION_PARALLEL, options.maxParallel ?? 3));
+		const maxParallel = this.resolveSwarmMaxParallel({
+			requested: options.maxParallel,
+			plan,
+			source: "plain",
+		});
 		const meta = this.buildSwarmRunMeta({
 			runId,
 			source: "plain",
@@ -11814,6 +12453,8 @@ export class InteractiveMode {
 		maxParallel?: number;
 		budgetUsd?: number;
 	}): Promise<void> {
+		if (!this.ensureSwarmModelReady("singular")) return;
+
 		const analysis = this.loadSingularAnalysisByRunId(input.runId);
 		if (!analysis) {
 			this.showWarning(`Singular run not found: ${input.runId}`);
@@ -11838,7 +12479,11 @@ export class InteractiveMode {
 		});
 
 		const runId = `swarm_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
-		const maxParallel = Math.max(1, Math.min(MAX_ORCHESTRATION_PARALLEL, input.maxParallel ?? 3));
+		const maxParallel = this.resolveSwarmMaxParallel({
+			requested: input.maxParallel,
+			plan,
+			source: "singular",
+		});
 		const meta = this.buildSwarmRunMeta({
 			runId,
 			source: "singular",
@@ -12036,6 +12681,10 @@ export class InteractiveMode {
 	}
 
 	private async handleSwarmCommand(text: string): Promise<void> {
+		if (this.swarmActiveRunId) {
+			this.showWarning(`Swarm run already in progress: ${this.swarmActiveRunId}. Use /swarm watch.`);
+			return;
+		}
 		if (this.session.isStreaming) {
 			this.showWarning("Cannot run /swarm while the agent is processing another request.");
 			return;
@@ -12261,6 +12910,9 @@ export class InteractiveMode {
 			this.showWarning("--max-parallel is only valid with --parallel mode.");
 			return undefined;
 		}
+		if (mode === "parallel" && maxParallel === undefined) {
+			maxParallel = Math.max(1, Math.min(MAX_ORCHESTRATION_PARALLEL, agents));
+		}
 		if (maxParallel !== undefined && maxParallel > agents) {
 			maxParallel = agents;
 		}
@@ -12336,12 +12988,25 @@ export class InteractiveMode {
 		const currentCwd = this.sessionManager.getCwd();
 		const assignments: string[] = [];
 		const assignmentRecords: Array<{ profile: string; cwd: string; lockKey?: string; dependsOn: number[] }> = [];
+		const dependencyEdges = parsed.dependencies?.reduce((sum, entry) => sum + entry.dependsOn.length, 0) ?? 0;
+		const defaultAssignmentProfile = this.resolveOrchestrateDefaultAssignmentProfile(parsed);
+		const delegateParallelHints: number[] = [];
 		for (let index = 0; index < parsed.agents; index++) {
 			const assignmentProfile =
-				parsed.profiles?.[index] ?? parsed.profile ?? (this.activeProfileName || "full");
+				parsed.profiles?.[index] ?? parsed.profile ?? defaultAssignmentProfile;
 			const assignmentCwd = parsed.cwds?.[index] ?? ".";
 			const assignmentLock = parsed.locks?.[index];
 			const dependsOn = parsed.dependencies?.find((entry) => entry.agent === index + 1)?.dependsOn ?? [];
+			const delegateParallelHint = this.deriveOrchestrateDelegateParallelHint({
+				task: parsed.task,
+				mode: parsed.mode,
+				agents: parsed.agents,
+				maxParallel: parsed.maxParallel,
+				dependencyEdges,
+				hasLock: !!assignmentLock,
+				hasDependencies: dependsOn.length > 0,
+			});
+			delegateParallelHints.push(delegateParallelHint);
 			const resolvedCwd = path.resolve(currentCwd, assignmentCwd);
 			assignmentRecords.push({
 				profile: assignmentProfile,
@@ -12352,6 +13017,7 @@ export class InteractiveMode {
 			assignments.push(
 				`- agent ${index + 1}: profile=${assignmentProfile} cwd=${resolvedCwd}${assignmentLock ? ` lock_key=${assignmentLock}` : ""
 				}${parsed.isolation === "worktree" ? " isolation=worktree" : ""}${dependsOn.length > 0 ? ` depends_on=${dependsOn.join("|")}` : ""
+				} delegate_parallel_hint=${delegateParallelHint}
 				}`,
 			);
 		}
@@ -12368,9 +13034,20 @@ export class InteractiveMode {
 		);
 		const taskCallHints = teamRun.tasks.map((task, index) => {
 			const assignment = assignmentRecords[index];
+			const hint = delegateParallelHints[index] ?? 1;
 			return `- task_call_${index + 1}: description="agent ${index + 1} execution" profile="${assignment.profile}" cwd="${assignment.cwd}" run_id="${teamRun.runId}" task_id="${task.id}"${assignment.lockKey ? ` lock_key="${assignment.lockKey}"` : ""
-				}${parsed.isolation === "worktree" ? ' isolation="worktree"' : ""}`;
+				}${parsed.isolation === "worktree" ? ' isolation="worktree"' : ""} delegate_parallel_hint=${hint}`;
 		});
+
+		if (
+			parsed.mode === "parallel" &&
+			!parsed.profile &&
+			!(parsed.profiles && parsed.profiles.length > 0) &&
+			defaultAssignmentProfile === "meta" &&
+			this.activeProfileName !== "meta"
+		) {
+			this.showStatus("Orchestrate auto-profile: using `meta` workers for stronger fan-out and nested delegation.");
+		}
 
 		this.chatContainer.addChild(new Spacer(1));
 		this.chatContainer.addChild(
@@ -12394,6 +13071,9 @@ export class InteractiveMode {
 				"- for parallel mode, emit all independent task calls in one assistant response",
 				"- in parallel mode, use parallel tool-call style (<use_parallel_tool_calls>)",
 				"- when assignment lines include depends_on, still emit one task call per assignment; runtime enforces dependency gating",
+				"- include delegate_parallel_hint from each assignment/task_call hint in every corresponding task tool call",
+				"- for delegate_parallel_hint >= 2, split child work into nested <delegate_task> streams unless impossible",
+				"- if nested split is impossible for a non-trivial stream, emit one line: DELEGATION_IMPOSSIBLE: <reason>",
 				"- keep required orchestration task calls in foreground; do not set background=true unless user explicitly requested detached async runs",
 			"- do not poll .iosm/subagents/background via bash/read during orchestration; wait for task results and then synthesize",
 			"- include run_id and task_id from each assignment in the task tool arguments",

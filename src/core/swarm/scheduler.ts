@@ -16,9 +16,21 @@ import type {
 } from "./types.js";
 
 const TERMINAL_STATUSES = new Set<SwarmTaskRuntimeState["status"]>(["done", "error", "cancelled", "blocked"]);
+const FAILURE_STATUSES = new Set<SwarmTaskRuntimeState["status"]>(["error", "cancelled"]);
 
 function nowIso(): string {
 	return new Date().toISOString();
+}
+
+function parseBoundedInt(raw: string | undefined, fallback: number, min: number, max: number): number {
+	const parsed = raw ? Number.parseInt(raw, 10) : fallback;
+	if (!Number.isInteger(parsed)) return fallback;
+	return Math.max(min, Math.min(max, parsed));
+}
+
+function clampBoundedInt(value: number | undefined, fallback: number, min: number, max: number): number {
+	if (typeof value !== "number" || !Number.isFinite(value)) return fallback;
+	return Math.max(min, Math.min(max, Math.floor(value)));
 }
 
 function compact(values: string[]): string[] {
@@ -122,6 +134,37 @@ function collectReadyTasks(state: SwarmRuntimeState, planById: Map<string, Swarm
 		ready.push(taskId);
 	}
 	return ready;
+}
+
+function blockDependentsOfFailure(input: {
+	failedTaskId: string;
+	state: SwarmRuntimeState;
+	planById: Map<string, SwarmTaskPlan>;
+}): string[] {
+	const blocked: string[] = [];
+	const queue: string[] = [input.failedTaskId];
+	const seen = new Set<string>(queue);
+
+	while (queue.length > 0) {
+		const failedId = queue.shift();
+		if (!failedId) break;
+
+		for (const [taskId, runtime] of Object.entries(input.state.tasks)) {
+			if (runtime.status !== "pending" && runtime.status !== "ready") continue;
+			const plan = input.planById.get(taskId);
+			if (!plan || !plan.depends_on.includes(failedId)) continue;
+			runtime.status = "blocked";
+			runtime.completedAt = nowIso();
+			runtime.lastError = `Dependency failed: ${failedId}`;
+			blocked.push(taskId);
+			if (!seen.has(taskId)) {
+				seen.add(taskId);
+				queue.push(taskId);
+			}
+		}
+	}
+
+	return blocked;
 }
 
 function selectBatch(input: {
@@ -254,6 +297,8 @@ export interface RunSwarmSchedulerOptions {
 	budgetUsd?: number;
 	existingState?: SwarmRuntimeState;
 	retryPolicy?: SwarmRetryPolicy;
+	/** Max time for a single dispatch call in milliseconds. Defaults to IOSM_SWARM_DISPATCH_TIMEOUT_MS or 180000. */
+	dispatchTimeoutMs?: number;
 	noProgressTickLimit?: number;
 	spawnCap?: number;
 	progressHeuristic?: {
@@ -292,6 +337,13 @@ export async function runSwarmScheduler(
 	const planById = new Map(options.plan.tasks.map((task) => [task.id, task]));
 	const dependents = collectDependents(options.plan);
 	const retryPolicy = options.retryPolicy ?? DEFAULT_RETRY_POLICY;
+	const envDispatchTimeoutMs = parseBoundedInt(
+		process.env.IOSM_SWARM_DISPATCH_TIMEOUT_MS,
+		180_000,
+		1_000,
+		1_800_000,
+	);
+	const dispatchTimeoutMs = clampBoundedInt(options.dispatchTimeoutMs, envDispatchTimeoutMs, 1_000, 1_800_000);
 	const noProgressLimit = Math.max(3, options.noProgressTickLimit ?? 8);
 	const spawnCap = Math.max(1, options.spawnCap ?? 30);
 	const progressHeuristicEnabled = options.progressHeuristic?.enabled !== false;
@@ -500,11 +552,33 @@ export async function runSwarmScheduler(
 				dispatchContexts.map(async ({ taskId, plan, runtime }) => {
 					let result: SwarmDispatchResult;
 					try {
-						result = await options.dispatchTask({
+						const dispatchPromise = options.dispatchTask({
 							task: plan,
 							runtime,
 							tick: state.tick,
 						});
+						// Prevent unhandled rejections when timeout wins the race.
+						void dispatchPromise.catch(() => {
+							// handled by timeout race path
+						});
+						let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
+						const timeoutPromise = new Promise<SwarmDispatchResult>((resolve) => {
+							timeoutHandle = setTimeout(() => {
+								resolve({
+									taskId,
+									status: "error",
+									error: `Dispatch timed out after ${dispatchTimeoutMs}ms.`,
+									failureCause: "timeout",
+								});
+							}, dispatchTimeoutMs);
+						});
+						try {
+							result = await Promise.race([dispatchPromise, timeoutPromise]);
+						} finally {
+							if (timeoutHandle) {
+								clearTimeout(timeoutHandle);
+							}
+						}
 					} catch (error) {
 						result = {
 							taskId,
@@ -548,41 +622,65 @@ export async function runSwarmScheduler(
 				} else if (result.status === "blocked") {
 					runtime.status = "blocked";
 					runtime.lastError = result.error ?? "Task blocked by user input or policy.";
+					runtime.completedAt = nowIso();
 					emit("task_blocked", runtime.lastError, undefined, taskId);
 				} else {
 					const errorMessage = result.error ?? "Unknown task failure.";
 					const currentRetries = state.retries[taskId] ?? 0;
-						const retryDecision = shouldRetry({
-							errorMessage,
-							currentRetries,
-							policy: retryPolicy,
-						});
-						if (retryDecision.retry) {
-							state.retries[taskId] = currentRetries + 1;
-							runtime.status = "ready";
-							runtime.lastError = errorMessage;
-							emit(
-								"task_retry",
-								`retry ${state.retries[taskId]}/${retryDecision.max} for ${taskId} (${retryDecision.bucket})`,
-								{
-									error: errorMessage,
-									bucket: retryDecision.bucket,
-									failureCause: result.failureCause ?? retryDecision.bucket,
-								},
-								taskId,
-							);
-						} else {
-							runtime.status = "error";
-							runtime.completedAt = nowIso();
-							runtime.lastError = errorMessage;
-							emit(
-								"task_error",
+					const nonRetryableFailure =
+						result.failureCause === "protocol_violation" || result.failureCause === "interrupted";
+					const retryDecision = nonRetryableFailure
+						? { retry: false, bucket: "unknown" as const, max: 0 }
+						: shouldRetry({
 								errorMessage,
-								{ bucket: retryDecision.bucket, failureCause: result.failureCause ?? retryDecision.bucket },
-								taskId,
-							);
+								currentRetries,
+								policy: retryPolicy,
+							});
+					if (retryDecision.retry) {
+						state.retries[taskId] = currentRetries + 1;
+						runtime.status = "ready";
+						runtime.lastError = errorMessage;
+						emit(
+							"task_retry",
+							`retry ${state.retries[taskId]}/${retryDecision.max} for ${taskId} (${retryDecision.bucket})`,
+							{
+								error: errorMessage,
+								bucket: retryDecision.bucket,
+								failureCause: result.failureCause ?? retryDecision.bucket,
+							},
+							taskId,
+						);
+					} else {
+						runtime.status = "error";
+						runtime.completedAt = nowIso();
+						runtime.lastError = errorMessage;
+						emit(
+							"task_error",
+							errorMessage,
+							{ bucket: retryDecision.bucket, failureCause: result.failureCause ?? retryDecision.bucket },
+							taskId,
+						);
+						if (FAILURE_STATUSES.has(runtime.status)) {
+							const blockedDependents = blockDependentsOfFailure({
+								failedTaskId: taskId,
+								state,
+								planById,
+							});
+							for (const blockedTaskId of blockedDependents) {
+								const blockedRuntime = state.tasks[blockedTaskId];
+								emit(
+									"task_blocked",
+									blockedRuntime?.lastError ?? `Dependency failed: ${taskId}`,
+									{ dependency: taskId },
+									blockedTaskId,
+								);
+							}
+							if (blockedDependents.length > 0) {
+								progressThisTick = true;
+							}
 						}
 					}
+				}
 
 				for (const candidate of result.spawnCandidates ?? []) {
 					if (spawned.size() >= spawnCap) break;

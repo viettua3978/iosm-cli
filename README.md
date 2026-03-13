@@ -1,4 +1,4 @@
-<h1 align="center">IOSM CLI v0.2.4</h1>
+<h1 align="center">IOSM CLI v0.2.5</h1>
 
 <p align="center">
   <strong>AI Engineering Runtime for Professional Developers</strong>
@@ -34,6 +34,20 @@ It is a runtime for production codebases:
 - extensibility for teams (MCP + extensions) and embedding (SDK + JSON/RPC modes)
 
 Adoption path is layered: start in **full** profile for low-friction daily usage, switch to **meta** when tasks benefit from adaptive multi-agent orchestration, then use **iosm** profile when you need advanced IOSM cycles, metrics, and governance.
+
+## What's New in v0.2.5
+
+- stronger parallel orchestration defaults for `/orchestrate`:
+  - in `--parallel` mode, omitted `--max-parallel` now auto-matches `--agents`
+  - when no worker profile is set, parallel orchestration defaults workers to `meta` (except read-only host contexts)
+  - assignment-level `delegate_parallel_hint` is propagated so nested delegation can fan out more predictably
+- improved swarm reliability and observability:
+  - dispatch timeout guardrails in scheduler runtime
+  - dependent tasks are auto-blocked when an upstream dependency fails
+  - richer subagent progress visibility while `/swarm` runs
+- safer coordination internals:
+  - queued retries for team status updates under lock contention
+  - shared-memory reads are metadata-first by default (optional value preview when requested)
 
 ## Why It Exists
 
@@ -145,7 +159,7 @@ Core commands to unlock full runtime value:
 
 ```console
 $ iosm
-IOSM CLI v0.2.4 [full]
+IOSM CLI v0.2.5 [full]
 
 you> /singular Refactor auth and split session handling from token validation
 iosm> Option 1 selected

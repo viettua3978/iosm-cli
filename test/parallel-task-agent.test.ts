@@ -89,7 +89,10 @@ describe("parallel task execution policy", () => {
 		expect(elapsedMs).toBeLessThan(500);
 		expect(result.steeringMessages?.length).toBe(1);
 		expect(result.toolResults).toHaveLength(2);
-		expect(result.toolResults.every((item) => item.isError)).toBe(true);
+		expect(result.toolResults.every((item) => item.isError)).toBe(false);
+		expect(result.toolResults.every((item) => (item.details as { steeringSkipped?: boolean })?.steeringSkipped === true)).toBe(
+			true,
+		);
 		expect(
 			result.toolResults.every((item) =>
 				item.content.some((content) => content.type === "text" && content.text?.includes("Skipped due to queued user message.")),

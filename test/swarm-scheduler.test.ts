@@ -179,6 +179,48 @@ describe("swarm scheduler", () => {
 		expect(result.state.retries.task_1).toBe(1);
 	});
 
+	it("fails a hung dispatch with timeout instead of stalling the run", async () => {
+		const plan: SwarmPlan = {
+			source: "plain",
+			request: "timeout guard",
+			notes: [],
+			tasks: [
+				{
+					id: "task_1",
+					brief: "hung worker",
+					depends_on: [],
+					scopes: ["src/**"],
+					touches: ["src/hung.ts"],
+					concurrency_class: "implementation",
+					severity: "medium",
+					needs_user_input: false,
+					spawn_policy: "allow",
+				},
+			],
+		};
+
+		let attempts = 0;
+		const result = await runSwarmScheduler({
+			runId: "swarm_scheduler_dispatch_timeout",
+			plan,
+			contract: {},
+			maxParallel: 1,
+			dispatchTimeoutMs: 20,
+			dispatchTask: async () => {
+				attempts += 1;
+				return await new Promise<never>(() => {
+					// Simulate a hanging model/tool call.
+				});
+			},
+		});
+
+		expect(attempts).toBe(3);
+		expect(result.state.tasks.task_1?.status).toBe("error");
+		expect(result.state.retries.task_1).toBe(2);
+		expect(result.events.some((event) => event.type === "task_retry" && /timeout/i.test(event.message))).toBe(true);
+		expect(result.state.status).toBe("failed");
+	});
+
 	it("propagates failureCause into task_retry and task_error events", async () => {
 		const plan: SwarmPlan = {
 			source: "plain",
@@ -223,6 +265,112 @@ describe("swarm scheduler", () => {
 		expect(retryEvent?.payload?.failureCause).toBe(failureCause);
 		expect(errorEvent?.payload?.failureCause).toBe(failureCause);
 		expect(result.state.tasks.task_1?.status).toBe("error");
+	});
+
+	it("does not retry non-retryable protocol violations", async () => {
+		const plan: SwarmPlan = {
+			source: "plain",
+			request: "protocol contract",
+			notes: [],
+			tasks: [
+				{
+					id: "task_1",
+					brief: "run one task",
+					depends_on: [],
+					scopes: ["src/**"],
+					touches: ["src/app.ts"],
+					concurrency_class: "implementation",
+					severity: "medium",
+					needs_user_input: false,
+					spawn_policy: "allow",
+				},
+			],
+		};
+
+		let attempts = 0;
+		const result = await runSwarmScheduler({
+			runId: "swarm_scheduler_protocol_violation",
+			plan,
+			contract: {},
+			maxParallel: 1,
+			dispatchTask: async ({ task }) => {
+				attempts += 1;
+				return {
+					taskId: task.id,
+					status: "error",
+					error: "No task tool call executed by assistant.",
+					failureCause: "protocol_violation",
+				};
+			},
+		});
+
+		expect(attempts).toBe(1);
+		expect(result.state.tasks.task_1?.status).toBe("error");
+		expect(result.state.status).toBe("failed");
+	});
+
+	it("blocks downstream tasks when an upstream dependency fails", async () => {
+		const plan: SwarmPlan = {
+			source: "plain",
+			request: "dependency failure propagation",
+			notes: [],
+			tasks: [
+				{
+					id: "task_1",
+					brief: "root",
+					depends_on: [],
+					scopes: ["src/**"],
+					touches: ["src/root.ts"],
+					concurrency_class: "implementation",
+					severity: "high",
+					needs_user_input: false,
+					spawn_policy: "allow",
+				},
+				{
+					id: "task_2",
+					brief: "child",
+					depends_on: ["task_1"],
+					scopes: ["src/**"],
+					touches: ["src/child.ts"],
+					concurrency_class: "implementation",
+					severity: "medium",
+					needs_user_input: false,
+					spawn_policy: "allow",
+				},
+				{
+					id: "task_3",
+					brief: "grandchild",
+					depends_on: ["task_2"],
+					scopes: ["src/**"],
+					touches: ["src/grandchild.ts"],
+					concurrency_class: "implementation",
+					severity: "medium",
+					needs_user_input: false,
+					spawn_policy: "allow",
+				},
+			],
+		};
+
+		const result = await runSwarmScheduler({
+			runId: "swarm_scheduler_dependency_failure",
+			plan,
+			contract: {},
+			maxParallel: 2,
+			dispatchTask: async ({ task }) => ({
+				taskId: task.id,
+				status: "error",
+				error: `fatal error on ${task.id}`,
+				failureCause: "protocol_violation",
+			}),
+		});
+
+		expect(result.state.tasks.task_1?.status).toBe("error");
+		expect(result.state.tasks.task_2?.status).toBe("blocked");
+		expect(result.state.tasks.task_3?.status).toBe("blocked");
+		expect(result.state.status).toBe("failed");
+		const blockedEvents = result.events.filter((event) => event.type === "task_blocked").map((event) => event.taskId);
+		expect(blockedEvents).toContain("task_2");
+		expect(blockedEvents).toContain("task_3");
 	});
 
 	it("applies conflict-density guard and emits scheduler guard events", async () => {

@@ -1,6 +1,7 @@
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import lockfile from "proper-lockfile";
 import { TypeCompiler } from "@sinclair/typebox/compiler";
 import { afterEach, describe, expect, it } from "vitest";
 import { createTeamRun, getTeamRun, updateTeamTaskStatus } from "../src/core/agent-teams.js";
@@ -44,6 +45,39 @@ describe("subagent orchestration", () => {
 		const loaded = getTeamRun(cwd, run.runId);
 		expect(loaded?.tasks.find((task) => task.id === "task_1")?.status).toBe("done");
 		expect(loaded?.tasks.find((task) => task.id === "task_2")?.status).toBe("pending");
+	});
+
+	it("retries queued team task status updates after temporary lock contention", async () => {
+		const cwd = makeTempDir();
+		const run = createTeamRun({
+			cwd,
+			mode: "parallel",
+			agents: 1,
+			task: "lock contention status update",
+			assignments: [{ profile: "full", cwd, dependsOn: [] }],
+		});
+		const runPath = join(cwd, ".iosm", "subagents", "teams", `${run.runId}.json`);
+		const release = lockfile.lockSync(runPath, { realpath: false });
+		try {
+			const immediate = updateTeamTaskStatus({
+				cwd,
+				runId: run.runId,
+				taskId: "task_1",
+				status: "running",
+			});
+			expect(immediate).toBeUndefined();
+		} finally {
+			release();
+		}
+
+		const deadline = Date.now() + 1500;
+		while (Date.now() < deadline) {
+			const loaded = getTeamRun(cwd, run.runId);
+			if (loaded?.tasks.find((task) => task.id === "task_1")?.status === "running") break;
+			await new Promise((resolve) => setTimeout(resolve, 25));
+		}
+
+		expect(getTeamRun(cwd, run.runId)?.tasks.find((task) => task.id === "task_1")?.status).toBe("running");
 	});
 
 	it("task tool writes done/error status to team runs when run_id/task_id are provided", async () => {
@@ -225,6 +259,75 @@ describe("subagent orchestration", () => {
 		expect((result.content[0] as { type: "text"; text: string }).text).toBe("ok");
 		expect(result.details?.profile).toBe("full");
 		expect(observedTools).toContain("write");
+	});
+
+	it("defaults missing profile to the current host profile when provided", async () => {
+		const cwd = makeTempDir();
+		const observedProfiles: string[] = [];
+		const tool = createTaskTool(
+			cwd,
+			async (options) => {
+				observedProfiles.push(options.profileName);
+				return { output: "ok" };
+			},
+			{
+				getHostProfileName: () => "meta",
+			},
+		);
+
+		const result = await tool.execute("call_missing_profile_host_meta", {
+			description: "missing profile with host override",
+			prompt: "delegate and orchestrate",
+		});
+
+		expect((result.content[0] as { type: "text"; text: string }).text).toContain("ok");
+		expect(result.details?.profile).toBe("meta");
+		expect(observedProfiles[0]).toBe("meta");
+	});
+
+	it("blocks write-capable subtask profiles from read-only hosts", async () => {
+		const cwd = makeTempDir();
+		const tool = createTaskTool(
+			cwd,
+			async () => ({ output: "ok" }),
+			{
+				getHostProfileName: () => "plan",
+			},
+		);
+
+		await expect(
+			tool.execute("call_readonly_host_write_profile", {
+				description: "attempt write-capable delegate from read-only host",
+				prompt: "perform edits",
+				profile: "full",
+			}),
+		).rejects.toThrow(/Host profile "plan" is read-only/);
+	});
+
+	it("allows read-only subtask profiles from read-only hosts", async () => {
+		const cwd = makeTempDir();
+		let observedTools: string[] = [];
+		const tool = createTaskTool(
+			cwd,
+			async (options) => {
+				observedTools = options.tools.slice();
+				return { output: "ok" };
+			},
+			{
+				getHostProfileName: () => "plan",
+			},
+		);
+
+		const result = await tool.execute("call_readonly_host_readonly_profile", {
+			description: "safe read-only delegate from plan host",
+			prompt: "scan auth and rbac",
+			profile: "explore",
+		});
+
+		expect((result.content[0] as { type: "text"; text: string }).text).toBe("ok");
+		expect(result.details?.profile).toBe("explore");
+		expect(observedTools).toContain("read");
+		expect(observedTools).not.toContain("write");
 	});
 
 	it("accepts task calls with description only and uses it as the prompt", async () => {
@@ -1518,6 +1621,53 @@ describe("subagent orchestration", () => {
 
 		expect(synthesizedDelegatesObserved).toBeGreaterThanOrEqual(3);
 		expect(result.details?.delegatedTasks ?? 0).toBeGreaterThanOrEqual(3);
+	});
+
+	it("enforces delegate fan-out for orchestrated run contexts when hint >= 2", async () => {
+		const cwd = makeTempDir();
+		const run = createTeamRun({
+			cwd,
+			mode: "parallel",
+			agents: 1,
+			maxParallel: 1,
+			task: "orchestrated fanout",
+			assignments: [{ profile: "full", cwd, dependsOn: [] }],
+		});
+		let synthesizedDelegatesObserved = 0;
+		const tool = createTaskTool(cwd, async (options) => {
+			if (options.prompt.includes("Workstream ")) {
+				synthesizedDelegatesObserved += 1;
+				return {
+					output: "Delegated stream complete.",
+					stats: { toolCallsStarted: 1, toolCallsCompleted: 1, assistantMessages: 1 },
+				};
+			}
+			if (options.prompt.includes("DELEGATION_ENFORCEMENT")) {
+				return {
+					output: "Still monolithic output.",
+					stats: { toolCallsStarted: 1, toolCallsCompleted: 1, assistantMessages: 1 },
+				};
+			}
+			if (options.prompt.includes("root-orchestrated-task")) {
+				return {
+					output: "Root monolithic output.",
+					stats: { toolCallsStarted: 1, toolCallsCompleted: 1, assistantMessages: 1 },
+				};
+			}
+			return { output: "unexpected" };
+		});
+
+		const result = await tool.execute("call_orchestrated_fanout", {
+			description: "Orchestrated security audit stream",
+			prompt: "root-orchestrated-task",
+			profile: "full",
+			delegate_parallel_hint: 3,
+			run_id: run.runId,
+			task_id: "task_1",
+		});
+
+		expect(synthesizedDelegatesObserved).toBeGreaterThanOrEqual(2);
+		expect(result.details?.delegatedTasks ?? 0).toBeGreaterThanOrEqual(2);
 	});
 
 	it("supports delegated fan-out up to the 10-child ceiling", async () => {

@@ -49,4 +49,12 @@ describe("singular service", () => {
 		expect(last?.runId).toBe(result.runId);
 		expect(last?.analysisPath).toContain(".iosm/singular/");
 	});
+
+	it("generates unique run ids across rapid consecutive analyses", async () => {
+		const service = new SingularService({ cwd: projectDir });
+		const first = await service.analyze({ request: "introduce account dashboard", autosave: true });
+		const second = await service.analyze({ request: "introduce account dashboard", autosave: true });
+
+		expect(first.runId).not.toBe(second.runId);
+	});
 });

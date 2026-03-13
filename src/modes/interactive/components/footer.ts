@@ -175,9 +175,10 @@ export class FooterComponent implements Component {
 			statusParts.push(badge(normalizedProfile, "muted"));
 		}
 
+		const swarmBusy = this.footerData.getSwarmBusy?.() ?? false;
 		if (this.session.isCompacting) {
 			statusParts.push(badge("compacting", "warning"));
-		} else if (this.session.isStreaming) {
+		} else if (this.session.isStreaming || swarmBusy) {
 			statusParts.push(badge("working", "accent"));
 		} else {
 			statusParts.push(badge("ready", "success"));

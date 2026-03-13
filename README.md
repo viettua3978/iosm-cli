@@ -313,11 +313,11 @@ For non-trivial changes, the recommended path is a controlled progression rather
 
 ```mermaid
 flowchart LR
-  A[Goal] --> B[/contract]
-  B --> C[/singular]
-  C --> D[/swarm]
+  A[Goal] --> B["/contract"]
+  B --> C["/singular"]
+  C --> D["/swarm"]
   D --> E[Verified changes]
-  E --> F[/iosm cycle]
+  E --> F["/iosm cycle"]
   F --> G[Artifacts + history]
 ```
 

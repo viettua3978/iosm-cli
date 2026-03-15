@@ -3,12 +3,14 @@ import type { TaskPlanSnapshot } from "../../../core/task-plan.js";
 import { theme } from "../theme/theme.js";
 import { editorKey } from "./keybinding-hints.js";
 
+const MESSAGE_BOX_PADDING_X = 2;
+
 export class TaskPlanMessageComponent extends Box {
 	private expanded = false;
 	private snapshot: TaskPlanSnapshot;
 
 	constructor(snapshot: TaskPlanSnapshot) {
-		super(1, 1, (text) => theme.bg("customMessageBg", text));
+		super(MESSAGE_BOX_PADDING_X, 1, (text) => theme.bg("customMessageBg", text));
 		this.snapshot = snapshot;
 		this.renderContent();
 	}

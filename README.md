@@ -1,6 +1,6 @@
 <div align="center">
 
-<h1>IOSM CLI 0.2.8</h1>
+<h1>IOSM CLI 0.2.9</h1>
 
 <p><strong>Terminal-native AI runtime for controlled, measurable engineering work on real codebases.</strong></p>
 
@@ -291,7 +291,7 @@ Profiles control tool access, thinking level, and behavioral guidance injected i
 |---------|----------|-------------|----------|
 | `explore` | Fast codebase exploration (no writes) | Read, grep, find, ls | Off |
 | `iosm_analyst` | Reading `.iosm/` artifacts, reporting | Read-only | Low |
-| `iosm_verifier` | Verifying changes, updating `.iosm/` | bash, read, write | Low |
+| `iosm_verifier` | Verifying changes, updating `.iosm/` | bash, read, write, test_run, lint_run, typecheck_run | Low |
 | `cycle_planner` | Planning IOSM cycles, writing hypotheses | bash, read, write | Medium |
 
 Select at startup:
@@ -471,7 +471,7 @@ Run `/settings` inside the TUI to view and modify all settings interactively.
            │                          │
 ┌──────────▼──────────────────────────▼───────────────────┐
 │                       Tool layer                        │
-│  read · edit · write · fs_ops · bash · grep · rg · fd · ast_grep │
+│  read · edit · write · fs_ops · test_run · lint_run · typecheck_run · db_run · bash · grep · rg · fd · ast_grep │
 │  comby · jq · yq · semgrep · sed · semantic_search · fetch · web_search · git_read · git_write │
 └─────────────────────────┬───────────────────────────────┘
                           │

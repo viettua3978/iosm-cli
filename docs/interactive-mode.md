@@ -92,7 +92,7 @@ iosm --continue
 | `/export` | Export session to HTML | `/export` |
 | `/share` | Share via GitHub Gist | `/share` |
 | `/copy` | Copy last response to clipboard | `/copy` |
-| `/doctor` | Run diagnostics for model/auth/MCP/hooks/resources | `/doctor` |
+| `/doctor` | Run diagnostics for model/auth/MCP/hooks/resources/toolchain (includes db_run/typecheck client CLIs) | `/doctor` |
 | `/compact` | Compact conversation context | `/compact` |
 | `/reload` | Reload extensions and resources | `/reload` |
 | `/permissions` | View/set tool permissions | `/permissions` |
@@ -112,6 +112,8 @@ In `/semantic setup`, the headers step is optional: press `Enter` on empty input
 `/swarm` enforces `Scopes -> Touches -> Locks -> Gates -> Done`. If effective contract is missing, it blocks execution and opens a bootstrap menu (auto-draft, guided Q&A, or manual `/contract` editor).
 `/orchestrate --parallel` defaults `--max-parallel` to `--agents` when omitted and auto-selects `meta` workers when profiles are not explicitly set (outside read-only host contexts).
 For orchestrate assignments, `delegate_parallel_hint` is carried into child task calls; high hints should trigger nested delegate fan-out or explicit `DELEGATION_IMPOSSIBLE`.
+If a model emits raw pseudo markup like `<tool_call>`, `<function=...>`, or `<delegate_task>` instead of real tool calls, interactive mode injects bounded protocol-recovery retries.
+If a model returns a silent `stop` (no visible text and no tool call), interactive mode injects bounded stall-recovery retries.
 `/blast` and `/shadow` are removed from active interactive workflow.
 
 ### `/contract` Detailed Guide
@@ -336,7 +338,7 @@ Profiles change the agent's behavior, available tools, and system prompt:
 
 | Profile | Tools | Use Case |
 |---------|-------|----------|
-| `full` | All built-ins (read, bash, edit, write, git_write, fs_ops, grep, find, ls, rg, fd, ast_grep, comby, jq, yq, semgrep, sed, semantic_search, fetch, web_search, git_read) | Default development work |
+| `full` | All built-ins (read, bash, edit, write, git_write, fs_ops, test_run, lint_run, typecheck_run, db_run, grep, find, ls, rg, fd, ast_grep, comby, jq, yq, semgrep, sed, semantic_search, fetch, web_search, git_read) | Default development work |
 | `plan` | Read-only bundle (read, grep, find, ls, rg, fd, ast_grep, comby, jq, yq, semgrep, sed, semantic_search, fetch, web_search, git_read) | Architecture planning, code review |
 | `iosm` | All + IOSM context | IOSM cycle execution with artifact sync |
 | `meta` | Full toolset + orchestration-first contract | Adaptive multi-agent/delegate execution with verification closure |
@@ -352,6 +354,9 @@ Profiles change the agent's behavior, available tools, and system prompt:
 | `iosm_analyst` | Deep metric analysis and reporting |
 | `iosm_verifier` | Verify cycle results and quality gates |
 | `cycle_planner` | Plan and structure IOSM cycles |
+
+`db_run` is intentionally excluded from read-only profiles and `iosm_verifier`.  
+`typecheck_run` is available in write-capable profiles and `iosm_verifier`.
 
 ### Example: Planning Workflow
 

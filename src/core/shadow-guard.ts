@@ -1,6 +1,17 @@
 import { readOnlyTools } from "./tools/index.js";
 
-const SHADOW_MUTATING_TOOLS = new Set(["edit", "write", "bash", "git_write", "fs_ops", "task"]);
+const SHADOW_MUTATING_TOOLS = new Set([
+	"edit",
+	"write",
+	"bash",
+	"git_write",
+	"fs_ops",
+	"test_run",
+	"lint_run",
+	"typecheck_run",
+	"db_run",
+	"task",
+]);
 const SHADOW_SAFE_ADDITIONAL_TOOLS = new Set(["todo_read", "ask_user"]);
 
 export interface ShadowGuardOptions {

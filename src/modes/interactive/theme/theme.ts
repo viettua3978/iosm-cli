@@ -448,9 +448,11 @@ function getBuiltinThemes(): Record<string, ThemeJson> {
 		const themesDir = getThemesDir();
 		const darkPath = path.join(themesDir, "dark.json");
 		const lightPath = path.join(themesDir, "light.json");
+		const universalPath = path.join(themesDir, "universal.json");
 		BUILTIN_THEMES = {
 			dark: JSON.parse(fs.readFileSync(darkPath, "utf-8")) as ThemeJson,
 			light: JSON.parse(fs.readFileSync(lightPath, "utf-8")) as ThemeJson,
+			universal: JSON.parse(fs.readFileSync(universalPath, "utf-8")) as ThemeJson,
 		};
 	}
 	return BUILTIN_THEMES;
@@ -530,7 +532,7 @@ function parseThemeJson(label: string, json: unknown): ThemeJson {
 			errorMessage += "\nMissing required color tokens:\n";
 			errorMessage += missingColors.map((c) => `  - ${c}`).join("\n");
 			errorMessage += '\n\nPlease add these colors to your theme\'s "colors" object.';
-			errorMessage += "\nSee the built-in themes (dark.json, light.json) for reference values.";
+			errorMessage += "\nSee the built-in themes (dark.json, light.json, universal.json) for reference values.";
 		}
 		if (otherErrors.length > 0) {
 			errorMessage += `\n\nOther errors:\n${otherErrors.join("\n")}`;
@@ -623,23 +625,8 @@ export function getThemeByName(name: string): Theme | undefined {
 	}
 }
 
-function detectTerminalBackground(): "dark" | "light" {
-	const colorfgbg = process.env.COLORFGBG || "";
-	if (colorfgbg) {
-		const parts = colorfgbg.split(";");
-		if (parts.length >= 2) {
-			const bg = parseInt(parts[1], 10);
-			if (!Number.isNaN(bg)) {
-				const result = bg < 8 ? "dark" : "light";
-				return result;
-			}
-		}
-	}
-	return "dark";
-}
-
 function getDefaultTheme(): string {
-	return detectTerminalBackground();
+	return "universal";
 }
 
 // ============================================================================
@@ -686,9 +673,9 @@ export function initTheme(themeName?: string, enableWatcher: boolean = false): v
 			startThemeWatcher();
 		}
 	} catch (_error) {
-		// Theme is invalid - fall back to dark theme silently
-		currentThemeName = "dark";
-		setGlobalTheme(loadTheme("dark"));
+		// Theme is invalid - fall back to universal theme silently
+		currentThemeName = "universal";
+		setGlobalTheme(loadTheme("universal"));
 		// Don't start watcher for fallback theme
 	}
 }
@@ -705,9 +692,9 @@ export function setTheme(name: string, enableWatcher: boolean = false): { succes
 		}
 		return { success: true };
 	} catch (error) {
-		// Theme is invalid - fall back to dark theme
-		currentThemeName = "dark";
-		setGlobalTheme(loadTheme("dark"));
+		// Theme is invalid - fall back to universal theme
+		currentThemeName = "universal";
+		setGlobalTheme(loadTheme("universal"));
 		// Don't start watcher for fallback theme
 		return {
 			success: false,
@@ -737,7 +724,12 @@ function startThemeWatcher(): void {
 	}
 
 	// Only watch if it's a custom theme (not built-in)
-	if (!currentThemeName || currentThemeName === "dark" || currentThemeName === "light") {
+	if (
+		!currentThemeName ||
+		currentThemeName === "dark" ||
+		currentThemeName === "light" ||
+		currentThemeName === "universal"
+	) {
 		return;
 	}
 
@@ -769,8 +761,8 @@ function startThemeWatcher(): void {
 				// File was deleted or renamed - fall back to default theme
 				setTimeout(() => {
 					if (!fs.existsSync(themeFile)) {
-						currentThemeName = "dark";
-						setGlobalTheme(loadTheme("dark"));
+						currentThemeName = "universal";
+						setGlobalTheme(loadTheme("universal"));
 						if (themeWatcher) {
 							themeWatcher.close();
 							themeWatcher = undefined;

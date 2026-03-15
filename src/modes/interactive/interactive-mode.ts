@@ -64,7 +64,12 @@ import {
 	isValidProfileName,
 	type AgentProfileName,
 } from "../../core/agent-profiles.js";
-import { type AgentSession, type AgentSessionEvent, parseSkillBlock } from "../../core/agent-session.js";
+import {
+	type AgentSession,
+	type AgentSessionEvent,
+	type PromptOptions,
+	parseSkillBlock,
+} from "../../core/agent-session.js";
 import type { CompactionResult } from "../../core/compaction/index.js";
 import type {
 	ExtensionContext,
@@ -331,6 +336,262 @@ function extractTaskToolErrorText(result: unknown): string | undefined {
 	if (typeof candidate.error === "string" && candidate.error.trim()) return candidate.error.trim();
 	if (typeof candidate.output === "string" && candidate.output.trim()) return candidate.output.trim();
 	return undefined;
+}
+
+type RawToolProtocolIssue = {
+	hasToolCallMarkup: boolean;
+	hasDelegateTaskMarkup: boolean;
+};
+
+type AssistantResumeReason = "interrupted_error" | "user_aborted";
+
+type RawToolRepairReason = "raw_markup" | "silent_stop";
+const MAX_TOOL_PROTOCOL_REPAIR_ATTEMPTS = 2;
+const MAX_ASSISTANT_CONTINUATION_PROMPTS_PER_TURN = 1;
+
+type AssistantContinuationDecision =
+	| { action: "resume"; promptText: string }
+	| { action: "repeat_request"; promptText: string }
+	| { action: "stay" }
+	| { action: "new_session" };
+
+function extractAssistantProtocolText(message: AssistantMessage): string {
+	const parts: string[] = [];
+	for (const content of message.content) {
+		if (content.type === "text" && typeof content.text === "string" && content.text.trim()) {
+			parts.push(content.text.trim());
+			continue;
+		}
+		if (content.type !== "thinking") continue;
+		const record = content as unknown as Record<string, unknown>;
+		const thinking = record.thinking;
+		if (typeof thinking === "string" && thinking.trim()) {
+			parts.push(thinking.trim());
+		}
+	}
+	return parts.join("\n\n").trim();
+}
+
+function extractAssistantVisibleText(message: AssistantMessage): string {
+	return message.content
+		.filter((content): content is { type: "text"; text: string } => content.type === "text")
+		.map((content) => content.text.trim())
+		.filter((text) => text.length > 0)
+		.join("\n\n")
+		.trim();
+}
+
+function isNonActionableVisibleAssistantText(text: string): boolean {
+	const trimmed = text.trim();
+	if (trimmed.length === 0) return true;
+	return /^\[\s*output\s+truncated[^\]]*\]?\s*\.?$/i.test(trimmed);
+}
+
+function detectRawToolProtocolIssue(text: string): RawToolProtocolIssue | undefined {
+	const trimmed = text.trim();
+	if (!trimmed) return undefined;
+
+	const hasToolCallOpenBlock = /(^|\n)\s*<\s*tool_call\b/i.test(trimmed);
+	const hasToolCallCloseTag = /<\/\s*tool_call\s*>/i.test(trimmed);
+	const hasFunctionBlock = /(^|\n)\s*<\s*function\s*=\s*[A-Za-z0-9._:-]+/i.test(trimmed);
+	const hasParameterBlock = /(^|\n)\s*<\s*parameter\s*=\s*[A-Za-z0-9._:-]+\s*>/i.test(trimmed);
+	// Treat markup as protocol issue only when it resembles an executable pseudo-call structure.
+	// Plain inline mentions like "raw <tool_call>/<function=...> markup" should not trigger repair.
+	const hasToolCallMarkup =
+		(hasToolCallOpenBlock && (hasToolCallCloseTag || hasFunctionBlock || hasParameterBlock)) ||
+		(hasFunctionBlock && hasParameterBlock);
+	const hasDelegateTaskMarkup = /<\s*delegate_task\b/i.test(trimmed) && /<\/\s*delegate_task\s*>/i.test(trimmed);
+
+	if (!hasToolCallMarkup && !hasDelegateTaskMarkup) {
+		return undefined;
+	}
+
+	return {
+		hasToolCallMarkup,
+		hasDelegateTaskMarkup,
+	};
+}
+
+function detectAssistantResumeReason(message: AssistantMessage): AssistantResumeReason | undefined {
+	if (message.stopReason === "aborted") return "user_aborted";
+	if (message.stopReason === "error") return "interrupted_error";
+
+	return undefined;
+}
+
+function buildAssistantResumePrompt(input: { reason: AssistantResumeReason; originalPrompt: string }): string {
+	const originalPrompt = input.originalPrompt.trim();
+	const boundedOriginalPrompt =
+		originalPrompt.length > 2_000 ? `${originalPrompt.slice(0, 2_000).trimEnd()}...` : originalPrompt;
+	const reasonLine =
+		input.reason === "user_aborted"
+			? "Previous assistant turn was cancelled before completion."
+			: "Previous assistant turn ended with a tool/model interruption before completion.";
+
+	return [
+		"[ASSISTANT_RESUME_REQUEST]",
+		reasonLine,
+		"Continue the same user request from current in-memory state.",
+		"Do not repeat completed steps unless required.",
+		"Use only real structured tool calls when tools are needed.",
+		"Do not emit pseudo XML-like tool markup.",
+		"<original_user_request>",
+		boundedOriginalPrompt,
+		"</original_user_request>",
+		"[/ASSISTANT_RESUME_REQUEST]",
+	].join("\n");
+}
+
+function buildAssistantContinuationSelectorTitle(reason: AssistantResumeReason): string {
+	if (reason === "user_aborted") {
+		return "You stopped the current run.\nChoose what to do next:";
+	}
+	return "Tool invocation failed on the model side.\nChoose what to do next:";
+}
+
+function buildRawToolProtocolCorrectionPrompt(input: {
+	originalPrompt: string;
+	issue: RawToolProtocolIssue;
+	hasPriorToolActivity?: boolean;
+}): string {
+	const reasons = [
+		input.issue.hasToolCallMarkup ? "raw <tool_call>/<function=...> markup" : undefined,
+		input.issue.hasDelegateTaskMarkup ? "raw <delegate_task> blocks" : undefined,
+	].filter((item): item is string => typeof item === "string");
+	const originalPrompt = input.originalPrompt.trim();
+	const boundedOriginalPrompt =
+		originalPrompt.length > 2_000 ? `${originalPrompt.slice(0, 2_000).trimEnd()}...` : originalPrompt;
+
+	return [
+		"[TOOL_PROTOCOL_CORRECTION]",
+		`Previous assistant output included ${reasons.join(" and ")} in plain text.`,
+		"These XML-like blocks are not executable tool calls and are ignored by the runtime.",
+		"Retry now and follow this protocol exactly:",
+		"1) Do not output XML/pseudo-call tags (<tool_call>, <function=...>, <delegate_task>).",
+		"2) If a tool is needed, emit real structured tool calls only.",
+		"3) Prefer structured built-ins (db_run, typecheck_run, test_run, lint_run) when applicable.",
+		"4) If no tool is needed, return a normal direct answer.",
+		input.hasPriorToolActivity
+			? "5) Continue from the current in-memory state; avoid repeating already completed tool steps unless necessary."
+			: undefined,
+		"Execute the original user request now.",
+		"<original_user_request>",
+		boundedOriginalPrompt,
+		"</original_user_request>",
+		"[/TOOL_PROTOCOL_CORRECTION]",
+	]
+		.filter((line): line is string => typeof line === "string")
+		.join("\n");
+}
+
+function buildRawToolSilentStopRecoveryPrompt(input: {
+	originalPrompt: string;
+	hasPriorToolActivity?: boolean;
+}): string {
+	const originalPrompt = input.originalPrompt.trim();
+	const boundedOriginalPrompt =
+		originalPrompt.length > 2_000 ? `${originalPrompt.slice(0, 2_000).trimEnd()}...` : originalPrompt;
+	return [
+		"[ASSISTANT_STALL_RECOVERY]",
+		"Previous assistant output ended with stop but produced no visible text and no executable tool calls.",
+		"Retry now and continue the same request.",
+		"1) Do not return an empty response.",
+		"2) If a tool is needed, emit real structured tool calls.",
+		"3) If no tool is needed, return a normal direct answer.",
+		input.hasPriorToolActivity
+			? "4) Continue from the current in-memory state; avoid repeating already completed tool steps unless necessary."
+			: undefined,
+		"Execute the original user request now.",
+		"<original_user_request>",
+		boundedOriginalPrompt,
+		"</original_user_request>",
+		"[/ASSISTANT_STALL_RECOVERY]",
+	]
+		.filter((line): line is string => typeof line === "string")
+		.join("\n");
+}
+
+async function promptWithRawToolProtocolRepair(input: {
+	session: Pick<AgentSession, "prompt"> & Partial<Pick<AgentSession, "subscribe">>;
+	promptText: string;
+	promptOptions?: PromptOptions;
+	onRepairApplied?: (reason: RawToolRepairReason) => void;
+	onRepairExhausted?: (reason: RawToolRepairReason) => Promise<void> | void;
+}): Promise<void> {
+	let currentPrompt = input.promptText;
+	let currentOptions: PromptOptions = {
+		...(input.promptOptions ?? {}),
+		skipProtocolAutoRepair: true,
+	};
+
+	for (let repairAttempt = 0; repairAttempt <= MAX_TOOL_PROTOCOL_REPAIR_ATTEMPTS; repairAttempt += 1) {
+		let toolCallsStarted = 0;
+		let latestAssistantProtocolText = "";
+		let latestAssistantStopReason: string | undefined;
+		let latestAssistantVisibleText = "";
+		let latestAssistantHasInlineToolCalls = false;
+		const unsubscribe =
+			typeof input.session.subscribe === "function"
+				? input.session.subscribe((event: AgentSessionEvent) => {
+						if (event.type === "tool_execution_start") {
+							toolCallsStarted += 1;
+							return;
+						}
+						if (event.type === "message_end" && event.message.role === "assistant") {
+							latestAssistantStopReason = event.message.stopReason;
+							const assistantMessage = event.message as AssistantMessage;
+							latestAssistantProtocolText = extractAssistantProtocolText(assistantMessage);
+							latestAssistantVisibleText = extractAssistantVisibleText(assistantMessage);
+							latestAssistantHasInlineToolCalls = assistantMessage.content.some(
+								(part) => part.type === "toolCall",
+							);
+						}
+					})
+				: undefined;
+
+		try {
+			await input.session.prompt(currentPrompt, currentOptions);
+		} finally {
+			unsubscribe?.();
+		}
+
+		const issue = detectRawToolProtocolIssue(latestAssistantProtocolText);
+		const silentStopWithoutOutput =
+			!issue &&
+			latestAssistantStopReason === "stop" &&
+			!latestAssistantHasInlineToolCalls &&
+			isNonActionableVisibleAssistantText(latestAssistantVisibleText);
+
+		if (!issue && !silentStopWithoutOutput) {
+			return;
+		}
+		if (repairAttempt >= MAX_TOOL_PROTOCOL_REPAIR_ATTEMPTS) {
+			await input.onRepairExhausted?.(issue ? "raw_markup" : "silent_stop");
+			return;
+		}
+
+		const hasPriorToolActivity = toolCallsStarted > 0 || repairAttempt > 0;
+		if (issue) {
+			input.onRepairApplied?.("raw_markup");
+			currentPrompt = buildRawToolProtocolCorrectionPrompt({
+				originalPrompt: input.promptText,
+				issue,
+				hasPriorToolActivity,
+			});
+		} else {
+			input.onRepairApplied?.("silent_stop");
+			currentPrompt = buildRawToolSilentStopRecoveryPrompt({
+				originalPrompt: input.promptText,
+				hasPriorToolActivity,
+			});
+		}
+		currentOptions = {
+			expandPromptTemplates: false,
+			skipOrchestrationDirective: true,
+			skipProtocolAutoRepair: true,
+			source: "interactive",
+		};
+	}
 }
 
 function buildMetaParallelismCorrection(input: {
@@ -769,6 +1030,81 @@ const DOCTOR_CLI_TOOL_SPECS: DoctorCliToolSpec[] = [
 		tool: "semgrep",
 		candidates: ["semgrep"],
 		hint: "Install semgrep (pipx install semgrep or pip install semgrep).",
+	},
+	{
+		tool: "vitest",
+		candidates: ["vitest"],
+		hint: "Install vitest (npm/pnpm/yarn add -D vitest).",
+	},
+	{
+		tool: "jest",
+		candidates: ["jest"],
+		hint: "Install jest (npm/pnpm/yarn add -D jest).",
+	},
+	{
+		tool: "pytest",
+		candidates: ["python3", "pytest"],
+		hint: "Install pytest (python3 -m pip install pytest or pipx install pytest).",
+	},
+	{
+		tool: "eslint",
+		candidates: ["eslint"],
+		hint: "Install eslint (npm/pnpm/yarn add -D eslint).",
+	},
+	{
+		tool: "prettier",
+		candidates: ["prettier"],
+		hint: "Install prettier (npm/pnpm/yarn add -D prettier).",
+	},
+	{
+		tool: "stylelint",
+		candidates: ["stylelint"],
+		hint: "Install stylelint (npm/pnpm/yarn add -D stylelint).",
+	},
+	{
+		tool: "tsc",
+		candidates: ["tsc"],
+		hint: "Install TypeScript compiler (npm/pnpm/yarn add -D typescript).",
+	},
+	{
+		tool: "vue_tsc",
+		candidates: ["vue-tsc"],
+		hint: "Install vue-tsc (npm/pnpm/yarn add -D vue-tsc).",
+	},
+	{
+		tool: "pyright",
+		candidates: ["pyright"],
+		hint: "Install pyright (npm i -D pyright or pipx install pyright).",
+	},
+	{
+		tool: "mypy",
+		candidates: ["mypy", "python3"],
+		hint: "Install mypy (python3 -m pip install mypy or pipx install mypy).",
+	},
+	{
+		tool: "psql",
+		candidates: ["psql"],
+		hint: "Install PostgreSQL CLI (psql).",
+	},
+	{
+		tool: "mysql",
+		candidates: ["mysql"],
+		hint: "Install MySQL CLI client (mysql).",
+	},
+	{
+		tool: "sqlite3",
+		candidates: ["sqlite3"],
+		hint: "Install sqlite3 CLI.",
+	},
+	{
+		tool: "mongosh",
+		candidates: ["mongosh"],
+		hint: "Install MongoDB shell (mongosh).",
+	},
+	{
+		tool: "redis-cli",
+		candidates: ["redis-cli"],
+		hint: "Install Redis CLI (redis-cli).",
 	},
 	{
 		tool: "sed",
@@ -2428,7 +2764,28 @@ export class InteractiveMode {
 		while (true) {
 			const userInput = await this.getUserInput();
 			try {
-				await this.promptWithTaskFallback(userInput);
+				let promptText = userInput;
+				let continuationPrompts = 0;
+				while (true) {
+					const turnStartMessageCount = this.session.messages.length;
+					await this.promptWithTaskFallback(promptText);
+					if (continuationPrompts >= MAX_ASSISTANT_CONTINUATION_PROMPTS_PER_TURN) {
+						break;
+					}
+					const continuationDecision = await this.maybeRequestAgentContinuation(
+						userInput,
+						turnStartMessageCount,
+					);
+					if (!continuationDecision || continuationDecision.action === "stay") {
+						break;
+					}
+					if (continuationDecision.action === "new_session") {
+						await this.handleClearCommand();
+						break;
+					}
+					continuationPrompts += 1;
+					promptText = continuationDecision.promptText;
+				}
 			} catch (error: unknown) {
 				const errorMessage = error instanceof Error ? error.message : "Unknown error occurred";
 				this.showError(errorMessage);
@@ -6490,7 +6847,7 @@ export class InteractiveMode {
 					transport: this.settingsManager.getTransport(),
 					thinkingLevel: this.session.thinkingLevel,
 					availableThinkingLevels: this.session.getAvailableThinkingLevels(),
-					currentTheme: this.settingsManager.getTheme() || "dark",
+					currentTheme: this.settingsManager.getTheme() || "universal",
 					availableThemes: getAvailableThemes(),
 					hideThinkingBlock: this.hideThinkingBlock,
 					collapseChangelog: this.settingsManager.getCollapseChangelog(),
@@ -6669,7 +7026,7 @@ export class InteractiveMode {
 						this.settingsManager.setTheme(themeName);
 						this.ui.invalidate();
 						if (!result.success) {
-							this.showError(`Failed to load theme "${themeName}": ${result.error}\nFell back to dark theme.`);
+							this.showError(`Failed to load theme "${themeName}": ${result.error}\nFell back to universal theme.`);
 						}
 					},
 					onThemePreview: (themeName) => {
@@ -10413,7 +10770,10 @@ export class InteractiveMode {
 		const mcpConnected = mcpStatuses.filter((status) => status.state === "connected").length;
 		const mcpErrored = mcpStatuses.filter((status) => status.state === "error").length;
 		const mcpDisabled = mcpStatuses.filter((status) => !status.enabled).length;
-		const cliToolStatuses = resolveDoctorCliToolStatuses();
+		const resolveCliToolStatuses =
+			(this as { resolveDoctorCliToolStatuses?: () => DoctorCliToolStatus[] }).resolveDoctorCliToolStatuses ??
+			resolveDoctorCliToolStatuses;
+		const cliToolStatuses = resolveCliToolStatuses();
 		const missingCliTools = cliToolStatuses.filter((status) => !status.available).map((status) => status.tool);
 		let semanticStatus: SemanticStatusResult | undefined;
 		let semanticStatusError: string | undefined;
@@ -10960,6 +11320,48 @@ export class InteractiveMode {
 			});
 	}
 
+	private async maybeRequestAgentContinuation(
+		originalUserInput: string,
+		turnStartMessageCount: number,
+	): Promise<AssistantContinuationDecision | undefined> {
+		const recentAssistant = this.session.messages
+			.slice(turnStartMessageCount)
+			.reverse()
+			.find((message): message is AssistantMessage => message.role === "assistant");
+		if (!recentAssistant) {
+			return undefined;
+		}
+
+		const resumeReason = detectAssistantResumeReason(recentAssistant);
+		if (!resumeReason) {
+			return undefined;
+		}
+
+		const selected = await this.showExtensionSelector(buildAssistantContinuationSelectorTitle(resumeReason), [
+			"1. Yes, continue agent work",
+			"2. Repeat my original request",
+			"3. No, keep this session",
+			"4. Start a new session",
+		]);
+		if (selected === "4. Start a new session") {
+			return { action: "new_session" };
+		}
+		if (selected === "2. Repeat my original request") {
+			return { action: "repeat_request", promptText: originalUserInput };
+		}
+		if (selected !== "1. Yes, continue agent work") {
+			return { action: "stay" };
+		}
+
+		return {
+			action: "resume",
+			promptText: buildAssistantResumePrompt({
+				reason: resumeReason,
+				originalPrompt: originalUserInput,
+			}),
+		};
+	}
+
 	private sanitizeAssistantDisplayMessage(message: AssistantMessage): AssistantMessage {
 		const hideAllTextForOrchestration = this.activeAssistantOrchestrationContext;
 		let changed = false;
@@ -11005,7 +11407,184 @@ export class InteractiveMode {
 		);
 	}
 
+	private async showProtocolRepairRecoverySelector(
+		reason: RawToolRepairReason,
+	): Promise<"retry_now" | "repeat_original" | "switch_model_retry" | "keep_session"> {
+		const title =
+			reason === "silent_stop"
+				? "Model returned empty/non-actionable responses after auto-repair.\nChoose what to do next:"
+				: "Model emitted pseudo tool-call markup after auto-repair.\nChoose what to do next:";
+		const retryNow = "1. Retry now (Recommended)";
+		const repeatOriginal = "2. Repeat original request";
+		const switchModel = "3. Switch model and retry";
+		const keepSession = "4. Keep session";
+		const selected = await this.showExtensionSelector(title, [retryNow, repeatOriginal, switchModel, keepSession]);
+		if (!selected || selected === keepSession) return "keep_session";
+		if (selected === repeatOriginal) return "repeat_original";
+		if (selected === switchModel) return "switch_model_retry";
+		return "retry_now";
+	}
+
+	private async showModelSelectorForImmediateRetry(
+		initialSearchInput?: string,
+		providerFilter?: string,
+	): Promise<Model<any> | undefined> {
+		return await new Promise((resolve) => {
+			let settled = false;
+			const settle = (model?: Model<any>): void => {
+				if (settled) return;
+				settled = true;
+				resolve(model);
+			};
+
+			this.showSelector((done) => {
+				const selector = new ModelSelectorComponent(
+					this.ui,
+					this.session.model,
+					this.settingsManager,
+					this.session.modelRegistry,
+					this.session.scopedModels,
+					async (model) => {
+						try {
+							await this.session.setModel(model);
+							this.footer.invalidate();
+							this.updateEditorBorderColor();
+							this.refreshBuiltInHeader();
+							done();
+							this.showStatus(`Model: ${model.provider}/${model.id}`);
+							this.checkDaxnutsEasterEgg(model);
+							settle(model);
+						} catch (error) {
+							done();
+							this.showError(error instanceof Error ? error.message : String(error));
+							settle(undefined);
+						}
+					},
+					() => {
+						done();
+						this.ui.requestRender();
+						settle(undefined);
+					},
+					initialSearchInput,
+					providerFilter,
+				);
+				return { component: selector, focus: selector };
+			});
+		});
+	}
+
+	private async selectModelForImmediateRetry(preferredProvider?: string): Promise<Model<any> | undefined> {
+		await this.hydrateMissingProviderModelsForSavedAuth();
+		this.session.modelRegistry.refresh();
+		let models: Model<any>[] = [];
+		try {
+			models = await this.session.modelRegistry.getAvailable();
+		} catch {
+			models = [];
+		}
+		if (models.length === 0) {
+			this.showStatus("No models available");
+			return undefined;
+		}
+
+		const providerCounts = new Map<string, number>();
+		for (const model of models) {
+			providerCounts.set(model.provider, (providerCounts.get(model.provider) ?? 0) + 1);
+		}
+		const providers = Array.from(providerCounts.entries()).sort(([a], [b]) => a.localeCompare(b));
+		if (providers.length === 0) {
+			this.showStatus("No providers available");
+			return undefined;
+		}
+
+		if (preferredProvider) {
+			const preferred = providers.find(([provider]) => provider.toLowerCase() === preferredProvider.toLowerCase());
+			if (preferred) {
+				return await this.showModelSelectorForImmediateRetry(undefined, preferred[0]);
+			}
+		}
+
+		if (providers.length === 1) {
+			return await this.showModelSelectorForImmediateRetry(undefined, providers[0]?.[0]);
+		}
+
+		const optionMap = new Map<string, string>();
+		const options = ["All providers"];
+		for (const [provider, count] of providers) {
+			const optionLabel = `${provider} (${count})`;
+			optionMap.set(optionLabel, provider);
+			options.push(optionLabel);
+		}
+
+		const selected = await this.showExtensionSelector("/model: choose provider for retry", options);
+		if (!selected) return undefined;
+		if (selected === "All providers") {
+			return await this.showModelSelectorForImmediateRetry();
+		}
+
+		const provider = optionMap.get(selected);
+		if (!provider) {
+			this.showWarning("Provider selection is no longer available.");
+			return undefined;
+		}
+		return await this.showModelSelectorForImmediateRetry(undefined, provider);
+	}
+
 	private async promptWithTaskFallback(userInput: string): Promise<void> {
+		const handleProtocolRepairApplied = (reason: RawToolRepairReason): void => {
+			const showWarning = (this as { showWarning?: (message: string) => void }).showWarning;
+			if (typeof showWarning === "function") {
+				const message =
+					reason === "silent_stop"
+						? "Protocol auto-repair: model returned an empty stop response; retrying once."
+						: "Protocol auto-repair: model emitted raw tool-call markup; retrying once.";
+					showWarning.call(this, message);
+			}
+		};
+		const runPromptWithProtocolRecovery = async (promptText: string, promptOptions?: PromptOptions): Promise<void> => {
+			let nextPrompt = promptText;
+			let nextOptions = promptOptions;
+
+			for (let recoveryAttempt = 0; recoveryAttempt < 3; recoveryAttempt += 1) {
+				let exhaustedReason: RawToolRepairReason | undefined;
+				await promptWithRawToolProtocolRepair({
+					session: this.session,
+					promptText: nextPrompt,
+					promptOptions: nextOptions,
+					onRepairApplied: handleProtocolRepairApplied,
+					onRepairExhausted: async (reason) => {
+						exhaustedReason = reason;
+					},
+				});
+
+				if (!exhaustedReason) {
+					return;
+				}
+
+				const selectedAction = await this.showProtocolRepairRecoverySelector(exhaustedReason);
+				if (selectedAction === "keep_session") {
+					return;
+				}
+				if (selectedAction === "repeat_original") {
+					nextPrompt = userInput;
+					nextOptions = undefined;
+					continue;
+				}
+				if (selectedAction === "switch_model_retry") {
+					const selectedModel = await this.selectModelForImmediateRetry();
+					if (!selectedModel) {
+						return;
+					}
+					continue;
+				}
+				// retry_now: rerun current prompt/options
+			}
+
+			this.showWarning(
+				"Protocol auto-repair exhausted repeatedly. Keep session as-is and retry with a different model or a simpler prompt.",
+			);
+		};
+
 		const mentionedAgent = this.resolveMentionedAgent(userInput);
 		if (mentionedAgent) {
 			const cleaned = userInput.replace(/(?:^|\s)@[^\s]+/g, " ").trim();
@@ -11031,13 +11610,13 @@ export class InteractiveMode {
 						"Answer normally and concisely in plain language. Do not run task tool for this query.",
 						"</agent_capability_query>",
 					].join("\n");
-					await this.session.prompt(capabilityPrompt, {
-						expandPromptTemplates: false,
-						source: "interactive",
-					});
-					return;
+						await runPromptWithProtocolRecovery(capabilityPrompt, {
+							expandPromptTemplates: false,
+							source: "interactive",
+						});
+						return;
+					}
 				}
-			}
 			const mentionTask = cleaned.length > 0 ? cleaned : userInput;
 			const orchestrationAwareAgent = /orchestrator/i.test(mentionedAgent);
 			const mentionMode: OrchestrationMode = orchestrationAwareAgent ? "parallel" : "sequential";
@@ -11062,12 +11641,12 @@ export class InteractiveMode {
 					: []),
 				"</orchestrate>",
 			].join("\n");
-			await this.session.prompt(mentionPrompt, {
-				expandPromptTemplates: false,
-				source: "interactive",
-			});
-			return;
-		}
+				await runPromptWithProtocolRecovery(mentionPrompt, {
+					expandPromptTemplates: false,
+					source: "interactive",
+				});
+				return;
+			}
 		if (this.activeProfileName === "meta") {
 			await promptMetaWithParallelismGuard({
 				session: this.session,
@@ -11106,7 +11685,7 @@ export class InteractiveMode {
 			});
 			return;
 		}
-		await this.session.prompt(userInput);
+		await runPromptWithProtocolRecovery(userInput);
 	}
 
 	private createIosmVerificationEventBridge(options?: {
@@ -15231,7 +15810,7 @@ The agent will automatically receive IOSM context on every turn.`;
 			const themeName = this.settingsManager.getTheme();
 			const themeResult = themeName ? setTheme(themeName, true) : { success: true };
 			if (!themeResult.success) {
-				this.showError(`Failed to load theme "${themeName}": ${themeResult.error}\nFell back to dark theme.`);
+				this.showError(`Failed to load theme "${themeName}": ${themeResult.error}\nFell back to universal theme.`);
 			}
 			const editorPaddingX = this.settingsManager.getEditorPaddingX();
 			const autocompleteMaxVisible = this.settingsManager.getAutocompleteMaxVisible();

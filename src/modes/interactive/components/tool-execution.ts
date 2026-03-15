@@ -25,6 +25,8 @@ import { truncateToVisualLines } from "./visual-truncate.js";
 
 // Preview line limit for bash when not expanded
 const BASH_PREVIEW_LINES = 5;
+const TOOL_BOX_PADDING_X = 2;
+const TOOL_BOX_PADDING_Y = 1;
 // During partial write tool-call streaming, re-highlight the first N lines fully
 // to keep multiline tokenization mostly correct without re-highlighting the full file.
 const WRITE_PARTIAL_FULL_HIGHLIGHT_LINES = 50;
@@ -65,6 +67,10 @@ function str(value: unknown): string | null {
 
 type ToolRenderState = "pending" | "success" | "error";
 
+function hasAnsiEscape(input: string): boolean {
+	return /\x1b\[[0-9;]*m/.test(input);
+}
+
 function toolBadge(label: string, state: ToolRenderState): string {
 	const color = state === "error" ? "error" : state === "success" ? "accent" : "muted";
 	return theme.fg("dim", "[") + theme.fg(color, label) + theme.fg("dim", "]");
@@ -73,7 +79,9 @@ function toolBadge(label: string, state: ToolRenderState): string {
 function toolHeader(label: string, subject: string, state: ToolRenderState, meta?: string): string {
 	const nestColor = state === "error" ? "error" : state === "success" ? "accent" : "dim";
 	const parts = [toolBadge(label, state)];
-	if (subject) parts.push(subject);
+	if (subject) {
+		parts.push(hasAnsiEscape(subject) ? subject : theme.fg("toolTitle", subject));
+	}
 	if (meta) parts.push(theme.fg("muted", meta));
 	return theme.fg(nestColor, "\u23BF ") + parts.join(" ");
 }
@@ -145,8 +153,10 @@ export class ToolExecutionComponent extends Container {
 		this.addChild(new Spacer(1));
 
 		// Always create both - contentBox for custom tools/bash, contentText for other built-ins
-		this.contentBox = new Box(1, 1, (text: string) => theme.bg("toolPendingBg", text));
-		this.contentText = new Text("", 1, 1, (text: string) => theme.bg("toolPendingBg", text));
+		this.contentBox = new Box(TOOL_BOX_PADDING_X, TOOL_BOX_PADDING_Y, (text: string) => theme.bg("toolPendingBg", text));
+		this.contentText = new Text("", TOOL_BOX_PADDING_X, TOOL_BOX_PADDING_Y, (text: string) =>
+			theme.bg("toolPendingBg", text),
+		);
 
 		// Use contentBox for bash (visual truncation) or custom tools with custom renderers
 		// Use contentText for built-in tools (including overrides without custom renderers)
@@ -421,6 +431,7 @@ export class ToolExecutionComponent extends Container {
 			// Custom tools use Box for flexible component rendering
 			this.contentBox.setBgFn(bgFn);
 			this.contentBox.clear();
+			let customCallSectionRendered = false;
 
 			// Render call component
 			if (this.toolDefinition.renderCall) {
@@ -429,17 +440,26 @@ export class ToolExecutionComponent extends Container {
 					if (callComponent !== undefined) {
 						this.contentBox.addChild(callComponent);
 						customRendererHasContent = true;
+						customCallSectionRendered = true;
 					}
 				} catch {
 					// Fall back to default on error
 					this.contentBox.addChild(new Text(theme.fg("toolTitle", theme.bold(this.toolName)), 0, 0));
 					customRendererHasContent = true;
+					customCallSectionRendered = true;
 				}
 			} else {
 				// No custom renderCall, show tool name
 				this.contentBox.addChild(new Text(theme.fg("toolTitle", theme.bold(this.toolName)), 0, 0));
 				customRendererHasContent = true;
+				customCallSectionRendered = true;
 			}
+
+			const addSectionSpacer = (): void => {
+				if (customCallSectionRendered) {
+					this.contentBox.addChild(new Spacer(1));
+				}
+			};
 
 			// Render result component if we have a result
 			if (this.result && this.toolDefinition.renderResult) {
@@ -450,6 +470,7 @@ export class ToolExecutionComponent extends Container {
 						theme,
 					);
 					if (resultComponent !== undefined) {
+						addSectionSpacer();
 						this.contentBox.addChild(resultComponent);
 						customRendererHasContent = true;
 					}
@@ -457,6 +478,7 @@ export class ToolExecutionComponent extends Container {
 					// Fall back to showing raw output on error
 					const output = this.getTextOutput();
 					if (output) {
+						addSectionSpacer();
 						this.contentBox.addChild(new Text(theme.fg("toolOutput", output), 0, 0));
 						customRendererHasContent = true;
 					}
@@ -465,6 +487,7 @@ export class ToolExecutionComponent extends Container {
 				// Has result but no custom renderResult
 				const output = this.getTextOutput();
 				if (output) {
+					addSectionSpacer();
 					this.contentBox.addChild(new Text(theme.fg("toolOutput", output), 0, 0));
 					customRendererHasContent = true;
 				}
@@ -886,7 +909,9 @@ export class ToolExecutionComponent extends Container {
 			const rawPath = str(this.args?.path);
 			const shortPath = rawPath !== null ? shortenPath(rawPath || ".") : null;
 			const pathLabel = shortPath === null ? "[invalid arg]" : shortPath || ".";
-			const subject = `${patternLabel} ${theme.fg("muted", "in")} ${shortPath === null ? invalidArg : theme.fg("accent", pathLabel)}`;
+			const subject = `${theme.fg("toolTitle", patternLabel)} ${theme.fg("muted", "in")} ${
+				shortPath === null ? invalidArg : theme.fg("accent", pathLabel)
+			}`;
 
 			if (this.isPartial) {
 				text = toolHeader("find", subject, "pending");
@@ -991,10 +1016,10 @@ export class ToolExecutionComponent extends Container {
 			text = theme.fg("toolTitle", theme.bold(this.toolName));
 
 			const content = JSON.stringify(this.args, null, 2);
-			text += `\n\n${content}`;
+			text += `\n\n${theme.fg("toolOutput", content)}`;
 			const output = this.getTextOutput();
 			if (output) {
-				text += `\n${output}`;
+				text += `\n${theme.fg("toolOutput", output)}`;
 			}
 		}
 

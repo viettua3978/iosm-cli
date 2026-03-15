@@ -5,6 +5,8 @@ import type { MessageRenderer } from "../../../core/extensions/types.js";
 import type { CustomMessage } from "../../../core/messages.js";
 import { getMarkdownTheme, theme } from "../theme/theme.js";
 
+const MESSAGE_BOX_PADDING_X = 2;
+
 /**
  * Component that renders a custom message entry from extensions.
  * Uses distinct styling to differentiate from user messages.
@@ -30,7 +32,7 @@ export class CustomMessageComponent extends Container {
 		this.addChild(new Spacer(1));
 
 		// Create box with purple background (used for default rendering)
-		this.box = new Box(1, 1, (t) => theme.bg("customMessageBg", t));
+		this.box = new Box(MESSAGE_BOX_PADDING_X, 1, (t) => theme.bg("customMessageBg", t));
 
 		this.rebuild();
 	}

@@ -36,5 +36,9 @@ describe("createAgentSession default profile tools", () => {
 		expect(active).toContain("git_read");
 		expect(active).toContain("git_write");
 		expect(active).toContain("fs_ops");
+		expect(active).toContain("test_run");
+		expect(active).toContain("lint_run");
+		expect(active).toContain("typecheck_run");
+		expect(active).toContain("db_run");
 	});
 });

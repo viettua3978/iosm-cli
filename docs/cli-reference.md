@@ -257,7 +257,7 @@ iosm --api-key sk-test-123           # Override for this run
 
 ### Available Tools
 
-`read`, `bash`, `edit`, `write`, `grep`, `find`, `ls`, `rg`, `fd`, `ast_grep`, `comby`, `jq`, `yq`, `semgrep`, `sed`, `semantic_search`, `fetch`, `web_search`, `git_read`, `git_write`, `fs_ops`, `todo_read`, `todo_write`
+`read`, `bash`, `edit`, `write`, `grep`, `find`, `ls`, `rg`, `fd`, `ast_grep`, `comby`, `jq`, `yq`, `semgrep`, `sed`, `semantic_search`, `fetch`, `web_search`, `git_read`, `git_write`, `fs_ops`, `test_run`, `lint_run`, `typecheck_run`, `db_run`, `todo_read`, `todo_write`
 
 Tool notes:
 - `rg`, `fd` are managed by iosm-cli and auto-resolved when missing.
@@ -270,7 +270,20 @@ Tool notes:
 - `git_read` provides structured read-only git actions (`status`, `diff`, `log`, `blame`, `show`, `branch_list`, `remote_list`, `rev_parse`) without raw shell passthrough.
 - `git_write` provides structured git write actions (`add`, `restore`, `reset_index`, `commit`, `switch`, `branch_create`, `fetch`, `pull`, `push`, `stash_*`) with action-specific validation and no raw passthrough. Network actions require enabling GitHub tools network access in settings.
 - `fs_ops` performs structured filesystem mutations (`mkdir`, `move`, `copy`, `delete`) with explicit `recursive`/`force` safety flags.
+- `test_run` executes tests with runner auto-detection (`package.json` test script -> vitest config -> jest config -> python pytest markers) and normalized statuses (`passed`, `failed`, `no_tests`, `error`).
+- `lint_run` executes linters with runner auto-detection (`lint`/`lint:fix` script -> eslint/stylelint/prettier configs), with explicit `mode=check|fix`.
+- `typecheck_run` executes type checks with runner auto-detection across package scripts, `tsc`/`vue-tsc`, `pyright`, `mypy`; `runner=auto` aggregates all detected checks in one call.
+- `db_run` executes structured DB actions (`query`, `exec`, `schema`, `migrate`, `explain`) against named settings profiles (`dbTools.connections`) with read-first safety.
 - `todo_read` / `todo_write` provide persistent task-state tracking for multi-step work in the current workspace.
+
+`db_run` setup checklist:
+- Install the adapter CLI used by your profile: `sqlite3` (SQLite), `psql` (Postgres), `mysql` (MySQL), `mongosh` (MongoDB), `redis-cli` (Redis). Use `/doctor` to verify toolchain availability.
+- Define named profiles in `.iosm/settings.json` under `dbTools.connections`.
+- For `sqlite`, set `sqlitePath`.
+- For network adapters (`postgres`, `mysql`, `mongodb`, `redis`), set `dsnEnv` and export the DSN in your shell environment.
+- Use `connection` as a profile name (for example `"main"`), not a database file path or raw DSN.
+- If you edited `.iosm/settings.json` while a session is already running, run `/reload` (or restart session) before retrying `db_run`.
+- No separate `db-tools` npm package is required for `db_run`; it is a built-in tool in iosm-cli.
 
 Best-practice patterns:
 - Git analysis: `git_read status` -> targeted `git_read diff/log/blame/show` on the exact files/refs you need.
@@ -279,6 +292,8 @@ Best-practice patterns:
 - For API endpoints via `fetch`, prefer `response_format=json`; for HTML/text pages use `response_format=text` (or `auto`) and tune `max_bytes`/`timeout` to keep output usable.
 - File exploration: use bounded reads/searches (`path`, `glob`, `context`, `limit`); for large files, page with `read` using `offset`/`limit` instead of dumping whole files.
 - File mutation: prefer `edit` for surgical changes and `write` for full rewrites; use `fs_ops` for `mkdir/move/copy/delete`, with `force=true` only when replacement/no-op behavior is intentional.
+- Verification: prefer `test_run` / `lint_run` / `typecheck_run` over ad-hoc bash commands for deterministic runner resolution and normalized status reporting.
+- DB operations: prefer `db_run` with named profiles; keep read flows in `query/schema/explain` and use `allow_write=true` only for `exec/migrate`.
 - Structured data transforms: use `jq`/`yq` to compute/preview transforms, then persist the final state through `edit`/`write`.
 - Semantic retrieval: use `semantic_search status` first when relevance looks stale, then run `query`; run `index`/`rebuild` when config or index freshness requires it.
 - Multi-step execution: keep task progress synchronized with `todo_write` and recover state with `todo_read` before resuming long threads.

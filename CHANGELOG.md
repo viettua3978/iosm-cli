@@ -7,6 +7,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.9] - 2026-03-15
+
+### Added
+
+- **Structured verification/data tools** — added built-in `test_run`, `lint_run`, `typecheck_run`, and `db_run` with runner/adapter auto-detection, normalized statuses, bounded output capture, and tool-registry/SDK exports
+- **DB runtime settings layer** — added `dbTools` settings (`defaultConnection`, named `connections`, adapter-specific fields, migrate script options) wired into session/runtime resolution for `db_run`
+- **Universal terminal theme** — added built-in `universal` theme and made it the default/fallback theme for interactive mode
+- **Protocol and stall auto-repair flow** — added bounded automatic recovery for raw pseudo tool markup and silent stop responses, including interactive recovery actions (retry, repeat prompt, switch model + retry, keep session)
+
+### Changed
+
+- **Profile tool policy expansion** — enabled `test_run`, `lint_run`, `typecheck_run`, and `db_run` across write-capable engineering profiles (`full`, `meta`, `iosm`); enabled `typecheck_run` for `iosm_verifier`
+- **Interactive UX readability pass** — updated dark/light palettes, introduced universal box colors, and normalized box paddings/section spacing for user/custom/tool/plan/subagent/summary messages
+- **System prompt hardening** — added explicit guidance for structured verification/data tools, instruction-priority handling, untrusted tool-output/web-content handling, completion checks before final success claims, and stricter pseudo-markup prohibition
+- **Doctor diagnostics coverage** — expanded interactive `/doctor` CLI-toolchain checks to include verification and DB client commands used by new structured tools
+
+### Fixed
+
+- **Abort continuation wording** — when user interrupts execution, recovery selector now shows a user-action title (`You stopped the current run`) instead of model-failure wording
+- **Protocol false positives** — inline explanatory mentions like `raw <tool_call>/<function=...> markup` no longer trigger protocol auto-repair; only executable-looking pseudo-blocks are repaired
+- **Dark theme contrast in boxes** — fixed low-contrast text-on-dark-box cases for user/custom/tool blocks
+
+### Documentation
+
+- Updated README header/version marker to `0.2.9`
+- Updated CLI/config/interactive/development docs with `test_run`/`lint_run`/`typecheck_run`/`db_run`, profile policy updates, `dbTools` configuration, and `/doctor` toolchain scope
+
+### Tests
+
+- Added dedicated tool coverage for `test_run`, `lint_run`, `typecheck_run`, and `db_run`
+- Added protocol auto-repair and recovery-selector coverage in interactive/session tests (raw markup, silent stop, false-positive guard, model-switch recovery)
+- Expanded regressions for profiles, SDK exports, settings manager, shadow guard, system prompt guidance, and theme defaults/colors
+
 ## [0.2.8] - 2026-03-14
 
 ### Added

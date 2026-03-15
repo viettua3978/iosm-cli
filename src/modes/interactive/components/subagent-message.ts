@@ -2,6 +2,9 @@ import { homedir } from "node:os";
 import { Box, Spacer, Text } from "@mariozechner/pi-tui";
 import { theme } from "../theme/theme.js";
 
+const MESSAGE_BOX_PADDING_X = 2;
+const MESSAGE_BOX_PADDING_Y = 1;
+
 export type SubagentPhaseState = "queued" | "starting" | "running" | "responding";
 export type SubagentDelegateStatus = "pending" | "running" | "done" | "failed";
 
@@ -236,7 +239,7 @@ function selectDelegateItemsForDisplay(items: SubagentDelegateItem[]): {
  */
 export class SubagentMessageComponent extends Box {
 	constructor(info: SubagentInfo) {
-		super(1, 1, (text) => theme.bg("customMessageBg", text));
+		super(MESSAGE_BOX_PADDING_X, MESSAGE_BOX_PADDING_Y, (text) => theme.bg("customMessageBg", text));
 		this.renderContent(info);
 	}
 

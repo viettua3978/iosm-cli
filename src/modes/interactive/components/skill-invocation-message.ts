@@ -1,7 +1,9 @@
-import { Box, Markdown, type MarkdownTheme, Text } from "@mariozechner/pi-tui";
+import { Box, Markdown, type MarkdownTheme, Spacer, Text } from "@mariozechner/pi-tui";
 import type { ParsedSkillBlock } from "../../../core/agent-session.js";
 import { getMarkdownTheme, theme } from "../theme/theme.js";
 import { editorKey } from "./keybinding-hints.js";
+
+const MESSAGE_BOX_PADDING_X = 2;
 
 /**
  * Component that renders a skill invocation message with collapsed/expanded state.
@@ -14,7 +16,7 @@ export class SkillInvocationMessageComponent extends Box {
 	private markdownTheme: MarkdownTheme;
 
 	constructor(skillBlock: ParsedSkillBlock, markdownTheme: MarkdownTheme = getMarkdownTheme()) {
-		super(1, 1, (t) => theme.bg("customMessageBg", t));
+		super(MESSAGE_BOX_PADDING_X, 1, (t) => theme.bg("customMessageBg", t));
 		this.skillBlock = skillBlock;
 		this.markdownTheme = markdownTheme;
 		this.updateDisplay();
@@ -37,6 +39,7 @@ export class SkillInvocationMessageComponent extends Box {
 			// Expanded: label + skill name header + full content
 			const label = theme.fg("customMessageLabel", `\x1b[1m[skill]\x1b[22m`);
 			this.addChild(new Text(label, 0, 0));
+			this.addChild(new Spacer(1));
 			const header = `**${this.skillBlock.name}**\n\n`;
 			this.addChild(
 				new Markdown(header + this.skillBlock.content, 0, 0, this.markdownTheme, {

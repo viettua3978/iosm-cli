@@ -3,6 +3,8 @@ import type { CompactionSummaryMessage } from "../../../core/messages.js";
 import { getMarkdownTheme, theme } from "../theme/theme.js";
 import { editorKey } from "./keybinding-hints.js";
 
+const MESSAGE_BOX_PADDING_X = 2;
+
 /**
  * Component that renders a compaction message with collapsed/expanded state.
  * Uses same background color as custom messages for visual consistency.
@@ -13,7 +15,7 @@ export class CompactionSummaryMessageComponent extends Box {
 	private markdownTheme: MarkdownTheme;
 
 	constructor(message: CompactionSummaryMessage, markdownTheme: MarkdownTheme = getMarkdownTheme()) {
-		super(1, 1, (t) => theme.bg("customMessageBg", t));
+		super(MESSAGE_BOX_PADDING_X, 1, (t) => theme.bg("customMessageBg", t));
 		this.message = message;
 		this.markdownTheme = markdownTheme;
 		this.updateDisplay();

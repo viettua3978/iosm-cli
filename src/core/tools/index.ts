@@ -110,6 +110,31 @@ export {
 	jqTool,
 } from "./jq.js";
 export {
+	createDbRunTool,
+	type DbRunAction,
+	type DbRunAdapter,
+	type DbRunMigrateRunner,
+	type DbRunStatus,
+	type DbRunToolDetails,
+	type DbRunToolInput,
+	type DbRunToolOptions,
+	type DbToolsConnectionConfig,
+	type DbToolsMigrateConfig,
+	type DbToolsRuntimeConfig,
+	dbRunTool,
+	DEFAULT_DB_RUN_TIMEOUT_SECONDS,
+} from "./db-run.js";
+export {
+	createLintRunTool,
+	type LintRunMode,
+	type LintRunRunner,
+	type LintRunStatus,
+	type LintRunToolDetails,
+	type LintRunToolInput,
+	lintRunTool,
+	DEFAULT_LINT_RUN_TIMEOUT_SECONDS,
+} from "./lint-run.js";
+export {
 	createLsTool,
 	type LsOperations,
 	type LsToolDetails,
@@ -188,6 +213,25 @@ export {
 	type TaskToolInput,
 	type TaskToolDetails,
 } from "./task.js";
+export {
+	createTestRunTool,
+	type TestRunRunner,
+	type TestRunStatus,
+	type TestRunToolDetails,
+	type TestRunToolInput,
+	testRunTool,
+	DEFAULT_TEST_RUN_TIMEOUT_SECONDS,
+} from "./test-run.js";
+export {
+	createTypecheckRunTool,
+	type TypecheckRunItemDetails,
+	type TypecheckRunRunner,
+	type TypecheckRunStatus,
+	type TypecheckRunToolDetails,
+	type TypecheckRunToolInput,
+	typecheckRunTool,
+	DEFAULT_TYPECHECK_RUN_TIMEOUT_SECONDS,
+} from "./typecheck-run.js";
 
 import type { AgentTool } from "@mariozechner/pi-agent-core";
 import { astGrepTool, createAstGrepTool } from "./ast-grep.js";
@@ -208,6 +252,8 @@ import { createGrepTool, grepTool } from "./grep.js";
 import { createGitReadTool, gitReadTool } from "./git-read.js";
 import { createGitWriteTool, type GitWriteToolOptions, gitWriteTool } from "./git-write.js";
 import { createJqTool, jqTool } from "./jq.js";
+import { createDbRunTool, type DbRunToolOptions, dbRunTool } from "./db-run.js";
+import { createLintRunTool, lintRunTool } from "./lint-run.js";
 import { createLsTool, lsTool } from "./ls.js";
 import { createReadTool, type ReadToolOptions, readTool } from "./read.js";
 import { createRgTool, rgTool } from "./rg.js";
@@ -221,6 +267,8 @@ import {
 import { createWriteTool, type WriteToolOptions, writeTool } from "./write.js";
 import { createYqTool, yqTool } from "./yq.js";
 import { todoWriteTool, todoReadTool } from "./todo.js";
+import { createTestRunTool, testRunTool } from "./test-run.js";
+import { createTypecheckRunTool, typecheckRunTool } from "./typecheck-run.js";
 
 /** Tool type (AgentTool from pi-ai) */
 export type Tool = AgentTool<any>;
@@ -273,6 +321,10 @@ export const allTools = {
 	git_read: gitReadTool,
 	git_write: gitWriteTool,
 	fs_ops: fsOpsTool,
+	test_run: testRunTool,
+	lint_run: lintRunTool,
+	typecheck_run: typecheckRunTool,
+	db_run: dbRunTool,
 	todo_write: todoWriteTool,
 	todo_read: todoReadTool,
 };
@@ -298,6 +350,8 @@ export interface ToolsOptions {
 	gitWrite?: GitWriteToolOptions;
 	/** Options for the fs_ops tool */
 	fsOps?: FsOpsToolOptions;
+	/** Options for the db_run tool */
+	dbRun?: DbRunToolOptions;
 }
 
 /**
@@ -368,6 +422,10 @@ export function createAllTools(cwd: string, options?: ToolsOptions): Record<Tool
 		git_read: createGitReadTool(cwd),
 		git_write: createGitWriteTool(cwd, options?.gitWrite),
 		fs_ops: createFsOpsTool(cwd, options?.fsOps),
+		test_run: createTestRunTool(cwd),
+		lint_run: createLintRunTool(cwd),
+		typecheck_run: createTypecheckRunTool(cwd),
+		db_run: createDbRunTool(cwd, options?.dbRun),
 		todo_write: todoWriteTool,
 		todo_read: todoReadTool,
 	};

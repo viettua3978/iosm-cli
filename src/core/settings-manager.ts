@@ -59,6 +59,25 @@ export interface GithubToolsSettings {
 	token?: string; // optional GitHub token used for git network operations
 }
 
+export interface DbToolsMigrateSettings {
+	script?: string;
+	cwd?: string;
+	args?: string[];
+}
+
+export interface DbToolsConnectionSettings {
+	adapter?: "postgres" | "mysql" | "sqlite" | "mongodb" | "redis";
+	dsnEnv?: string; // required for network adapters
+	sqlitePath?: string; // required for sqlite adapter
+	clientArgs?: string[]; // additional adapter CLI arguments
+	migrate?: DbToolsMigrateSettings;
+}
+
+export interface DbToolsSettings {
+	defaultConnection?: string;
+	connections?: Record<string, DbToolsConnectionSettings>;
+}
+
 export type TransportSetting = Transport;
 
 /**
@@ -115,6 +134,7 @@ export interface Settings {
 	markdown?: MarkdownSettings;
 	webSearch?: WebSearchSettings;
 	githubTools?: GithubToolsSettings;
+	dbTools?: DbToolsSettings;
 }
 
 const WEB_SEARCH_PROVIDER_MODES = ["auto", "tavily"] as const;
@@ -1064,6 +1084,37 @@ export class SettingsManager {
 
 	getGithubToolsNetworkEnabled(): boolean {
 		return this.settings.githubTools?.networkEnabled ?? false;
+	}
+
+	getDbToolsSettings(): DbToolsSettings {
+		const dbTools = this.settings.dbTools;
+		if (!dbTools) {
+			return {};
+		}
+
+		const connections: Record<string, DbToolsConnectionSettings> = {};
+		for (const [name, connection] of Object.entries(dbTools.connections ?? {})) {
+			const normalizedName = name.trim();
+			if (!normalizedName || !connection) continue;
+			connections[normalizedName] = {
+				adapter: connection.adapter,
+				dsnEnv: connection.dsnEnv?.trim() || undefined,
+				sqlitePath: connection.sqlitePath?.trim() || undefined,
+				clientArgs: Array.isArray(connection.clientArgs) ? [...connection.clientArgs] : undefined,
+				migrate: connection.migrate
+					? {
+						script: connection.migrate.script?.trim() || undefined,
+						cwd: connection.migrate.cwd?.trim() || undefined,
+						args: Array.isArray(connection.migrate.args) ? [...connection.migrate.args] : undefined,
+					}
+					: undefined,
+			};
+		}
+
+		return {
+			defaultConnection: dbTools.defaultConnection?.trim() || undefined,
+			connections,
+		};
 	}
 
 	setGithubToolsNetworkEnabled(enabled: boolean): void {

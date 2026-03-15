@@ -53,6 +53,10 @@ const WRITE_ENGINEERING_TOOLS = [
 	"write",
 	"git_write",
 	"fs_ops",
+	"test_run",
+	"lint_run",
+	"typecheck_run",
+	"db_run",
 	...READ_EXPLORATION_TOOLS.slice(1),
 ] as const;
 const READ_ONLY_PROFILE_SET = new Set<AgentProfileName>(["explore", "plan", "iosm_analyst"]);
@@ -104,7 +108,7 @@ export const AGENT_PROFILES: Record<AgentProfileName, AgentProfile> = {
 		label: "IOSM Verifier",
 		description:
 			"Post-change IOSM verification. Validates metrics and artifacts after code changes.",
-		tools: ["read", "bash", "write"],
+		tools: ["read", "bash", "write", "test_run", "lint_run", "typecheck_run"],
 		thinkingLevel: "low",
 		systemPromptAppend:
 			"You are an IOSM Verifier. Run deterministic checks on the repository to verify IOSM metrics are correct and up-to-date after code changes. Update only .iosm/ artifact files. Validate JSON after edits. Keep checks bounded and focused.",

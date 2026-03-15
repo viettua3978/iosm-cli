@@ -82,6 +82,25 @@ Settings are merged in this order (later wins):
     "networkEnabled": false,
     "token": "optional-gh-token"
   },
+  "dbTools": {
+    "defaultConnection": "main",
+    "connections": {
+      "main": {
+        "adapter": "postgres",
+        "dsnEnv": "APP_DB_DSN",
+        "clientArgs": [],
+        "migrate": {
+          "script": "db:migrate",
+          "cwd": ".",
+          "args": []
+        }
+      },
+      "localSqlite": {
+        "adapter": "sqlite",
+        "sqlitePath": "./data/app.db"
+      }
+    }
+  },
   "permissions": {
     "autoApprove": false
   }
@@ -90,6 +109,59 @@ Settings are merged in this order (later wins):
 
 `githubTools.networkEnabled` controls whether `git_write` network actions (`fetch`, `pull`, `push`) are allowed.  
 `githubTools.token` is optional and, when set, is injected for GitHub HTTPS authentication during network git actions.
+`dbTools` defines named DB connection profiles consumed by `db_run`; for network adapters (`postgres`, `mysql`, `mongodb`, `redis`) use `dsnEnv` so secrets stay in environment variables instead of tool input.
+
+### `db_run` Setup (Recommended)
+
+1. Install required DB client CLI for your adapter:
+   - SQLite: `sqlite3`
+   - Postgres: `psql`
+   - MySQL: `mysql`
+   - MongoDB: `mongosh`
+   - Redis: `redis-cli`
+2. Add named connection profiles to `.iosm/settings.json` (`dbTools.connections`).
+3. For network adapters, export DSN env vars referenced by `dsnEnv`.
+4. If settings were edited while a session is open, run `/reload` (or restart the session) before calling `db_run`.
+
+SQLite profile example:
+
+```json
+{
+  "dbTools": {
+    "defaultConnection": "main",
+    "connections": {
+      "main": {
+        "adapter": "sqlite",
+        "sqlitePath": "./test_database.sqlite"
+      }
+    }
+  }
+}
+```
+
+Postgres profile example:
+
+```json
+{
+  "dbTools": {
+    "defaultConnection": "main",
+    "connections": {
+      "main": {
+        "adapter": "postgres",
+        "dsnEnv": "APP_DB_DSN",
+        "clientArgs": []
+      }
+    }
+  }
+}
+```
+
+```bash
+export APP_DB_DSN="postgres://user:password@localhost:5432/appdb"
+```
+
+`db_run.connection` expects a **profile name** (for example `"main"`), not a DB file path and not an inline DSN.
+`db_run` is built-in; no separate `db-tools` npm package is required.
 
 ## MCP Configuration
 
@@ -254,7 +326,7 @@ Profiles control the agent's behavior, available tools, and system prompt.
 
 | Profile | Tools | Behavior |
 |---------|-------|----------|
-| `full` | All built-ins (read, bash, edit, write, git_write, fs_ops, grep, find, ls, rg, fd, ast_grep, comby, jq, yq, semgrep, sed, semantic_search, fetch, web_search, git_read) | Default full development capabilities |
+| `full` | All built-ins (read, bash, edit, write, git_write, fs_ops, test_run, lint_run, typecheck_run, db_run, grep, find, ls, rg, fd, ast_grep, comby, jq, yq, semgrep, sed, semantic_search, fetch, web_search, git_read) | Default full development capabilities |
 | `plan` | Read-only bundle (read, grep, find, ls, rg, fd, ast_grep, comby, jq, yq, semgrep, sed, semantic_search, fetch, web_search, git_read) | Architecture planning and code review |
 | `iosm` | All + IOSM context | IOSM cycle execution with artifact synchronization |
 | `meta` | Full tools + orchestration-first contract | Adaptive multi-agent/delegate execution with verification closure |
@@ -267,6 +339,9 @@ Profiles control the agent's behavior, available tools, and system prompt.
 | `iosm_analyst` | Deep IOSM metric analysis |
 | `iosm_verifier` | IOSM quality gate verification |
 | `cycle_planner` | IOSM cycle planning specialist |
+
+`db_run` is enabled only in write-capable engineering profiles (`full`, `meta`, `iosm`).  
+`typecheck_run` is enabled in write-capable engineering profiles and `iosm_verifier`.
 
 > `meta` profile recommendation: for orchestration-heavy work, prefer modern models with large context windows (`>=128k`, ideally `>=200k`) and high output limits. This improves delegate routing, contract retention, and synthesis reliability.
 

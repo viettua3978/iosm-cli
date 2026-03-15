@@ -233,9 +233,9 @@ ${chalk.bold("Options:")}
   --no-session                   Don't save session (ephemeral)
   --models <patterns>            Comma-separated model patterns for Ctrl+P cycling
                                  Supports globs (anthropic/*, *sonnet*) and fuzzy matching
-	--no-tools                     Disable all built-in tools
-		--tools <tools>                Comma-separated list of tools to enable (default: read,bash,edit,write)
-		                                 Available: read, bash, edit, write, grep, find, ls, rg, fd, ast_grep, comby, jq, yq, semgrep, sed, semantic_search, fetch, web_search, git_read, git_write, fs_ops
+  --no-tools                     Disable all built-in tools
+  --tools <tools>                Comma-separated list of tools to enable (default: read,bash,edit,write)
+                                 Available: read, bash, edit, write, grep, find, ls, rg, fd, ast_grep, comby, jq, yq, semgrep, sed, semantic_search, fetch, web_search, git_read, git_write, fs_ops, test_run, lint_run, typecheck_run, db_run, todo_read, todo_write
   --thinking <level>             Set thinking level: off, minimal, low, medium, high, xhigh
   --extension, -e <path>         Load an extension file (can be used multiple times)
   --no-extensions, -ne           Disable extension discovery (explicit -e paths still work)
@@ -373,5 +373,9 @@ ${chalk.bold("Available Tools (default: read, bash, edit, write):")}
   git_read - Structured read-only git introspection (status/diff/log/blame/show/branch_list/remote_list/rev_parse)
   git_write - Structured git mutation tool (add/restore/reset_index/commit/switch/branch_create/fetch/pull/push/stash_*)
   fs_ops - Structured filesystem mutations (mkdir/move/copy/delete with safety flags)
+  test_run - Structured test execution (auto/npm/pnpm/yarn/bun/vitest/jest/pytest)
+  lint_run - Structured lint execution (auto/npm/pnpm/yarn/bun/eslint/prettier/stylelint)
+  typecheck_run - Structured typecheck execution (auto/npm/pnpm/yarn/bun/tsc/vue_tsc/pyright/mypy)
+  db_run - Structured database operations (query/exec/schema/migrate/explain over named profiles)
 `);
 }

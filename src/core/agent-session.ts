@@ -182,6 +182,128 @@ function deriveOrchestrationDisplayText(promptTextWithoutDirective: string): str
 	return task;
 }
 
+type PromptProtocolIssue = {
+	hasToolCallMarkup: boolean;
+	hasDelegateTaskMarkup: boolean;
+};
+
+function extractAssistantProtocolText(message: AssistantMessage): string {
+	const parts: string[] = [];
+	for (const content of message.content) {
+		if (content.type === "text" && typeof content.text === "string" && content.text.trim()) {
+			parts.push(content.text.trim());
+			continue;
+		}
+		if (content.type !== "thinking") continue;
+		const record = content as unknown as Record<string, unknown>;
+		const thinking = record.thinking;
+		if (typeof thinking === "string" && thinking.trim()) {
+			parts.push(thinking.trim());
+		}
+	}
+	return parts.join("\n\n").trim();
+}
+
+function extractAssistantVisibleText(message: AssistantMessage): string {
+	return message.content
+		.filter((content): content is { type: "text"; text: string } => content.type === "text")
+		.map((content) => content.text.trim())
+		.filter((text) => text.length > 0)
+		.join("\n\n")
+		.trim();
+}
+
+function isNonActionableVisibleAssistantText(text: string): boolean {
+	const trimmed = text.trim();
+	if (trimmed.length === 0) return true;
+	return /^\[\s*output\s+truncated[^\]]*\]?\s*\.?$/i.test(trimmed);
+}
+
+function detectPromptProtocolIssue(text: string): PromptProtocolIssue | undefined {
+	const trimmed = text.trim();
+	if (!trimmed) return undefined;
+
+	const hasToolCallOpenBlock = /(^|\n)\s*<\s*tool_call\b/i.test(trimmed);
+	const hasToolCallCloseTag = /<\/\s*tool_call\s*>/i.test(trimmed);
+	const hasFunctionBlock = /(^|\n)\s*<\s*function\s*=\s*[A-Za-z0-9._:-]+/i.test(trimmed);
+	const hasParameterBlock = /(^|\n)\s*<\s*parameter\s*=\s*[A-Za-z0-9._:-]+\s*>/i.test(trimmed);
+	// Flag only executable-looking pseudo markup; don't treat inline explanatory mentions as protocol issues.
+	const hasToolCallMarkup =
+		(hasToolCallOpenBlock && (hasToolCallCloseTag || hasFunctionBlock || hasParameterBlock)) ||
+		(hasFunctionBlock && hasParameterBlock);
+	const hasDelegateTaskMarkup = /<\s*delegate_task\b/i.test(trimmed) && /<\/\s*delegate_task\s*>/i.test(trimmed);
+
+	if (!hasToolCallMarkup && !hasDelegateTaskMarkup) return undefined;
+	return {
+		hasToolCallMarkup,
+		hasDelegateTaskMarkup,
+	};
+}
+
+function buildPromptProtocolCorrectionPrompt(input: {
+	originalPrompt: string;
+	issue: PromptProtocolIssue;
+	hasPriorToolActivity?: boolean;
+}): string {
+	const reasons = [
+		input.issue.hasToolCallMarkup ? "raw <tool_call>/<function=...> markup" : undefined,
+		input.issue.hasDelegateTaskMarkup ? "raw <delegate_task> blocks" : undefined,
+	].filter((item): item is string => typeof item === "string");
+	const boundedOriginal =
+		input.originalPrompt.length > 2_000
+			? `${input.originalPrompt.slice(0, 2_000).trimEnd()}...`
+			: input.originalPrompt;
+
+	return [
+		"[TOOL_PROTOCOL_CORRECTION]",
+		`Previous assistant output included ${reasons.join(" and ")} in plain text.`,
+		"These XML-like blocks are not executable tool calls.",
+		"Retry now and follow this protocol exactly:",
+		"1) Do not output XML/pseudo-call tags (<tool_call>, <function=...>, <delegate_task>).",
+		"2) If a tool is needed, emit real structured tool calls only.",
+		"3) Prefer structured tools when available instead of ad-hoc pseudo calls.",
+		"4) If no tool is needed, provide a direct normal answer.",
+		input.hasPriorToolActivity
+			? "5) Continue from the current in-memory state; avoid repeating already completed tool steps unless necessary."
+			: undefined,
+		"Execute the original user request now.",
+		"<original_user_request>",
+		boundedOriginal,
+		"</original_user_request>",
+		"[/TOOL_PROTOCOL_CORRECTION]",
+	]
+		.filter((line): line is string => typeof line === "string")
+		.join("\n");
+}
+
+function buildPromptSilentStopRecoveryPrompt(input: {
+	originalPrompt: string;
+	hasPriorToolActivity?: boolean;
+}): string {
+	const boundedOriginal =
+		input.originalPrompt.length > 2_000
+			? `${input.originalPrompt.slice(0, 2_000).trimEnd()}...`
+			: input.originalPrompt;
+	return [
+		"[ASSISTANT_STALL_RECOVERY]",
+		"Previous assistant output ended with stop but produced no visible text and no executable tool calls.",
+		"Retry now and continue the same request.",
+		"1) Do not return an empty response.",
+		"2) If a tool is needed, emit real structured tool calls.",
+		"3) If no tool is needed, provide a direct answer.",
+		input.hasPriorToolActivity
+			? "4) Continue from the current in-memory state; avoid repeating already completed tool steps unless necessary."
+			: undefined,
+		"Execute the original user request now.",
+		"<original_user_request>",
+		boundedOriginal,
+		"</original_user_request>",
+		"[/ASSISTANT_STALL_RECOVERY]",
+	]
+		.filter((line): line is string => typeof line === "string")
+		.join("\n");
+}
+
 function buildSubagentOrchestrationDirective(text: string): string | undefined {
 	const block = parseOrchestrateBlock(text);
 	if (block) {
@@ -313,6 +435,8 @@ export interface PromptOptions {
 	source?: InputSource;
 	/** Skip auto-injected orchestration directive for prompts that intentionally mention agents/subagents as data. */
 	skipOrchestrationDirective?: boolean;
+	/** Internal safety valve: disable one-shot protocol auto-repair for this prompt call. */
+	skipProtocolAutoRepair?: boolean;
 }
 
 /** Result from cycleModel() */
@@ -348,6 +472,7 @@ export interface SessionStats {
 
 /** Standard thinking levels */
 const THINKING_LEVELS: ThinkingLevel[] = ["off", "minimal", "low", "medium", "high"];
+const MAX_PROMPT_PROTOCOL_AUTO_REPAIR_ATTEMPTS = 2;
 
 /** Thinking levels including xhigh (for supported models) */
 const THINKING_LEVELS_WITH_XHIGH: ThinkingLevel[] = ["off", "minimal", "low", "medium", "high", "xhigh"];
@@ -444,6 +569,7 @@ export class AgentSession {
 	private _pendingHookNotices: Array<{ event: HookEventName; message: string }> = [];
 	private _sessionTraceEnabled = isSessionTraceEnabled();
 	private _sessionTracePath: string | undefined;
+	private _protocolAutoRepairActive = false;
 
 	constructor(config: AgentSessionConfig) {
 		this.agent = config.agent;
@@ -1493,13 +1619,96 @@ export class AgentSession {
 			}
 		}
 
-		await this.agent.prompt(messages);
-		await this.waitForRetry();
+		const enableProtocolAutoRepair = !options?.skipProtocolAutoRepair && !this._protocolAutoRepairActive;
+		let protocolToolCallsStarted = 0;
+		let latestAssistantProtocolText = "";
+		let latestAssistantMessage: AssistantMessage | undefined;
+		let latestAssistantVisibleText = "";
+		const unsubscribeProtocolMonitor = enableProtocolAutoRepair
+			? this.subscribe((event) => {
+					if (event.type === "tool_execution_start") {
+						protocolToolCallsStarted += 1;
+						return;
+					}
+					if (event.type === "message_end" && event.message.role === "assistant") {
+						latestAssistantMessage = event.message as AssistantMessage;
+						latestAssistantProtocolText = extractAssistantProtocolText(latestAssistantMessage);
+						latestAssistantVisibleText = extractAssistantVisibleText(latestAssistantMessage);
+					}
+				})
+			: undefined;
+
+		try {
+			await this.agent.prompt(messages);
+			await this.waitForRetry();
+		} finally {
+			unsubscribeProtocolMonitor?.();
+		}
+
 		this._appendSessionTrace({
 			type: "prompt_dispatched",
 			messageCount: messages.length,
 			text: promptText,
 		});
+
+		if (enableProtocolAutoRepair) {
+			let nextIssue = detectPromptProtocolIssue(latestAssistantProtocolText);
+			let nextSilentStopWithoutOutput =
+				!nextIssue &&
+				latestAssistantMessage?.stopReason === "stop" &&
+				!latestAssistantMessage.content.some((part) => part.type === "toolCall") &&
+				isNonActionableVisibleAssistantText(latestAssistantVisibleText);
+			if (nextIssue || nextSilentStopWithoutOutput) {
+				this._protocolAutoRepairActive = true;
+				try {
+					for (
+						let repairAttempt = 1;
+						repairAttempt <= MAX_PROMPT_PROTOCOL_AUTO_REPAIR_ATTEMPTS && (nextIssue || nextSilentStopWithoutOutput);
+						repairAttempt += 1
+					) {
+						const hasPriorToolActivity = protocolToolCallsStarted > 0 || repairAttempt > 1;
+						const correctionPrompt = nextIssue
+							? buildPromptProtocolCorrectionPrompt({
+									originalPrompt: expandedText,
+									issue: nextIssue,
+									hasPriorToolActivity,
+								})
+							: buildPromptSilentStopRecoveryPrompt({
+									originalPrompt: expandedText,
+									hasPriorToolActivity,
+								});
+						this._appendSessionTrace({
+							type: "prompt_protocol_auto_repair",
+							originalPrompt: expandedText,
+							issue: nextIssue ?? { silentStopWithoutOutput: true },
+							hasPriorToolActivity,
+							repairAttempt,
+							maxRepairAttempts: MAX_PROMPT_PROTOCOL_AUTO_REPAIR_ATTEMPTS,
+						});
+
+						await this.prompt(correctionPrompt, {
+							expandPromptTemplates: false,
+							skipIosmAutopilot: true,
+							skipOrchestrationDirective: true,
+							skipProtocolAutoRepair: true,
+							source: inputSource,
+						});
+
+						const repairedAssistant = this._findLastAssistantMessage();
+						const repairedProtocolText = repairedAssistant ? extractAssistantProtocolText(repairedAssistant) : "";
+						const repairedVisibleText = repairedAssistant ? extractAssistantVisibleText(repairedAssistant) : "";
+						nextIssue = detectPromptProtocolIssue(repairedProtocolText);
+						nextSilentStopWithoutOutput =
+							!nextIssue &&
+							repairedAssistant?.stopReason === "stop" &&
+							!repairedAssistant.content.some((part) => part.type === "toolCall") &&
+							isNonActionableVisibleAssistantText(repairedVisibleText);
+					}
+				} finally {
+					this._protocolAutoRepairActive = false;
+				}
+			}
+		}
 	}
 
 	/**
@@ -2969,6 +3178,13 @@ export class AgentSession {
 						},
 					},
 					fsOps: {
+						permissionGuard: async (request) => {
+							evaluatePreToolHooks(request);
+							return this._toolPermissionHandler ? this._toolPermissionHandler(request) : true;
+						},
+					},
+					dbRun: {
+						resolveRuntimeConfig: () => this.settingsManager.getDbToolsSettings(),
 						permissionGuard: async (request) => {
 							evaluatePreToolHooks(request);
 							return this._toolPermissionHandler ? this._toolPermissionHandler(request) : true;

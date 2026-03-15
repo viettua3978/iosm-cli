@@ -430,4 +430,64 @@ describe("SettingsManager", () => {
 			expect(manager.isGithubToolsTokenConfigured()).toBe(false);
 		});
 	});
+
+	describe("dbTools settings", () => {
+		it("returns empty object when dbTools block is not set", () => {
+			const manager = SettingsManager.create(projectDir, agentDir);
+			expect(manager.getDbToolsSettings()).toEqual({});
+		});
+
+		it("returns normalized dbTools settings with trimmed values", () => {
+			const settingsPath = join(agentDir, "settings.json");
+			writeFileSync(
+				settingsPath,
+				JSON.stringify({
+					dbTools: {
+						defaultConnection: " main ",
+						connections: {
+							" main ": {
+								adapter: "postgres",
+								dsnEnv: " APP_DB_DSN ",
+								clientArgs: ["--set", "ON_ERROR_STOP=1"],
+								migrate: {
+									script: " db:migrate ",
+									cwd: " ./migrations ",
+									args: ["--from-profile"],
+								},
+							},
+							sqlite: {
+								adapter: "sqlite",
+								sqlitePath: " ./data/app.db ",
+							},
+						},
+					},
+				}),
+			);
+
+			const manager = SettingsManager.create(projectDir, agentDir);
+			expect(manager.getDbToolsSettings()).toEqual({
+				defaultConnection: "main",
+				connections: {
+					main: {
+						adapter: "postgres",
+						dsnEnv: "APP_DB_DSN",
+						sqlitePath: undefined,
+						clientArgs: ["--set", "ON_ERROR_STOP=1"],
+						migrate: {
+							script: "db:migrate",
+							cwd: "./migrations",
+							args: ["--from-profile"],
+						},
+					},
+					sqlite: {
+						adapter: "sqlite",
+						dsnEnv: undefined,
+						sqlitePath: "./data/app.db",
+						clientArgs: undefined,
+						migrate: undefined,
+					},
+				},
+			});
+		});
+	});
 });

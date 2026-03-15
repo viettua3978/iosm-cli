@@ -261,8 +261,22 @@ describe("parseArgs", () => {
 
 	describe("--tools values", () => {
 		test("parses newly added built-in tools", () => {
-			const result = parseArgs(["--tools", "read,fetch,web_search,git_read,git_write,fs_ops"]);
-			expect(result.tools).toEqual(["read", "fetch", "web_search", "git_read", "git_write", "fs_ops"]);
+			const result = parseArgs([
+				"--tools",
+				"read,fetch,web_search,git_read,git_write,fs_ops,test_run,lint_run,typecheck_run,db_run",
+			]);
+			expect(result.tools).toEqual([
+				"read",
+				"fetch",
+				"web_search",
+				"git_read",
+				"git_write",
+				"fs_ops",
+				"test_run",
+				"lint_run",
+				"typecheck_run",
+				"db_run",
+			]);
 		});
 	});
 
@@ -274,10 +288,14 @@ describe("parseArgs", () => {
 				const rendered = consoleSpy.mock.calls.map((call) => String(call[0] ?? "")).join("\n");
 				expect(rendered).toContain("fetch");
 				expect(rendered).toContain("web_search");
-				expect(rendered).toContain("git_read");
-				expect(rendered).toContain("git_write");
-				expect(rendered).toContain("fs_ops");
-			} finally {
+					expect(rendered).toContain("git_read");
+					expect(rendered).toContain("git_write");
+					expect(rendered).toContain("fs_ops");
+					expect(rendered).toContain("test_run");
+					expect(rendered).toContain("lint_run");
+					expect(rendered).toContain("typecheck_run");
+					expect(rendered).toContain("db_run");
+				} finally {
 				consoleSpy.mockRestore();
 			}
 		});

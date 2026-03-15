@@ -41,11 +41,26 @@ describe("shadow guard", () => {
 		expect(activeTools).toEqual(["read", "task", "todo_read"]);
 	});
 
-	it("treats git_write/fs_ops as mutating when shadow mode is enabled", () => {
-		let activeTools = ["read", "git_write", "fs_ops", "bash"];
+	it("treats git_write/fs_ops/test/lint/typecheck/db tools as mutating when shadow mode is enabled", () => {
+		let activeTools = ["read", "git_write", "fs_ops", "test_run", "lint_run", "typecheck_run", "db_run", "bash"];
 		const guard = new ShadowGuard({
 			getActiveTools: () => [...activeTools],
-			getAllTools: () => ["read", "fetch", "web_search", "git_read", "git_write", "fs_ops", "bash", "edit", "write", "task"],
+			getAllTools: () => [
+				"read",
+				"fetch",
+				"web_search",
+				"git_read",
+				"git_write",
+				"fs_ops",
+				"test_run",
+				"lint_run",
+				"typecheck_run",
+				"db_run",
+				"bash",
+				"edit",
+				"write",
+				"task",
+			],
 			setActiveTools: (next) => {
 				activeTools = [...next];
 			},
@@ -54,10 +69,18 @@ describe("shadow guard", () => {
 		guard.enable();
 		expect(guard.shouldDenyTool("git_write")).toBe(true);
 		expect(guard.shouldDenyTool("fs_ops")).toBe(true);
+		expect(guard.shouldDenyTool("test_run")).toBe(true);
+		expect(guard.shouldDenyTool("lint_run")).toBe(true);
+		expect(guard.shouldDenyTool("typecheck_run")).toBe(true);
+		expect(guard.shouldDenyTool("db_run")).toBe(true);
 		expect(activeTools).toContain("fetch");
 		expect(activeTools).toContain("web_search");
 		expect(activeTools).toContain("git_read");
 		expect(activeTools).not.toContain("git_write");
 		expect(activeTools).not.toContain("fs_ops");
+		expect(activeTools).not.toContain("test_run");
+		expect(activeTools).not.toContain("lint_run");
+		expect(activeTools).not.toContain("typecheck_run");
+		expect(activeTools).not.toContain("db_run");
 	});
 });

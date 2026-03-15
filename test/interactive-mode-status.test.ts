@@ -1047,6 +1047,16 @@ describe("InteractiveMode startup model restoration", () => {
 describe("InteractiveMode doctor command", () => {
 	test("includes external CLI tool status block in JSON report", async () => {
 		const showCommandJsonBlock = vi.fn();
+		const resolveDoctorCliToolStatuses = vi.fn(() => [
+			{ tool: "rg", available: true, source: "system", command: "rg", hint: "" },
+			{ tool: "fd", available: true, source: "system", command: "fd", hint: "" },
+			{ tool: "ast_grep", available: true, source: "system", command: "ast-grep", hint: "" },
+			{ tool: "comby", available: true, source: "system", command: "comby", hint: "" },
+			{ tool: "jq", available: true, source: "system", command: "jq", hint: "" },
+			{ tool: "yq", available: true, source: "system", command: "yq", hint: "" },
+			{ tool: "semgrep", available: true, source: "system", command: "semgrep", hint: "" },
+			{ tool: "sed", available: true, source: "system", command: "sed", hint: "" },
+		]);
 
 		const fakeThis: any = Object.create((InteractiveMode as any).prototype);
 		fakeThis.getHookPolicySummary = () => undefined;
@@ -1096,9 +1106,11 @@ describe("InteractiveMode doctor command", () => {
 		fakeThis.showCommandJsonBlock = showCommandJsonBlock;
 		fakeThis.showCommandTextBlock = vi.fn();
 		fakeThis.runDoctorInteractiveFixes = vi.fn();
+		fakeThis.resolveDoctorCliToolStatuses = resolveDoctorCliToolStatuses;
 
 		await (InteractiveMode as any).prototype.handleDoctorCommand.call(fakeThis, "/doctor --json");
 
+		expect(resolveDoctorCliToolStatuses).toHaveBeenCalledTimes(1);
 		expect(showCommandJsonBlock).toHaveBeenCalledTimes(1);
 		expect(showCommandJsonBlock).toHaveBeenCalledWith(
 			"Doctor Report",
@@ -1920,6 +1932,7 @@ describe("InteractiveMode.promptWithTaskFallback", () => {
 			expect(generatedPrompt).not.toContain("<orchestrate");
 			expect(options).toEqual({
 				expandPromptTemplates: false,
+				skipProtocolAutoRepair: true,
 				source: "interactive",
 			});
 		} finally {
@@ -1947,6 +1960,7 @@ describe("InteractiveMode.promptWithTaskFallback", () => {
 		expect(generatedPrompt).toContain("task: проверь архитектуру");
 		expect(options).toEqual({
 			expandPromptTemplates: false,
+			skipProtocolAutoRepair: true,
 			source: "interactive",
 		});
 	});
@@ -2685,6 +2699,598 @@ describe("InteractiveMode.promptWithTaskFallback", () => {
 
 		expect(prompt).toHaveBeenCalledTimes(1);
 		expect(prompt.mock.calls[0]?.[0]).toBe("используй субагента для анализа кода");
+	});
+
+	test("retries once with protocol correction when assistant emits raw tool_call markup", async () => {
+		let handler: ((event: any) => void) | undefined;
+		const subscribe = vi.fn((next: (event: any) => void) => {
+			handler = next;
+			return () => {
+				handler = undefined;
+			};
+		});
+		const prompt = vi.fn(async (text: string) => {
+			if (text.includes("[TOOL_PROTOCOL_CORRECTION]")) {
+				handler?.({
+					type: "message_end",
+					message: {
+						role: "assistant",
+						content: [{ type: "text", text: "Исправлено: выполняю db_run через реальный tool call." }],
+					},
+				});
+				return;
+			}
+			handler?.({
+				type: "message_end",
+				message: {
+					role: "assistant",
+					content: [
+						{
+							type: "text",
+							text:
+								"<tool_call>\n<function=db_run>\n<parameter=action>query</parameter>\n<parameter=statement>SELECT 1</parameter>\n</function>\n</tool_call>",
+						},
+					],
+				},
+			});
+		});
+		const showWarning = vi.fn();
+		const fakeThis: any = {
+			session: { prompt, subscribe },
+			activeProfileName: "full",
+			resolveMentionedAgent: vi.fn(() => undefined),
+			showWarning,
+		};
+
+		await (InteractiveMode as any).prototype.promptWithTaskFallback.call(fakeThis, "сделай запрос в базу");
+
+		expect(prompt).toHaveBeenCalledTimes(2);
+		const [correctionPrompt, correctionOptions] = prompt.mock.calls[1] as [string, Record<string, unknown>];
+		expect(correctionPrompt).toContain("[TOOL_PROTOCOL_CORRECTION]");
+		expect(correctionPrompt).toContain("raw <tool_call>/<function=...> markup");
+		expect(correctionPrompt).toContain("<original_user_request>");
+		expect(correctionPrompt).toContain("сделай запрос в базу");
+		expect(correctionOptions).toEqual({
+			expandPromptTemplates: false,
+			skipOrchestrationDirective: true,
+			skipProtocolAutoRepair: true,
+			source: "interactive",
+		});
+		expect(showWarning).toHaveBeenCalledWith(
+			expect.stringContaining("Protocol auto-repair: model emitted raw tool-call markup"),
+		);
+	});
+
+	test("does not trigger protocol repair for inline explanatory mention of pseudo-call tags", async () => {
+		let handler: ((event: any) => void) | undefined;
+		const subscribe = vi.fn((next: (event: any) => void) => {
+			handler = next;
+			return () => {
+				handler = undefined;
+			};
+		});
+		const prompt = vi.fn(async () => {
+			handler?.({
+				type: "message_end",
+				message: {
+					role: "assistant",
+					stopReason: "stop",
+					content: [
+						{
+							type: "text",
+							text: "Причина: raw <tool_call>/<function=...> markup в прошлой попытке. Продолжаю в обычном режиме.",
+						},
+					],
+				},
+			});
+		});
+		const showWarning = vi.fn();
+		const fakeThis: any = {
+			session: { prompt, subscribe },
+			activeProfileName: "full",
+			resolveMentionedAgent: vi.fn(() => undefined),
+			showWarning,
+		};
+
+		await (InteractiveMode as any).prototype.promptWithTaskFallback.call(fakeThis, "объясни причину и продолжай");
+
+		expect(prompt).toHaveBeenCalledTimes(1);
+		expect(showWarning).not.toHaveBeenCalled();
+	});
+
+	test("retries once with protocol correction when assistant emits raw delegate_task block", async () => {
+		let handler: ((event: any) => void) | undefined;
+		const subscribe = vi.fn((next: (event: any) => void) => {
+			handler = next;
+			return () => {
+				handler = undefined;
+			};
+		});
+		const prompt = vi.fn(async (text: string) => {
+			if (text.includes("[TOOL_PROTOCOL_CORRECTION]")) {
+				handler?.({
+					type: "message_end",
+					message: {
+						role: "assistant",
+						content: [{ type: "text", text: "Готово: выполняю задачу напрямую через доступные tools." }],
+					},
+				});
+				return;
+			}
+			handler?.({
+				type: "message_end",
+				message: {
+					role: "assistant",
+					content: [
+						{
+							type: "text",
+							text:
+								"<delegate_task profile=\"full\" description=\"DB stream\">проверь insert/update/delete</delegate_task>",
+						},
+					],
+				},
+			});
+		});
+		const fakeThis: any = {
+			session: { prompt, subscribe },
+			activeProfileName: "full",
+			resolveMentionedAgent: vi.fn(() => undefined),
+			showWarning: vi.fn(),
+		};
+
+		await (InteractiveMode as any).prototype.promptWithTaskFallback.call(fakeThis, "проверь db_run");
+
+		expect(prompt).toHaveBeenCalledTimes(2);
+		const [correctionPrompt] = prompt.mock.calls[1] as [string];
+		expect(correctionPrompt).toContain("raw <delegate_task> blocks");
+		expect(correctionPrompt).toContain("Do not output XML/pseudo-call tags");
+	});
+
+	test("retries when raw tool markup appears after prior tool activity in the same turn", async () => {
+		let handler: ((event: any) => void) | undefined;
+		const subscribe = vi.fn((next: (event: any) => void) => {
+			handler = next;
+			return () => {
+				handler = undefined;
+			};
+		});
+		const prompt = vi.fn(async (text: string) => {
+			if (text.includes("[TOOL_PROTOCOL_CORRECTION]")) {
+				handler?.({
+					type: "message_end",
+					message: {
+						role: "assistant",
+						stopReason: "stop",
+						content: [{ type: "text", text: "Продолжаю без повторного запуска завершённых шагов." }],
+					},
+				});
+				return;
+			}
+			handler?.({
+				type: "tool_execution_start",
+				toolName: "bash",
+				toolCallId: "call_1",
+				args: { command: "echo ok" },
+			});
+			handler?.({
+				type: "message_end",
+				message: {
+					role: "assistant",
+					stopReason: "stop",
+					content: [
+						{
+							type: "thinking",
+							thinking:
+								"<tool_call>\n<function=db_run>\n<parameter=action>query</parameter>\n<parameter=statement>SELECT 1</parameter>\n</function>\n</tool_call>",
+						},
+					],
+				},
+			});
+		});
+		const showWarning = vi.fn();
+		const fakeThis: any = {
+			session: { prompt, subscribe },
+			activeProfileName: "full",
+			resolveMentionedAgent: vi.fn(() => undefined),
+			showWarning,
+		};
+
+		await (InteractiveMode as any).prototype.promptWithTaskFallback.call(fakeThis, "проверь базу и продолжай");
+
+		expect(prompt).toHaveBeenCalledTimes(2);
+		const [correctionPrompt] = prompt.mock.calls[1] as [string];
+		expect(correctionPrompt).toContain("[TOOL_PROTOCOL_CORRECTION]");
+		expect(correctionPrompt).toContain("Continue from the current in-memory state");
+		expect(showWarning).toHaveBeenCalledWith(
+			expect.stringContaining("Protocol auto-repair: model emitted raw tool-call markup"),
+		);
+	});
+
+	test("applies second recovery when first correction ends with silent stop", async () => {
+		let handler: ((event: any) => void) | undefined;
+		const subscribe = vi.fn((next: (event: any) => void) => {
+			handler = next;
+			return () => {
+				handler = undefined;
+			};
+		});
+		let correctionCalls = 0;
+		const prompt = vi.fn(async (text: string) => {
+			if (text.includes("[ASSISTANT_STALL_RECOVERY]")) {
+				handler?.({
+					type: "message_end",
+					message: {
+						role: "assistant",
+						stopReason: "stop",
+						content: [{ type: "text", text: "Финальный ответ после второй попытки." }],
+					},
+				});
+				return;
+			}
+			if (text.includes("[TOOL_PROTOCOL_CORRECTION]")) {
+				correctionCalls += 1;
+				handler?.({
+					type: "message_end",
+					message: {
+						role: "assistant",
+						stopReason: "stop",
+						content: [{ type: "thinking", thinking: "[Output truncated." }],
+					},
+				});
+				return;
+			}
+			handler?.({
+				type: "message_end",
+				message: {
+					role: "assistant",
+					stopReason: "stop",
+					content: [
+						{
+							type: "text",
+							text:
+								"<tool_call>\n<function=db_run>\n<parameter=action>query</parameter>\n<parameter=statement>SELECT 1</parameter>\n</function>\n</tool_call>",
+						},
+					],
+				},
+			});
+		});
+		const showWarning = vi.fn();
+		const fakeThis: any = {
+			session: { prompt, subscribe },
+			activeProfileName: "full",
+			resolveMentionedAgent: vi.fn(() => undefined),
+			showWarning,
+		};
+
+		await (InteractiveMode as any).prototype.promptWithTaskFallback.call(fakeThis, "проверь и продолжай");
+
+		expect(correctionCalls).toBe(1);
+		expect(prompt).toHaveBeenCalledTimes(3);
+		expect((prompt.mock.calls[1] as [string])[0]).toContain("[TOOL_PROTOCOL_CORRECTION]");
+		expect((prompt.mock.calls[2] as [string])[0]).toContain("[ASSISTANT_STALL_RECOVERY]");
+		expect(showWarning).toHaveBeenCalledTimes(2);
+	});
+
+	test("shows recovery selector when protocol auto-repair attempts are exhausted", async () => {
+		let handler: ((event: any) => void) | undefined;
+		const subscribe = vi.fn((next: (event: any) => void) => {
+			handler = next;
+			return () => {
+				handler = undefined;
+			};
+		});
+		const rawMarkup =
+			"<tool_call>\n<function=db_run>\n<parameter=action>query</parameter>\n<parameter=statement>SELECT 1</parameter>\n</function>\n</tool_call>";
+		const prompt = vi.fn(async () => {
+			handler?.({
+				type: "message_end",
+				message: {
+					role: "assistant",
+					stopReason: "stop",
+					content: [{ type: "text", text: rawMarkup }],
+				},
+			});
+		});
+		const showWarning = vi.fn();
+		const showProtocolRepairRecoverySelector = vi.fn(async () => "keep_session");
+		const fakeThis: any = {
+			session: { prompt, subscribe },
+			activeProfileName: "full",
+			resolveMentionedAgent: vi.fn(() => undefined),
+			showWarning,
+			showProtocolRepairRecoverySelector,
+			selectModelForImmediateRetry: vi.fn(async () => undefined),
+		};
+
+		await (InteractiveMode as any).prototype.promptWithTaskFallback.call(fakeThis, "проверь базу");
+
+		expect(prompt).toHaveBeenCalledTimes(3);
+		expect(showProtocolRepairRecoverySelector).toHaveBeenCalledWith("raw_markup");
+	});
+
+	test("can switch model and retry automatically after protocol repair exhaustion", async () => {
+		let handler: ((event: any) => void) | undefined;
+		const subscribe = vi.fn((next: (event: any) => void) => {
+			handler = next;
+			return () => {
+				handler = undefined;
+			};
+		});
+		let callCount = 0;
+		const rawMarkup =
+			"<tool_call>\n<function=db_run>\n<parameter=action>query</parameter>\n<parameter=statement>SELECT 1</parameter>\n</function>\n</tool_call>";
+		const prompt = vi.fn(async () => {
+			callCount += 1;
+			if (callCount <= 3) {
+				handler?.({
+					type: "message_end",
+					message: {
+						role: "assistant",
+						stopReason: "stop",
+						content: [{ type: "text", text: rawMarkup }],
+					},
+				});
+				return;
+			}
+			handler?.({
+				type: "message_end",
+				message: {
+					role: "assistant",
+					stopReason: "stop",
+					content: [{ type: "text", text: "Готово: продолжаю после смены модели." }],
+				},
+			});
+		});
+
+		const showProtocolRepairRecoverySelector = vi.fn(async () => "switch_model_retry");
+		const selectModelForImmediateRetry = vi.fn(async () => ({ provider: "openai", id: "gpt-5" }));
+		const fakeThis: any = {
+			session: { prompt, subscribe },
+			activeProfileName: "full",
+			resolveMentionedAgent: vi.fn(() => undefined),
+			showWarning: vi.fn(),
+			showProtocolRepairRecoverySelector,
+			selectModelForImmediateRetry,
+		};
+
+		await (InteractiveMode as any).prototype.promptWithTaskFallback.call(fakeThis, "проверь базу");
+
+		expect(showProtocolRepairRecoverySelector).toHaveBeenCalledWith("raw_markup");
+		expect(selectModelForImmediateRetry).toHaveBeenCalledTimes(1);
+		expect(prompt).toHaveBeenCalledTimes(4);
+	});
+
+	test("retries once with stall recovery when assistant stops with empty output", async () => {
+		let handler: ((event: any) => void) | undefined;
+		const subscribe = vi.fn((next: (event: any) => void) => {
+			handler = next;
+			return () => {
+				handler = undefined;
+			};
+		});
+		const prompt = vi.fn(async (text: string) => {
+			if (text.includes("[ASSISTANT_STALL_RECOVERY]")) {
+				handler?.({
+					type: "message_end",
+					message: {
+						role: "assistant",
+						stopReason: "stop",
+						content: [{ type: "text", text: "Продолжаю: выполняю проверку дальше." }],
+					},
+				});
+				return;
+			}
+			handler?.({
+				type: "message_end",
+				message: {
+					role: "assistant",
+					stopReason: "stop",
+					content: [{ type: "thinking", thinking: "Продолжаю проверку" }],
+				},
+			});
+		});
+		const showWarning = vi.fn();
+		const fakeThis: any = {
+			session: { prompt, subscribe },
+			activeProfileName: "full",
+			resolveMentionedAgent: vi.fn(() => undefined),
+			showWarning,
+		};
+
+		await (InteractiveMode as any).prototype.promptWithTaskFallback.call(fakeThis, "продолжай выполнение");
+
+		expect(prompt).toHaveBeenCalledTimes(2);
+		const [correctionPrompt, correctionOptions] = prompt.mock.calls[1] as [string, Record<string, unknown>];
+		expect(correctionPrompt).toContain("[ASSISTANT_STALL_RECOVERY]");
+		expect(correctionPrompt).toContain("produced no visible text and no executable tool calls");
+		expect(correctionPrompt).toContain("<original_user_request>");
+		expect(correctionPrompt).toContain("продолжай выполнение");
+		expect(correctionOptions).toEqual({
+			expandPromptTemplates: false,
+			skipOrchestrationDirective: true,
+			skipProtocolAutoRepair: true,
+			source: "interactive",
+		});
+		expect(showWarning).toHaveBeenCalledWith(
+			expect.stringContaining("Protocol auto-repair: model returned an empty stop response"),
+		);
+	});
+});
+
+describe("InteractiveMode.maybeRequestAgentContinuation", () => {
+	test("offers 3-way recovery selector and returns resume decision for interrupted assistant turn", async () => {
+		const showExtensionSelector = vi.fn(async () => "1. Yes, continue agent work");
+		const fakeThis: any = {
+			session: {
+				messages: [
+					{
+						role: "assistant",
+						stopReason: "error",
+						content: [{ type: "text", text: "Ошибка выполнения." }],
+					},
+				],
+			},
+			showExtensionSelector,
+		};
+
+		const prompt = await (InteractiveMode as any).prototype.maybeRequestAgentContinuation.call(
+			fakeThis,
+			"проверь работу db_run",
+			0,
+		);
+
+		expect(showExtensionSelector).toHaveBeenCalledWith(
+			"Tool invocation failed on the model side.\nChoose what to do next:",
+			[
+				"1. Yes, continue agent work",
+				"2. Repeat my original request",
+				"3. No, keep this session",
+				"4. Start a new session",
+			],
+		);
+		expect(prompt).toBeDefined();
+		expect(prompt.action).toBe("resume");
+		expect(prompt.promptText).toContain("[ASSISTANT_RESUME_REQUEST]");
+		expect(prompt.promptText).toContain("проверь работу db_run");
+		expect(prompt.promptText).not.toContain("<tool_call>");
+		expect(prompt.promptText).not.toContain("<delegate_task>");
+	});
+
+	test("returns repeat_request decision when user chooses to repeat original request", async () => {
+		const showExtensionSelector = vi.fn(async () => "2. Repeat my original request");
+		const fakeThis: any = {
+			session: {
+				messages: [
+					{
+						role: "assistant",
+						stopReason: "aborted",
+						content: [{ type: "text", text: "Остановлено." }],
+					},
+				],
+			},
+			showExtensionSelector,
+		};
+
+		const prompt = await (InteractiveMode as any).prototype.maybeRequestAgentContinuation.call(
+			fakeThis,
+			"продолжай",
+			0,
+		);
+
+		expect(showExtensionSelector).toHaveBeenCalledWith(
+			"You stopped the current run.\nChoose what to do next:",
+			[
+				"1. Yes, continue agent work",
+				"2. Repeat my original request",
+				"3. No, keep this session",
+				"4. Start a new session",
+			],
+		);
+		expect(prompt).toEqual({ action: "repeat_request", promptText: "продолжай" });
+	});
+
+	test("returns stay decision when user chooses to keep current session without retry", async () => {
+		const showExtensionSelector = vi.fn(async () => "3. No, keep this session");
+		const fakeThis: any = {
+			session: {
+				messages: [
+					{
+						role: "assistant",
+						stopReason: "aborted",
+						content: [{ type: "text", text: "Остановлено." }],
+					},
+				],
+			},
+			showExtensionSelector,
+		};
+
+		const prompt = await (InteractiveMode as any).prototype.maybeRequestAgentContinuation.call(
+			fakeThis,
+			"продолжай",
+			0,
+		);
+
+		expect(prompt).toEqual({ action: "stay" });
+	});
+
+	test("returns new session decision when user chooses to start new session", async () => {
+		const showExtensionSelector = vi.fn(async () => "4. Start a new session");
+		const fakeThis: any = {
+			session: {
+				messages: [
+					{
+						role: "assistant",
+						stopReason: "error",
+						content: [{ type: "text", text: "Ошибка выполнения." }],
+					},
+				],
+			},
+			showExtensionSelector,
+		};
+
+		const prompt = await (InteractiveMode as any).prototype.maybeRequestAgentContinuation.call(
+			fakeThis,
+			"продолжай",
+			0,
+		);
+
+		expect(prompt).toEqual({ action: "new_session" });
+	});
+
+	test("does not offer continuation for raw pseudo tool markup stops", async () => {
+		const showExtensionSelector = vi.fn(async () => "Да");
+		const fakeThis: any = {
+			session: {
+				messages: [
+					{
+						role: "assistant",
+						stopReason: "stop",
+						content: [
+							{
+								type: "text",
+								text:
+									"<tool_call>\n<function=db_run>\n<parameter=action>query</parameter>\n</function>\n</tool_call>",
+							},
+						],
+					},
+				],
+			},
+			showExtensionSelector,
+		};
+
+		const prompt = await (InteractiveMode as any).prototype.maybeRequestAgentContinuation.call(
+			fakeThis,
+			"сделай запрос",
+			0,
+		);
+
+		expect(prompt).toBeUndefined();
+		expect(showExtensionSelector).not.toHaveBeenCalled();
+	});
+
+	test("does not offer continuation for normal successful assistant output", async () => {
+		const showExtensionSelector = vi.fn(async () => "Да");
+		const fakeThis: any = {
+			session: {
+				messages: [
+					{
+						role: "assistant",
+						stopReason: "stop",
+						content: [{ type: "text", text: "Готово, задача выполнена." }],
+					},
+				],
+			},
+			showExtensionSelector,
+		};
+
+		const prompt = await (InteractiveMode as any).prototype.maybeRequestAgentContinuation.call(
+			fakeThis,
+			"сделай задачу",
+			0,
+		);
+
+		expect(prompt).toBeUndefined();
+		expect(showExtensionSelector).not.toHaveBeenCalled();
 	});
 });
 

@@ -72,6 +72,11 @@ export const BUILTIN_SLASH_COMMANDS: ReadonlyArray<BuiltinSlashCommand> = [
 		description:
 			"Feature feasibility analyzer: /singular <request> (builds implementation options and recommendations)",
 	},
+	{
+		name: "ultrathink",
+		description:
+			"Deep multi-iteration analysis mode: /ultrathink [-q N|--iterations N] [query] (strict read-only tools)",
+	},
 	{ name: "settings", description: "Open settings menu" },
 	{
 		name: "permissions",

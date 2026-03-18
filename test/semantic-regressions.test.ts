@@ -42,10 +42,11 @@ describe("semantic integration regressions", () => {
 		expect("db_run" in perCwdTools).toBe(true);
 	});
 
-	it("exposes /semantic and /singular in slash commands", () => {
+	it("exposes /semantic, /singular, and /ultrathink in slash commands", () => {
 		const slashNames = BUILTIN_SLASH_COMMANDS.map((command) => command.name);
 		expect(slashNames).toContain("semantic");
 		expect(slashNames).toContain("singular");
+		expect(slashNames).toContain("ultrathink");
 		expect(slashNames).not.toContain("shadow");
 	});
 

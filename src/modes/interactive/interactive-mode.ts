@@ -2259,6 +2259,36 @@ export class InteractiveMode {
 		return null;
 	}
 
+	private getUltrathinkArgumentCompletions(prefix: string): AutocompleteItem[] | null {
+		const hasTrailingSpace = /\\s$/.test(prefix);
+		const tokens = this.parseSlashArgs(prefix);
+		const queryToken = hasTrailingSpace ? "" : (tokens[tokens.length - 1] ?? "");
+
+		if (tokens.length === 0) {
+			return [
+				{ value: "-q", label: "-q", description: `Iterations (default 5, max 12)` },
+				{ value: "--iterations", label: "--iterations", description: "Same as -q" },
+			];
+		}
+
+		const previousToken = tokens[tokens.length - 2];
+		if (previousToken === "-q" || previousToken === "--iterations") {
+			const values = ["3", "5", "7", "10", "12"];
+			return values
+				.filter((value) => value.startsWith(queryToken))
+				.map((value) => ({ value, label: value, description: "iteration count" }));
+		}
+
+		if (queryToken.startsWith("-")) {
+			return [
+				{ value: "-q", label: "-q", description: `Iterations (default 5, max 12)` },
+				{ value: "--iterations", label: "--iterations", description: "Same as -q" },
+			].filter((item) => item.value.startsWith(queryToken));
+		}
+
+		return null;
+	}
+
 	private setupAutocomplete(fdPath: string | undefined): void {
 		// Define commands for autocomplete
 		const builtinCommands = BUILTIN_SLASH_COMMANDS.filter(
@@ -2334,6 +2364,12 @@ export class InteractiveMode {
 		if (swarmCommand) {
 			swarmCommand.getArgumentCompletions = (prefix: string): AutocompleteItem[] | null =>
 				this.getSwarmArgumentCompletions(prefix);
+		}
+
+		const ultrathinkCommand = slashCommands.find((command) => command.name === "ultrathink");
+		if (ultrathinkCommand) {
+			ultrathinkCommand.getArgumentCompletions = (prefix: string): AutocompleteItem[] | null =>
+				this.getUltrathinkArgumentCompletions(prefix);
 		}
 
 		// Convert prompt templates to SlashCommand format for autocomplete

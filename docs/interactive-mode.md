@@ -56,6 +56,7 @@ iosm --continue
 | `/semantic` | Open semantic search manager (`setup/auto-index/status/index/rebuild/query`) | `/semantic` |
 | `/contract` | Interactive engineering contract editor (field-by-field, auto JSON build) | `/contract` |
 | `/singular` | Feature feasibility analyzer with implementation options and recommendation | `/singular add account dashboard` |
+| `/ultrathink` | Deep multi-iteration read-only analysis mode with self-check checkpoints | `/ultrathink -q 7 investigate auth regression` |
 | `/swarm` | Recommended multi-agent orchestration runtime for complex/risky tasks (`run`, `from-singular`, `watch`, `retry`, `resume`) | `/swarm run refactor auth module --max-parallel 3` |
 | `/memory` | Interactive memory manager (`add/edit/remove/scope/path`) | `/memory` |
 | `/settings` | View/modify settings | `/settings` |
@@ -109,6 +110,9 @@ In `/semantic setup`, the headers step is optional: press `Enter` on empty input
 `/memory` opens an interactive manager. `/memory <text>` saves a note to `memory.md` and reloads session context. Use `/memory edit <index> <text>` for direct updates.
 `/contract` edits contract fields interactively (`goal`, scope, constraints, quality gates, DoD, risks, etc.), then writes JSON automatically.
 `/singular <request>` runs a two-pass feasibility analysis (baseline scan + standard agent pass), builds concrete implementation options, then prompts `Start with Swarm` / `Continue without Swarm` / `Cancel`.
+`/ultrathink [-q N|--iterations N] [query]` runs `N` root-agent analysis passes in strict read-only mode (`N` defaults to `5`, max `12`), carries a compact checkpoint between passes, and emits concise per-iteration summaries with a final synthesis.
+`/ultrathink` without query reuses the latest meaningful user request from session context.
+If early passes produce no tool evidence, ultrathink injects an internal grounding retry so the agent probes the workspace with read-only tools before continuing.
 `/swarm` enforces `Scopes -> Touches -> Locks -> Gates -> Done`. If effective contract is missing, it blocks execution and opens a bootstrap menu (auto-draft, guided Q&A, or manual `/contract` editor).
 `/orchestrate --parallel` defaults `--max-parallel` to `--agents` when omitted and auto-selects `meta` workers when profiles are not explicitly set (outside read-only host contexts).
 For orchestrate assignments, `delegate_parallel_hint` is carried into child task calls; high hints should trigger nested delegate fan-out or explicit `DELEGATION_IMPOSSIBLE`.

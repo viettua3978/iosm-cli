@@ -127,6 +127,11 @@ These commands run inside interactive mode (`iosm`), not as top-level CLI subcom
   - baseline repository scan + standard agent pass
   - outputs exactly 3 implementation options with recommendation
   - lets user choose option `1/2/3`, then `Start with Swarm` or `Continue without Swarm`
+- `/ultrathink [-q N|--iterations N] [query]` — deep read-only iterative analysis:
+  - runs root-agent analysis in strict read-only tool mode for `N` iterations (default `5`, max `12`)
+  - carries compact checkpoint state between iterations (facts, rejected hypotheses, open questions, next checks)
+  - auto-injects a grounding retry when early passes return no tool evidence, forcing live workspace probes
+  - if query is omitted, reuses latest meaningful user request from session context
 - `/swarm` — canonical gated execution runtime:
   - `/swarm run <task> [--max-parallel N] [--budget-usd X]`
   - `/swarm from-singular <run-id> --option <1|2|3> [--max-parallel N] [--budget-usd X]`

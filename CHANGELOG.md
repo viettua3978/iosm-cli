@@ -7,6 +7,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.10] - 2026-03-18
+
+### Added
+
+- **`/ultrathink` built-in command** — added deep multi-iteration analysis mode with robust slash parsing (`-q`/`--iterations`, `--` separator), context-aware no-query fallback, and shared behavior through `AgentSession.prompt` across interactive/print/json/rpc flows
+- **Ultrathink checkpoint engine** — added structured checkpoint state (`Goal`, `Verified Facts`, `Rejected Hypotheses`, `Open Questions`, `Next Checks`) with carry-forward summaries and checkpoint compression support for long runs
+- **Ultrathink read-only execution policy** — added strict temporary read-only tool filtering during ultrathink runs with guaranteed restoration of the original active tool set
+- **Ultrathink evidence/runtime tests** — added dedicated parser and session-flow test suites covering iteration loops, no-query objective resolution, streaming guards, budget/stagnation paths, evidence-policy fallback, and tool-set restoration
+
+### Changed
+
+- **Ultrathink runtime hardening** — added budget guardrails (per-iteration input, run input/total tokens, run cost), stagnation early-stop behavior, and evidence-catalog carry-forward between passes
+- **Ultrathink anti-hallucination policy** — added quantitative-claim evidence tagging rules, verify/synthesis no-new-evidence marker handling, and compliance-repair pass support
+- **Ultrathink grounding behavior** — when early passes produce no tool evidence, runtime now injects an internal grounding retry that explicitly forces live read-only workspace probes before continuing
+- **Interactive slash UX** — added `/ultrathink` to built-in slash registry and interactive autocomplete argument hints (`-q`, `--iterations`, common iteration counts)
+
+### Fixed
+
+- **Ultrathink hard-stop on evidence mismatch** — repeated evidence-policy mismatch no longer aborts the entire command; runtime now degrades gracefully and returns a best-effort final response instead of throwing
+- **Internal prompt visibility leakage** — ultrathink internal retries (iteration/grounding/policy-repair prompts) are now consistently routed through hidden orchestration aliases, so users see clean progress text instead of raw directives
+- **Budget accounting with internal retries** — per-iteration budget checks now account for cumulative input tokens across the main pass plus internal retry prompts
+
+### Documentation
+
+- Updated README header/version marker to `0.2.10`
+- Added `/ultrathink` command coverage to interactive and CLI references, including read-only behavior, context fallback, and grounding-retry semantics
+
+### Tests
+
+- Added `test/ultrathink.test.ts` parser/validation coverage for `/ultrathink`
+- Added `test/agent-session-ultrathink.test.ts` runtime coverage for q-iteration flow, early-stop, budget-cutoff, no-query fallback, evidence-policy graceful fallback, and restoration guarantees
+- Expanded semantic regressions to assert `/ultrathink` built-in slash discoverability
+
 ## [0.2.9] - 2026-03-15
 
 ### Added

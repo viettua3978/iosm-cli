@@ -24,7 +24,7 @@ import type {
 	ThinkingLevel,
 } from "@mariozechner/pi-agent-core";
 import type { AssistantMessage, ImageContent, Message, Model, TextContent } from "@mariozechner/pi-ai";
-import { isContextOverflow, modelsAreEqual, resetApiProviders, supportsXhigh } from "@mariozechner/pi-ai";
+import { completeSimple, isContextOverflow, modelsAreEqual, resetApiProviders, supportsXhigh } from "@mariozechner/pi-ai";
 import { getDocsPath, getSessionTracePath, isSessionTraceEnabled } from "../config.js";
 import { buildIosmRuntimeDirective, prepareIosmRuntimeContext } from "../iosm/runtime-context.js";
 import { theme } from "../modes/interactive/theme/theme.js";
@@ -104,6 +104,40 @@ import {
 import type { BashOperations } from "./tools/bash.js";
 import { createAllTools, getAllowedFetchMethodsForProfile } from "./tools/index.js";
 import type { ToolPermissionRequest } from "./tools/index.js";
+import {
+	ULTRATHINK_CHECKPOINT_COMPRESSION_SYSTEM_PROMPT,
+	ULTRATHINK_MAX_CHECKPOINT_CHARS,
+	ULTRATHINK_MAX_ITERATION_INPUT_TOKENS,
+	ULTRATHINK_MAX_RUN_COST,
+	ULTRATHINK_MAX_RUN_INPUT_TOKENS,
+	ULTRATHINK_MAX_RUN_TOTAL_TOKENS,
+	ULTRATHINK_STAGNATION_LIMIT,
+	ULTRATHINK_VISIBLE_PROMPT_PREFIX,
+	buildUltrathinkCheckpointCompressionPrompt,
+	buildUltrathinkBudgetStatusLine,
+	buildUltrathinkComplianceRepairPrompt,
+	buildUltrathinkContextTail,
+	buildUltrathinkEvidenceCatalog,
+	buildUltrathinkIterationPrompt,
+	buildUltrathinkToolGroundingPrompt,
+	buildUltrathinkVisibleIterationPrompt,
+	createInitialUltrathinkCheckpoint,
+	evaluateUltrathinkEvidencePolicy,
+	extractUltrathinkCheckpoint,
+	extractUltrathinkIterationSummary,
+	extractUltrathinkToolEvidence,
+	findLastMeaningfulUserIntent,
+	getUltrathinkPhase,
+	hasUltrathinkEvidenceViolations,
+	isUltrathinkStagnated,
+	normalizeUltrathinkCheckpoint,
+	parseUltrathinkCommand,
+	resolveUltrathinkReadOnlyTools,
+	shouldUltrathinkForceToolGrounding,
+	truncateUltrathinkCheckpoint,
+	ULTRATHINK_USAGE,
+	type UltrathinkCommandConfig,
+} from "./ultrathink.js";
 
 // ============================================================================
 // Skill Block Parsing
@@ -437,6 +471,8 @@ export interface PromptOptions {
 	skipOrchestrationDirective?: boolean;
 	/** Internal safety valve: disable one-shot protocol auto-repair for this prompt call. */
 	skipProtocolAutoRepair?: boolean;
+	/** Internal safety valve: skip /ultrathink command interception for internal prompts. */
+	skipUltrathinkCommand?: boolean;
 }
 
 /** Result from cycleModel() */
@@ -570,6 +606,7 @@ export class AgentSession {
 	private _sessionTraceEnabled = isSessionTraceEnabled();
 	private _sessionTracePath: string | undefined;
 	private _protocolAutoRepairActive = false;
+	private _ultrathinkActive = false;
 
 	constructor(config: AgentSessionConfig) {
 		this.agent = config.agent;
@@ -1427,6 +1464,23 @@ export class AgentSession {
 			imageCount: options?.images?.length ?? 0,
 		});
 
+		if (!options?.skipUltrathinkCommand) {
+			const ultrathinkParseResult = parseUltrathinkCommand(text);
+			if (ultrathinkParseResult?.kind === "error") {
+				throw new Error(`${ultrathinkParseResult.error}\n\n${ultrathinkParseResult.usage}`);
+			}
+			if (ultrathinkParseResult?.kind === "command") {
+				await this._runUltrathinkCommand(ultrathinkParseResult.command, { source: inputSource });
+				this._appendSessionTrace({
+					type: "prompt_handled_by_command",
+					text,
+					command: "ultrathink",
+					iterations: ultrathinkParseResult.command.iterations,
+				});
+				return;
+			}
+		}
+
 		// Handle extension commands first (execute immediately, even during streaming)
 		// Extension commands manage their own LLM interaction via iosm.sendMessage()
 		if (expandPromptTemplates && text.startsWith("/")) {
@@ -1708,6 +1762,346 @@ export class AgentSession {
 					this._protocolAutoRepairActive = false;
 				}
 			}
+		}
+	}
+
+	private async _runUltrathinkCommand(
+		command: UltrathinkCommandConfig,
+		options: { source: InputSource },
+	): Promise<void> {
+		if (this.isStreaming) {
+			throw new Error("Cannot start /ultrathink while the agent is processing another request.");
+		}
+		if (this.isCompacting) {
+			throw new Error("Cannot start /ultrathink while compaction is running.");
+		}
+		if (this._ultrathinkActive) {
+			throw new Error("An /ultrathink run is already in progress.");
+		}
+
+		if (!this.model) {
+			throw new Error(
+				"No model selected.\n\n" +
+					`Use /login or set an API key environment variable. See ${join(getDocsPath(), "providers.md")}\n\n` +
+					"Then use /model to select a model.",
+			);
+		}
+
+		const apiKey = await this._modelRegistry.getApiKey(this.model);
+		if (!apiKey) {
+			const isOAuth = this._modelRegistry.isUsingOAuth(this.model);
+			if (isOAuth) {
+				throw new Error(
+					`Authentication failed for "${this.model.provider}". ` +
+						`Credentials may have expired or network is unavailable. ` +
+						`Run '/login ${this.model.provider}' to re-authenticate.`,
+				);
+			}
+			throw new Error(
+				`No API key found for ${this.model.provider}.\n\n` +
+					`Use /login or set an API key environment variable. See ${join(getDocsPath(), "providers.md")}`,
+			);
+		}
+
+		const objective = command.query?.trim() || findLastMeaningfulUserIntent(this.messages);
+		if (!objective) {
+			throw new Error(
+				[
+					"Cannot infer an objective for /ultrathink from session context.",
+					"Provide a query explicitly or send a regular user request first.",
+					"",
+					ULTRATHINK_USAGE,
+				].join("\n"),
+			);
+		}
+
+		const originalTools = this.getActiveToolNames();
+		const availableToolNames = this.getAllTools().map((tool) => tool.name);
+		const readOnlyTools = resolveUltrathinkReadOnlyTools(availableToolNames);
+		if (readOnlyTools.length === 0) {
+			throw new Error(
+				[
+					"Cannot start /ultrathink: no read-only tools are currently active.",
+					"Enable at least one analysis tool (for example read/rg/find/semantic_search/fetch/git_read) and retry.",
+				].join("\n"),
+			);
+		}
+
+		const contextTail = buildUltrathinkContextTail(this.messages);
+		let checkpoint = createInitialUltrathinkCheckpoint(objective);
+		let previousSummary: string | undefined;
+		let accumulatedInputTokens = 0;
+		let accumulatedTotalTokens = 0;
+		let accumulatedCost = 0;
+		let stagnationCount = 0;
+		let targetIterations = command.iterations;
+		let enforceEvidencePolicy = true;
+		const evidenceById = new Map<string, ReturnType<typeof extractUltrathinkToolEvidence>[number]>();
+
+		const mergeEvidence = (messages: AgentMessage[]): number => {
+			const evidence = extractUltrathinkToolEvidence(messages);
+			for (const entry of evidence) {
+				evidenceById.set(entry.toolCallId, entry);
+			}
+			return evidence.length;
+		};
+
+		const registerUsage = (
+			assistantMessage: AssistantMessage | undefined,
+		): { inputTokens: number; totalTokens: number; costTotal: number } => {
+			const usage = assistantMessage?.usage;
+			const inputTokens = Number(usage?.input ?? 0);
+			const totalTokens = Number(usage?.totalTokens ?? inputTokens + Number(usage?.output ?? 0));
+			const costTotal = Number(usage?.cost?.total ?? 0);
+			accumulatedInputTokens += inputTokens;
+			accumulatedTotalTokens += totalTokens;
+			accumulatedCost += costTotal;
+			return { inputTokens, totalTokens, costTotal };
+		};
+
+		const exceedsBudget = (iterationInputTokens: number): boolean =>
+			iterationInputTokens > ULTRATHINK_MAX_ITERATION_INPUT_TOKENS ||
+			accumulatedInputTokens > ULTRATHINK_MAX_RUN_INPUT_TOKENS ||
+			accumulatedTotalTokens > ULTRATHINK_MAX_RUN_TOTAL_TOKENS ||
+			accumulatedCost > ULTRATHINK_MAX_RUN_COST;
+
+		const runUltrathinkInternalPrompt = async (rawPrompt: string, displayText: string): Promise<AgentMessage[]> => {
+			this._appendCustomMessageLocally({
+				customType: INTERNAL_UI_META_CUSTOM_TYPE,
+				content: "",
+				display: false,
+				details: {
+					kind: "orchestration_context",
+					rawPrompt,
+					displayText,
+				},
+			});
+
+			const messageCountBefore = this.messages.length;
+			await this.prompt(rawPrompt, {
+				expandPromptTemplates: false,
+				skipIosmAutopilot: true,
+				skipOrchestrationDirective: true,
+				skipUltrathinkCommand: true,
+				source: options.source,
+			});
+			return this.messages.slice(messageCountBefore);
+		};
+
+		this._ultrathinkActive = true;
+		this.setActiveToolsByName(readOnlyTools);
+
+		try {
+			for (let iteration = 1; iteration <= targetIterations; iteration++) {
+				const phase = iteration === targetIterations ? "Synthesis" : getUltrathinkPhase(iteration, targetIterations);
+				const evidenceCatalog = buildUltrathinkEvidenceCatalog([...evidenceById.values()]);
+				const budgetStatus = buildUltrathinkBudgetStatusLine({
+					accumulatedInputTokens,
+					accumulatedTotalTokens,
+					accumulatedCost,
+				});
+				const iterationPrompt = buildUltrathinkIterationPrompt({
+					iteration,
+					totalIterations: targetIterations,
+					phase,
+					objective,
+					checkpoint,
+					previousSummary,
+					contextTail: iteration === 1 ? contextTail : undefined,
+					evidenceCatalog,
+					budgetStatus,
+				});
+				const visibleIterationPrompt = buildUltrathinkVisibleIterationPrompt({
+					iteration,
+					totalIterations: targetIterations,
+					phase,
+					objective,
+				});
+
+				const iterationMessages = await runUltrathinkInternalPrompt(iterationPrompt, visibleIterationPrompt);
+				let toolChecksThisIteration = mergeEvidence(iterationMessages);
+				let assistantMessage = this._findLastAssistantMessage();
+				let assistantText = this.getLastAssistantText() ?? "";
+				let iterationUsage = registerUsage(assistantMessage);
+				let iterationInputTokens = iterationUsage.inputTokens;
+
+				const evaluatePolicy = () =>
+					evaluateUltrathinkEvidencePolicy({
+						text: assistantText,
+						phase,
+						toolChecksThisIteration,
+						knownEvidenceIds: [...evidenceById.keys()],
+					});
+
+				const shouldGround = shouldUltrathinkForceToolGrounding({
+					phase,
+					cumulativeEvidenceCount: evidenceById.size,
+					toolChecksThisIteration,
+				});
+				if (shouldGround) {
+					const groundingPrompt = buildUltrathinkToolGroundingPrompt({
+						iteration,
+						totalIterations: targetIterations,
+						phase,
+						objective,
+						checkpoint,
+						availableReadOnlyTools: readOnlyTools,
+						evidenceCatalog: buildUltrathinkEvidenceCatalog([...evidenceById.values()]),
+					});
+					const groundingDisplayText = `${ULTRATHINK_VISIBLE_PROMPT_PREFIX} ${iteration}/${targetIterations} (${phase}) grounding retry. Performing live workspace probes with read-only tools.`;
+					const groundingMessages = await runUltrathinkInternalPrompt(groundingPrompt, groundingDisplayText);
+					toolChecksThisIteration += mergeEvidence(groundingMessages);
+					assistantMessage = this._findLastAssistantMessage();
+					assistantText = this.getLastAssistantText() ?? "";
+					iterationUsage = registerUsage(assistantMessage);
+					iterationInputTokens += iterationUsage.inputTokens;
+				}
+
+				if (enforceEvidencePolicy) {
+					let evidencePolicy = evaluatePolicy();
+					if (hasUltrathinkEvidenceViolations(evidencePolicy)) {
+						const policyIssues: string[] = [];
+						if (evidencePolicy.missingEvidenceForNumbers) {
+							policyIssues.push("Quantitative claims are missing `[evidence:<toolCallId>]` tags.");
+						}
+						if (evidencePolicy.invalidEvidenceTags.length > 0) {
+							policyIssues.push(`Unknown evidence tags: ${evidencePolicy.invalidEvidenceTags.join(", ")}`);
+						}
+						if (evidencePolicy.needsNoNewEvidenceMarker && !evidencePolicy.hasNoNewEvidenceMarker) {
+							policyIssues.push("Verify/Synthesis response with no new tool checks must include [NO_NEW_EVIDENCE_OK].");
+						}
+
+						const repairPrompt = buildUltrathinkComplianceRepairPrompt({
+							iteration,
+							totalIterations: targetIterations,
+							phase,
+							objective,
+							originalResponse: assistantText,
+							issues: policyIssues,
+							checkpoint,
+							evidenceCatalog: buildUltrathinkEvidenceCatalog([...evidenceById.values()]),
+						});
+
+						const repairDisplayText = `${ULTRATHINK_VISIBLE_PROMPT_PREFIX} ${iteration}/${targetIterations} (${phase}) policy repair. Normalizing evidence links and checkpoint format.`;
+						const repairMessages = await runUltrathinkInternalPrompt(repairPrompt, repairDisplayText);
+						toolChecksThisIteration += mergeEvidence(repairMessages);
+						assistantMessage = this._findLastAssistantMessage();
+						assistantText = this.getLastAssistantText() ?? "";
+						iterationUsage = registerUsage(assistantMessage);
+						iterationInputTokens += iterationUsage.inputTokens;
+						evidencePolicy = evaluatePolicy();
+
+						if (hasUltrathinkEvidenceViolations(evidencePolicy)) {
+							// Do not fail the entire run; keep the latest usable answer and finish gracefully.
+							enforceEvidencePolicy = false;
+							if (iteration < targetIterations) {
+								targetIterations = Math.min(targetIterations, iteration + 1);
+							}
+						}
+					}
+				}
+
+				previousSummary = extractUltrathinkIterationSummary(assistantText);
+				const checkpointBeforeIteration = checkpoint;
+				const extractedCheckpoint = extractUltrathinkCheckpoint(assistantText);
+				if (extractedCheckpoint && extractedCheckpoint.trim()) {
+					checkpoint = normalizeUltrathinkCheckpoint(extractedCheckpoint, objective);
+				}
+				if (checkpoint.length > ULTRATHINK_MAX_CHECKPOINT_CHARS) {
+					checkpoint = await this._compressUltrathinkCheckpoint(checkpoint, objective, apiKey);
+				}
+
+				const stagnated = isUltrathinkStagnated({
+					previousCheckpoint: checkpointBeforeIteration,
+					nextCheckpoint: checkpoint,
+					toolChecksThisIteration,
+				});
+				if (stagnated && iteration < targetIterations) {
+					stagnationCount += 1;
+					if (stagnationCount >= ULTRATHINK_STAGNATION_LIMIT) {
+						targetIterations = Math.min(targetIterations, iteration + 1);
+					}
+				} else {
+					stagnationCount = 0;
+				}
+
+				if (iteration < targetIterations && exceedsBudget(iterationInputTokens)) {
+					targetIterations = Math.min(targetIterations, iteration + 1);
+				}
+			}
+		} finally {
+			this._ultrathinkActive = false;
+			const currentTools = this.getActiveToolNames();
+			const shouldRestore =
+				currentTools.length !== originalTools.length ||
+				currentTools.some((toolName, index) => toolName !== originalTools[index]);
+			if (shouldRestore) {
+				this.setActiveToolsByName(originalTools);
+			}
+		}
+	}
+
+	private async _compressUltrathinkCheckpoint(
+		checkpoint: string,
+		objective: string,
+		apiKey: string,
+	): Promise<string> {
+		const model = this.model;
+		const fallback = truncateUltrathinkCheckpoint(
+			normalizeUltrathinkCheckpoint(checkpoint, objective),
+			ULTRATHINK_MAX_CHECKPOINT_CHARS,
+		);
+		if (!model) return fallback;
+
+		const reserveTokens = this.settingsManager.getCompactionReserveTokens();
+		const maxTokens = Math.max(256, Math.min(2048, Math.floor(reserveTokens * 0.4)));
+
+		try {
+			const response = await completeSimple(
+				model,
+				{
+					systemPrompt: ULTRATHINK_CHECKPOINT_COMPRESSION_SYSTEM_PROMPT,
+					messages: [
+						{
+							role: "user",
+							content: [
+								{
+									type: "text",
+									text: buildUltrathinkCheckpointCompressionPrompt({
+										objective,
+										checkpoint,
+										maxChars: ULTRATHINK_MAX_CHECKPOINT_CHARS,
+									}),
+								},
+							],
+							timestamp: Date.now(),
+						},
+					],
+				},
+				model.reasoning
+					? { maxTokens, apiKey, reasoning: "high" as const }
+					: { maxTokens, apiKey },
+			);
+
+			if (response.stopReason === "error") {
+				return fallback;
+			}
+
+			const text = response.content
+				.filter((part): part is { type: "text"; text: string } => part.type === "text")
+				.map((part) => part.text)
+				.join("\n")
+				.trim();
+			if (!text) {
+				return fallback;
+			}
+
+			return truncateUltrathinkCheckpoint(
+				normalizeUltrathinkCheckpoint(text, objective),
+				ULTRATHINK_MAX_CHECKPOINT_CHARS,
+			);
+		} catch {
+			return fallback;
 		}
 	}
 

